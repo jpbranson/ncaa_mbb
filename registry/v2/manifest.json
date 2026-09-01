@@ -1,0 +1,35 @@
+{
+  "version": "v2",
+  "kind": "lightgbm",
+  "features": [
+    "margin",
+    "sqrt_time",
+    "margin_per_sqrt_time",
+    "possession",
+    "pregame_exp_margin",
+    "pregame_exp_margin_decayed",
+    "is_ot",
+    "timeout_diff",
+    "bonus_diff",
+    "ft_pct_diff",
+    "margin_per_sqrt_points_left"
+  ],
+  "state_rules_version": 2,
+  "sha256": "2d4bf58134fa2e64",
+  "created": "2026-09-01T21:23:19.214537+00:00",
+  "train_seasons": [
+    2016,
+    2017,
+    2018,
+    2019,
+    2021,
+    2022,
+    2023
+  ],
+  "calibration_season": 2024,
+  "test_seasons": [
+    2025,
+    2026
+  ],
+  "notes": "Refit after the possession fix: made field goals are detected by the feed's scoring+shooting flags rather than a play-type name whitelist, which restores possession after the 324,043 made threes ESPN typed as 'Three Point Jump Shot' in 2016-2019. Test seasons are unchanged by the fix, so v1 and v2 are directly comparable on identical test data."
+}

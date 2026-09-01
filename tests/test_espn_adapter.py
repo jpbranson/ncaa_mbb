@@ -140,13 +140,13 @@ def test_espn_adapter_matches_hoopr_states(game_ids):
 
 
 @pytestmark_data
-@pytest.mark.skipif(not (ROOT / "registry/v1").exists(),
+@pytest.mark.skipif(not (ROOT / "registry/v2").exists(),
                     reason="no model registry built yet")
 def test_espn_path_gives_identical_win_probabilities(game_ids):
     from espn_fixtures import summary_from_hoopr
     from cbbwp.serve import WinProbabilityService
 
-    svc = WinProbabilityService(ROOT / "registry", "v1")
+    svc = WinProbabilityService(ROOT / "registry", "v2")
     for gid in game_ids[:5]:
         ref_events, home_id, away_id = load_events(PBP, gid)
         ctx = PregameContext(gid, home_id, away_id, pregame_exp_margin=2.5,
@@ -178,3 +178,26 @@ def test_partial_feed_is_a_prefix_of_the_finished_game(game_ids):
     for x, y in zip(a, b):
         assert (x.seq, x.margin, x.possession, x.game_seconds_remaining) == \
                (y.seq, y.margin, y.possession, y.game_seconds_remaining)
+
+
+def test_serving_refuses_a_model_fit_under_older_state_rules():
+    """The guard that the feature-name check could not provide.
+
+    A model fit before the possession fix must not be served states built after
+    it. The feature NAMES are identical in both, so without this check the
+    mismatch is completely silent - which is exactly what happened on
+    2026-09-01 before it was caught.
+    """
+    from cbbwp.serve import WinProbabilityService
+    if not (ROOT / "registry/v1").exists():
+        pytest.skip("no v1 artifact kept")
+    with pytest.raises(RuntimeError, match="state rules"):
+        WinProbabilityService(ROOT / "registry", "v1")
+
+
+def test_the_current_model_loads():
+    from cbbwp.serve import WinProbabilityService
+    if not (ROOT / "registry/v2").exists():
+        pytest.skip("no v2 artifact built yet")
+    svc = WinProbabilityService(ROOT / "registry", "v2")
+    assert svc.manifest["state_rules_version"] == 2

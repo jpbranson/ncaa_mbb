@@ -89,3 +89,20 @@ FEATURE_NAMES = [
 # Men's NCAA bonus thresholds, in team fouls per half.
 BONUS_FOULS = 7        # 1-and-1
 DOUBLE_BONUS_FOULS = 10
+
+# Version of the STATE RULES, as opposed to the feature list above.
+#
+# FEATURE_NAMES catches someone adding, removing or reordering a column. It does
+# NOT catch someone changing what an existing column MEANS - and that is the
+# more dangerous edit, because nothing downstream looks any different.
+#
+# This happened on 2026-09-01: the possession rule was corrected so that made
+# three-pointers in 2016-2019 flip possession (they had not, because ESPN typed
+# them "Three Point Jump Shot" and the rule keyed on play-type names). The
+# feature list was untouched, so the manifest check passed, and a model trained
+# on the old meaning would have been served states built with the new one.
+#
+# Bump this whenever the meaning of any GameState field changes, and refit.
+#   1 - original rules, shipped 2026-08-31 (registry/v1)
+#   2 - made field goals detected by scoring+shooting flags, not type names
+STATE_RULES_VERSION = 2

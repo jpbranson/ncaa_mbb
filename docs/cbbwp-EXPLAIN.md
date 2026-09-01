@@ -1,7 +1,7 @@
 # EXPLAIN.md — how the win probability model works, and why every choice was made
 
 *Written for someone who has to stand up and explain this, and answer questions about it.*
-Last updated: 2026-09-01 · Model version `v1` (`registry/v1`)
+Last updated: 2026-09-01 (evening) · Model version `v2` (`registry/v2`, sha `2d4bf58134fa2e64`)
 
 ---
 
@@ -481,9 +481,11 @@ objects the historical adapter emits. Three details carry the weight:
   `type.id`. So the adapter maps id → *the text the model was trained on*, and falls back to
   the feed's own text only for an id that has never appeared in training. `TYPE_ID_TO_TEXT`
   was extracted from all ten seasons: 29 distinct (id, text) pairs.
-- **It is deliberately bug-compatible.** Id 30558 is `"Three Point Jump Shot"`, which the
-  state builder does *not* treat as a made-shot possession flip, because that is how the
-  model was fit. Changing that is a model-version change, not an adapter change.
+- **It no longer decides possession.** The map originally preserved a bug: id 30558,
+  `"Three Point Jump Shot"`, was not in the made-shot whitelist. That whitelist has been
+  removed entirely — possession now keys on the feed's scoring/shooting flags (§8.2), so a
+  future ESPN rename cannot reintroduce the failure. The map survives for every *other*
+  rule, where the trained-on text is still what matters.
 - **Plays are ordered by `sequenceNumber` and renumbered 1..N**, exactly as hoopR's
   `game_play_number` is dense and 1-based. The live feed does not promise ordered plays; the
   adapter sorts, and the parity test shuffles the payload on purpose to prove it.
@@ -695,7 +697,7 @@ Test set: 2025 and 2026, 12,398 games, 2,233,937 snapshots, none of which the mo
 
 | Model | Log loss | Brier | Accuracy | Calibration error |
 |---|---|---|---|---|
-| **LightGBM v1 (shipped)** | **0.3104** | **0.1008** | 85.17% | **0.0028** |
+| **LightGBM v2 (shipped)** | **0.3103** | **0.1008** | 85.20% | **0.0026** |
 | Logistic baseline | 0.3109 | 0.1009 | 85.19% | 0.0043 |
 | ESPN (deployed) | 0.3295 | 0.1061 | 84.58% | 0.0069 |
 
@@ -828,9 +830,11 @@ Early-game states are enormously redundant. Halves the dataset, concentrates it 
 action is, no measurable cost.
 
 ### 7.11 Map ESPN play types by numeric id, not by display text
-**Because** the possession rules are written against the exact strings hoopR stored, and
-those strings are ESPN's display text — the thing most likely to be reworded. The numeric
-`type.id` is the stable key.
+**Because** the rules for fouls, timeouts, rebounds and turnovers are written against the
+exact strings hoopR stored, and those strings are ESPN's display text — the thing most likely
+to be reworded. The numeric `type.id` is the stable key.
+**Since corrected:** possession no longer depends on play-type names at all (§8.2). The rename
+this decision anticipated had already happened *inside the training data* before anyone looked.
 **Rejected alternative:** normalising both sides (strip spaces, lowercase) so "Jump Shot" and
 "JumpShot" match. That silently changes what the model receives the moment ESPN introduces a
 type whose normalised form collides with an existing one, and it hides feed changes instead
@@ -845,6 +849,19 @@ every week is an alert nobody reads.
 **Rejected alternative:** alert on log loss crossing a threshold. Log loss is exactly the
 metric that does *not* move when calibration drifts — which is the failure we are watching
 for.
+
+### 7.13 Version the MEANING of state, not just the list of features
+**Because** `serve.py` compared feature names and nothing else, so the possession fix — which
+changed what `possession` means without touching any name — would have been served silently
+against a model trained on the old meaning. That is the exact failure the manifest exists to
+prevent, walking straight past it.
+**The fix:** `STATE_RULES_VERSION` in `schemas.py`, stamped into every artifact at publish time
+and checked at load. An unstamped artifact is treated as version 1. `registry/v1` is stamped 1
+and is now *refused* by current code, which is correct, and a test asserts it.
+**The general lesson:** every check in this system compared the code to itself — two
+implementations, a manifest, a replay harness. All passed. The bug was visible only by
+comparing the code to the rules of basketball. **Parity proves consistency, not correctness**,
+and it is easy to mistake one for the other.
 
 ---
 
@@ -885,10 +902,50 @@ corrects it. We deliberately do **not** look ahead at future events to resolve t
 at live time the future doesn't exist and using it would create train/serve skew. Affects a
 small number of rows; more relevant late than early.
 
-There is also a known gap in the rules table: play type id 30558, `"Three Point Jump Shot"`,
-is not in the made-shot list, so a made three from that id carries possession instead of
-flipping it. It is rare, and it is *consistent between training and serving* — the live
-adapter reproduces it deliberately. Fixing it is a model-version change.
+**This section previously called the next item a rare gap. It was not rare, and it is now
+fixed — the story is worth keeping because of how well it hid.**
+
+ESPN typed made three-pointers as `"Three Point Jump Shot"` (id 30558) through 2019 and as
+`"JumpShot"` (id 558) from 2021 onward. The possession rule keyed on a whitelist of play-type
+NAMES containing "JumpShot" but not "Three Point Jump Shot". So for four of the seven training
+seasons, **89% of every made three left the ball with the team that had just scored** — 324,043
+plays, 4.8% of the entire feed.
+
+The consequence was subtler than a wrong value: `possession` *meant something different* in
+2016–2019 than from 2021 on. The model trained on four seasons of one definition and three of
+another, and was tested on a period using the second.
+
+**Why nothing caught it.** `test_parity.py` asserts the bulk path agrees with the reference
+builder — it passed, because both were wrong identically. The manifest guard compares feature
+*names*, and no name changed. Every check in the system compared the code to itself. Nothing
+compared it to the rules of basketball.
+
+**The fix** (state rules v2) keys made field goals on the feed's own `scoring_play` and
+`shooting_play` flags. Across all ten seasons that rule drops nothing the whitelist caught and
+adds exactly the missing threes. `tests/test_possession_truth.py` now asserts the invariant
+directly — after a made field goal the other team has the ball, in every season — plus a
+regression test that renames every play type and requires possession to be unchanged.
+
+**What it was worth: almost nothing, and that is the honest headline.** The test seasons
+contain no 30558 rows, so v1 and v2 are comparable on identical test data:
+
+| Bucket | v1 (buggy) | v2 (fixed) | Δ |
+|---|---|---|---|
+| overall | 0.31031 | 0.31032 | +0.00001 |
+| 2–1 min | 0.1553 | 0.1553 | −0.0000 |
+| 1–0 min | 0.1248 | 0.1246 | **−0.0002** |
+| under 30s | 0.1258 | 0.1255 | **−0.0003** |
+| under 10s | 0.1124 | 0.1122 | **−0.0002** |
+
+The gain is confined to exactly where possession matters, is consistent across all three late
+buckets, and appears in the logistic baseline too (0.12668 → 0.12655 under 60s). The logistic
+`possession` coefficient rose from 0.068 to 0.077 — with a cleaner feature the model leans on
+it more. But the magnitude is two ten-thousandths of a nat: **the model had largely learned to
+work around the corrupted feature.**
+
+It was still right to fix, for reasons that are not about log loss. The endgame simulator
+depends on possession being correct in a way the model does not, and a feature that means two
+different things inside one training set is a defect whatever the metric says.
 
 ### 8.3 Timeouts are approximate
 The men's rule is fiddly: a team that doesn't use its 60-second timeout in the first half
@@ -1041,7 +1098,8 @@ Beating a *broadcast* win probability model and beating a *market* are different
 | `src/cbbwp/serve.py` | The live scoring path and the version-pinning guard. |
 | `scripts/` | The pipeline, the live poller, the fixture tools, the monitor. |
 | `tests/` | 37 tests: state rules, feature contract, bulk parity, ESPN-adapter parity, endgame rules, replay harness, monitor statistics. |
-| `registry/v1/` | The pinned model artifact and its manifest. |
+| `registry/v2/` | The pinned model artifact and manifest, stamped with the state-rules version. |
+| `registry/v1/` | The pre-fix model, kept for provenance. Refused at load by current code. |
 | `registry/context_latest.json` | Today's team ratings and season-to-date stats, for live games. |
 
 ---

@@ -1,7 +1,12 @@
 # CBB Win Probability — build log and re-entry point
 
-**Last worked: 2026-09-01.** Phases 1–5 complete except a live smoke test against
-the real ESPN endpoint, which is blocked from every sandbox available here.
+**Last worked: 2026-09-01 (evening).** Phases 1–5 complete except a live smoke
+test against the real ESPN endpoint, which is blocked from every sandbox here.
+Endgame-simulator work started and is **paused mid-Phase 2** — see the bottom of
+this file for exactly where.
+
+Shipped model is now **v2** (`registry/v2`, sha `2d4bf58134fa2e64`). v1 is kept
+for provenance and is deliberately refused at load by current code.
 
 **This folder is now the source of truth.** `~/Downloads/ncaa_mbb` on
 cas-w7r21674vv holds the package, the data, the fitted model and these docs. The
@@ -16,7 +21,7 @@ Trained on 2016–2023, calibrated on 2024, tested on 2025–2026 (2.23M states,
 
 | Model | Log loss | Brier | Accuracy | ECE |
 |---|---|---|---|---|
-| **LightGBM v1 (shipped)** | **0.3103** | 0.1008 | 85.19% | 0.0024 |
+| **LightGBM v2 (shipped)** | **0.3103** | 0.1008 | 85.20% | 0.0026 |
 | Logistic baseline | 0.3109 | 0.1009 | 85.19% | 0.0043 |
 | ESPN (deployed, same rows) | 0.3295 | 0.1061 | 84.58% | 0.0069 |
 
@@ -158,3 +163,104 @@ seasons and cuts on tied games specifically, which is the sharper test.
    seconds.
 6. **Foul trouble / lineup state** — reachable from the same feed, unmodelled.
 7. **A licensed spread** would close a ~0.8 point RMSE gap on the pregame term.
+
+
+---
+
+# Session 2 (evening) — the possession bug, and where the endgame work stopped
+
+## What happened
+
+Started executing the endgame-simulator plan (`docs/cbbwp-endgame-plan.md`,
+which pre-registers the bar it has to clear). Phase 1 of that plan was "fix the
+possession and timeout inputs the simulator depends on". Measuring the
+possession input first turned up something much larger than the docs described.
+
+## The possession bug (fixed, shipped as v2)
+
+ESPN typed made three-pointers as `"Three Point Jump Shot"` (id 30558) through
+2019 and as `"JumpShot"` from 2021. The possession rule keyed on a whitelist of
+play-type **names**, which had "JumpShot" but not the older spelling. Result:
+**89% of every made three in 2016–2019 left the ball with the scoring team** —
+324,043 plays, 4.8% of the feed. `possession` therefore meant one thing in four
+training seasons and another in the rest.
+
+Fixed by keying made field goals on the feed's `scoring_play` + `shooting_play`
+flags instead of names. Verified across all ten seasons: drops nothing the
+whitelist caught, adds exactly the missing threes, and **changes zero rows in
+2024–2026** — so v1 and v2 are directly comparable on identical test data.
+
+**It was worth almost nothing.** Overall log loss moved +0.00001. The gain is
+real but confined to where possession matters — under 60s −0.0002, under 30s
+−0.0003, under 10s −0.0002, consistent in the logistic baseline too, and the
+logistic `possession` coefficient rose 0.068 → 0.077. The model had largely
+learned to work around the corrupted feature. Fixed anyway: the simulator
+depends on possession in a way the model does not, and a feature with two
+meanings inside one training set is a defect regardless.
+
+**Why nothing caught it, which is the part worth remembering.** The parity test
+compares the bulk path to the reference path — both were wrong identically. The
+manifest guard compares feature *names* — none changed. Every check compared the
+code to itself. `tests/test_possession_truth.py` now asserts the invariant
+against the rules of basketball instead, in every season, plus a regression test
+that renames every play type.
+
+## The near-miss this created
+
+After the fix, the folder briefly held code at state-rules v2 and a model
+trained under v1. The feature names matched, so `serve.py` loaded it happily.
+That is live train/serve skew — the thing the whole architecture exists to
+prevent — and the manifest walked straight past it.
+
+Fixed by `STATE_RULES_VERSION` in `schemas.py`, stamped into every artifact at
+publish and checked at load. v1 is stamped 1 and is now refused; a test asserts
+the refusal. **Bump it whenever the meaning of a GameState field changes.**
+
+## Also this session
+
+- Monitor re-run on v2: the one 40–20 min alert from v1 no longer fires. It was
+  marginal either way (z −3.1 against a threshold of 3.0), so treat it as
+  noise-adjacent, **not** as fixed by the possession change. Still worth the
+  investigation listed below.
+- 64 tests passing. Poller re-smoke-tested end to end on v2.
+
+## Where the endgame work stopped — resume here
+
+Phase 0 (the bar) and Phase 1 (input fixes) are **done**. Phase 2 (estimate the
+simulator's parameters from data) is **partly done and paused mid-measurement.**
+
+Established so far:
+
+- Free throws are fully recoverable: type 540 `MadeFreeThrow` covers made *and*
+  missed, distinguished by `scoring_play`, and `text` gives "makes/misses free
+  throw N of M" so sequence position is parseable.
+- Conversion by position, 2021–2026: `1 of 2` 0.744, `2 of 2` 0.757,
+  `1 of 3` 0.761, `2 of 3` 0.809, `3 of 3` 0.829. Late FT% is slightly *higher*
+  than the game average (0.728 overall, 0.748 in the last minute), not lower.
+- **Column schemas differ by season.** 2021 lacks `home_timeout_called` /
+  `away_timeout_called`; those exist only from 2023. `points_attempted` only from
+  2025. Use the 49-column intersection, or per-season handling.
+
+**The open question, mid-investigation:** `1 of 1` free throws convert at only
+**0.537** overall and 0.273 inside 30 seconds — far too low for a one-and-one
+front end, and the wrong direction late. They appear **only in 2026** (18,817 of
+them, 11.4% of that season's free throws) and in no earlier season. Sampled
+play context showed them as ordinary single shots after a common foul, some
+followed by offensive rebounds.
+
+Two candidate explanations, not yet distinguished:
+1. A men's rules change taking effect in 2026 (a one-and-one replacement, or a
+   change in how the bonus is awarded) — which would also mean the model's
+   `bonus_diff` feature, hard-coded to 7 = one-and-one and 10 = double bonus,
+   is wrong for 2026.
+2. A feed/encoding change where "1 of 1" now covers a mix of situations,
+   deliberate misses included.
+
+**Resolve this before building the simulator.** If it is (1), it affects
+`schemas.BONUS_FOULS` / `DOUBLE_BONUS_FOULS`, the `bonus_diff` feature, and the
+simulator's entire free-throw branch — and it would be a second instance of the
+same class of bug as the possession one: a rule encoded as a constant while the
+sport changed underneath it. Check the NCAA men's rule book for 2025-26 rather
+than inferring it from the feed alone.
+
+Phases 3–5 (simulator, lookup table, validation, blend) are **not started**.

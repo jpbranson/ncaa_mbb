@@ -228,7 +228,7 @@ def main() -> int:
     ap.add_argument("--date", help="slate to follow, YYYYMMDD (default: today)")
     ap.add_argument("--game", type=int, help="follow a single game id")
     ap.add_argument("--once", action="store_true", help="one pass, then exit")
-    ap.add_argument("--version", default="v1", help="model registry version")
+    ap.add_argument("--version", default="v2", help="model registry version")
     ap.add_argument("--registry", default=str(ROOT / "registry"))
     ap.add_argument("--context", default=str(ROOT / "registry/context_latest.json"))
     ap.add_argument("--out", default=None, help="JSONL output path")

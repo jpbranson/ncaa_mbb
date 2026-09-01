@@ -21,13 +21,13 @@ PBP = str(ROOT / "data/raw/pbp/pbp_2025.parquet")
 REGISTRY = ROOT / "registry"
 
 pytestmark = pytest.mark.skipif(
-    not (REGISTRY / "v1").exists() or not pathlib.Path(PBP).exists(),
+    not (REGISTRY / "v2").exists() or not pathlib.Path(PBP).exists(),
     reason="no model registry or pbp data built yet")
 
 
 @pytest.fixture(scope="module")
 def svc():
-    return WinProbabilityService(REGISTRY, "v1")
+    return WinProbabilityService(REGISTRY, "v2")
 
 
 @pytest.fixture(scope="module")

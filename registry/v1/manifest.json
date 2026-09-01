@@ -29,5 +29,7 @@
   "test_seasons": [
     2025,
     2026
-  ]
+  ],
+  "state_rules_version": 1,
+  "notes": "Superseded by v2. Fit BEFORE the possession fix, so it must not be served by code at state rules v2 - the guard in serve.py enforces this. Kept for provenance and for the v1-vs-v2 comparison."
 }

@@ -85,10 +85,14 @@ def states_lazy(lf: pl.LazyFrame, timeouts_at_tip: int = 4) -> pl.LazyFrame:
     )
     other = 1.0 - actor
     made = pl.col("scoring_play").fill_null(False)
+    shooting = pl.col("shooting_play").fill_null(False)
 
     poss_set = (
-        pl.when(t.is_in(MADE_SHOT_TYPES) & made).then(other)
-        .when(t.str.contains("FreeThrow") & made).then(other)
+        # Same rule, same order, as state._possession_after. Made field goals are
+        # detected by the scoring/shooting flags, not by play-type name - see the
+        # comment there for why the name whitelist was wrong for 2016-2019.
+        pl.when(t.str.contains("FreeThrow") & made).then(other)
+        .when(made & shooting).then(other)
         .when(t.is_in(["Defensive Rebound", "Offensive Rebound"])).then(actor)
         .when(t.str.contains("Turnover")).then(other)
         .when(t == "Steal").then(actor)

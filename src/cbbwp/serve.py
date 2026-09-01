@@ -10,7 +10,8 @@ from typing import Iterable, List
 
 import numpy as np
 
-from .schemas import Event, PregameContext, FEATURE_NAMES
+from .schemas import (Event, PregameContext, FEATURE_NAMES,
+                      STATE_RULES_VERSION)
 from .state import build_states
 from .features import build_feature_matrix
 from . import endgame
@@ -27,6 +28,19 @@ class WinProbabilityService:
             raise RuntimeError(
                 f"model {version} was fit on different features than this code builds; "
                 "the feature contract changed - refit or pin an older code version"
+            )
+        # The names can match while the MEANING has changed underneath them.
+        # A model fit before a state-rule change must not be served states built
+        # after it. An artifact with no stamp predates the check and is treated
+        # as version 1.
+        fit_rules = self.manifest.get("state_rules_version", 1)
+        if fit_rules != STATE_RULES_VERSION:
+            raise RuntimeError(
+                f"model {version} was fit with state rules v{fit_rules} but this "
+                f"code builds states with v{STATE_RULES_VERSION}. The feature NAMES "
+                "still match, so this would have been silent: the model would be "
+                "served inputs that mean something different from its training "
+                "data. Refit, or pin the code version that matches the artifact."
             )
         kind = self.manifest["kind"]
         if kind == "lightgbm":

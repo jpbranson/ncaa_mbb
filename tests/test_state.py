@@ -7,8 +7,13 @@ from cbbwp.state import build_states, clock_to_seconds, game_seconds_remaining
 HOME, AWAY = 10, 20
 
 
-def ev(seq, period, clock, hs, a_s, typ, team=None, scoring=False, sv=0):
-    return Event(1, seq, period, clock, hs, a_s, typ, team, sv, scoring, False)
+def ev(seq, period, clock, hs, a_s, typ, team=None, scoring=False, sv=0,
+       shooting=False):
+    # `shooting` matters: possession after a field goal is decided by the feed's
+    # scoring/shooting flags, not by the play-type name. Every real made field
+    # goal in the hoopR data carries shooting_play=True, so a fixture that omits
+    # it is not modelling the feed.
+    return Event(1, seq, period, clock, hs, a_s, typ, team, sv, scoring, shooting)
 
 
 def test_clock_parsing():
@@ -28,8 +33,8 @@ def test_game_clock_is_regulation_wide_and_ot_resets():
 def test_replay_is_order_independent():
     evs = [
         ev(1, 1, 1200, 0, 0, "Jumpball"),
-        ev(2, 1, 1180, 0, 2, "JumpShot", AWAY, True, 2),
-        ev(3, 1, 1160, 3, 2, "JumpShot", HOME, True, 3),
+        ev(2, 1, 1180, 0, 2, "JumpShot", AWAY, True, 2, shooting=True),
+        ev(3, 1, 1160, 3, 2, "JumpShot", HOME, True, 3, shooting=True),
     ]
     ctx = PregameContext(1, HOME, AWAY)
     a = build_states(evs, ctx)
@@ -41,8 +46,8 @@ def test_possession_rules():
     ctx = PregameContext(1, HOME, AWAY)
     s = build_states([
         ev(1, 1, 1200, 0, 0, "Jumpball"),
-        ev(2, 1, 1180, 2, 0, "JumpShot", HOME, True, 2),      # made -> away ball
-        ev(3, 1, 1160, 2, 0, "JumpShot", AWAY, False, 2),     # miss -> carry
+        ev(2, 1, 1180, 2, 0, "JumpShot", HOME, True, 2, shooting=True),   # made -> away ball
+        ev(3, 1, 1160, 2, 0, "JumpShot", AWAY, False, 2, shooting=True),  # miss -> carry
         ev(4, 1, 1158, 2, 0, "Defensive Rebound", HOME),      # home ball
         ev(5, 1, 1150, 2, 0, "Lost Ball Turnover", HOME),     # -> away ball
         ev(6, 1, 1148, 2, 0, "Steal", AWAY),                  # away ball

@@ -100,7 +100,7 @@ def main():
                     help="restrict a backtest to the last N days of the season")
     ap.add_argument("--glob", default=str(ROOT / "data/live/*.jsonl"))
     ap.add_argument("--registry", default=str(ROOT / "registry"))
-    ap.add_argument("--version", default="v1")
+    ap.add_argument("--version", default="v2")
     ap.add_argument("--json", default=None, help="also write the report here")
     ap.add_argument("--z", type=float, default=monitor.Z_ALERT)
     ap.add_argument("--min-gap", type=float, default=monitor.MIN_GAP)

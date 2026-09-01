@@ -11,10 +11,15 @@ numeric `type.id`, so this adapter maps id -> the text the model was TRAINED on
 and only falls back to whatever text the feed sent when the id is unknown.
 
 `TYPE_ID_TO_TEXT` was extracted from the 2016-2026 hoopR files: every
-(type_id, type_text) pair that actually occurs. Deliberately bug-compatible -
-e.g. id 30558 stays "Three Point Jump Shot", which the state builder does NOT
-treat as a made-shot possession flip, because that is how the model was fit.
-Fixing that is a model-version change, not an adapter change.
+(type_id, type_text) pair that actually occurs.
+
+Note what this map is and is not for. Possession no longer depends on play-type
+NAMES at all - `state._possession_after` keys made field goals on the feed's
+scoring/shooting flags, precisely because ESPN renamed the made-three type
+between 2019 and 2021 and a name whitelist silently missed 324,043 made threes.
+The map survives because the type text is still what the model was trained on
+for every OTHER rule (fouls, timeouts, rebounds, turnovers), and because an id
+is a more stable key for those than a display string.
 """
 from __future__ import annotations
 
