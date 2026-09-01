@@ -1,0 +1,33 @@
+{
+  "version": "v1",
+  "kind": "lightgbm",
+  "features": [
+    "margin",
+    "sqrt_time",
+    "margin_per_sqrt_time",
+    "possession",
+    "pregame_exp_margin",
+    "pregame_exp_margin_decayed",
+    "is_ot",
+    "timeout_diff",
+    "bonus_diff",
+    "ft_pct_diff",
+    "margin_per_sqrt_points_left"
+  ],
+  "sha256": "aaddca0d81606bc0",
+  "created": "2026-09-01T20:54:40.369382+00:00",
+  "train_seasons": [
+    2016,
+    2017,
+    2018,
+    2019,
+    2021,
+    2022,
+    2023
+  ],
+  "calibration_season": 2024,
+  "test_seasons": [
+    2025,
+    2026
+  ]
+}

@@ -1,0 +1,8 @@
+data/
+artifacts/
+registry/v1/model.txt
+tmp/
+reports/
+__pycache__/
+*.pyc
+.pytest_cache/
