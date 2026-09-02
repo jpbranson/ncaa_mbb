@@ -19,13 +19,17 @@ provenance where it exists and is deliberately refused at load by current code.
 - `~/Downloads/ncaa_mbb` on **cas-w7r21674vv** (this file's copy) — has
   `registry/v1`, so all 82 tests run with none skipped. Sessions 4 and 5's work
   was done here.
-- `C:\Users\jpbra\Downloads\mbb_prob_claude` on **jpbranson-desk** — session 3's
+- `%USERPROFILE%\Downloads\mbb_prob_claude` on **jpbranson-desk** — session 3's
   bit-identical rebuild. Lacks `registry/v1`, so one test skips there.
 
 Neither is stale in a way that matters for the model: session 3 proved the
 pipeline reproduces exactly across machines. Session 4's endgame work exists
 only in the Mac copy and in the project docs. Copy `registry/v1/` between them
 and they agree.
+
+Repository: **https://github.com/jpbranson/ncaa_mbb** (`main`, tagged
+`checkpoint-2026-09-02`). The folder is the source of truth; git is the backup
+and the history.
 
 Published results report (artifact, updatable by passing this URL as `url`):
 https://claude.ai/code/artifact/e474963f-e992-4ed3-a15c-edd8c95ee6dd

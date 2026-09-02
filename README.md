@@ -17,6 +17,8 @@ change has to beat: **`docs/cbbwp-CHECKPOINT.md`**. Running it live:
 Full explanation of the model, every design decision and its rejected
 alternative: **`docs/cbbwp-EXPLAIN.md`**. Read that first.
 
+Repository: https://github.com/jpbranson/ncaa_mbb
+
 ## Setup
 
 ```bash
