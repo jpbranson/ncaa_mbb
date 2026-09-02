@@ -1,0 +1,26 @@
+# The container path. Same entry point as the Mac; only the environment differs.
+#
+#   docker compose -f deploy/docker-compose.yml up --build
+#
+# The registry is mounted READ-ONLY on purpose: a serving process has no business
+# rewriting the model it is serving. Refresh the ratings snapshot wherever the
+# training data lives, then let this pick it up on restart.
+services:
+  cbbwp:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    image: cbbwp:latest
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8808:8808"
+    volumes:
+      - ../registry:/app/registry:ro
+      - cbbwp-live:/data/live
+    environment:
+      CBBWP_MODEL_VERSION: "v2"
+      CBBWP_RATINGS_MAX_AGE: "3"
+    stop_grace_period: 20s
+
+volumes:
+  cbbwp-live:

@@ -1142,9 +1142,14 @@ Beating a *broadcast* win probability model and beating a *market* are different
 | `src/cbbwp/monitor.py` | Calibration drift statistics. |
 | `src/cbbwp/serve.py` | The live scoring path and the version-pinning guard. |
 | `scripts/` | The pipeline, the live poller, the fixture tools, the monitor. |
+| `src/cbbwp/config.py` | Every deployment setting, from the environment, with working defaults. |
+| `src/cbbwp/api.py` | The read-only HTTP view of the live feed. Standard library only. |
+| `scripts/serve_live.py` | The deployment entry point: poller plus API, one process. |
+| `scripts/smoke_live.py` | The eight-step pre-flight check for a live night. |
+| `deploy/` | macOS LaunchAgents, Dockerfile, compose. Same entry point either way. |
 | `src/cbbwp/endgame_sim.py` | The endgame solver and lookup table. A documented diagnostic; **not** wired into `serve.py` — see §7.10. |
 | `registry/endgame/e1/` | The solved table, its manifest and a readable CSV of canonical states. |
-| `tests/` | 72 tests: state rules, feature contract, bulk parity, ESPN-adapter parity, endgame rules, replay harness, monitor statistics, endgame-table structure and the ESPN free-throw labelling convention. |
+| `tests/` | 82 tests: state rules, feature contract, bulk parity, ESPN-adapter parity, endgame rules, replay harness, monitor statistics, endgame-table structure and the ESPN free-throw labelling convention. |
 | `registry/v2/` | The pinned model artifact and manifest, stamped with the state-rules version. |
 | `registry/v1/` | The pre-fix model, kept for provenance. Refused at load by current code. |
 | `registry/context_latest.json` | Today's team ratings and season-to-date stats, for live games. |

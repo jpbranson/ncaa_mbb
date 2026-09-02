@@ -1,0 +1,10 @@
+data/
+artifacts/
+tmp/
+reports/
+.git/
+.pytest_cache/
+**/__pycache__/
+*.parquet
+*.npz
+docs/

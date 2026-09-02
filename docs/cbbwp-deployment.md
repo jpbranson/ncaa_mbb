@@ -1,0 +1,215 @@
+# Running this live
+
+*Companion to `cbbwp-CHECKPOINT.md`, which records exactly what is frozen.
+This document is the operational one: what to run, in what order, and what to
+look at when something is wrong.*
+
+## The one thing that is still unvalidated
+
+**The live path has never touched the real ESPN endpoint.** Neither the sandbox
+this was built in nor the Cowork device VM can reach `site.api.espn.com` — both
+fail with `Tunnel connection failed: 403 Forbidden`. Everything else is tested;
+this is the last link in the chain and it must be closed **before** a live
+night, not during one.
+
+```bash
+python3 scripts/smoke_live.py
+```
+
+Eight steps, one verdict. Exit codes are meaningful:
+
+| exit | meaning |
+|---|---|
+| 0 | all eight passed — the live path is validated |
+| 1 | something is broken; do not go live |
+| 2 | the offline steps passed but ESPN was unreachable, so the live path is **still unvalidated** |
+
+Exit 2 is not a pass. It is the state the project is in today.
+
+Step 6 is the one to read carefully: it reports **play type ids the model has
+never seen**. A frequent unknown id means ESPN changed the feed, and the honest
+fix is to refit with the new type present rather than to map it to something
+plausible.
+
+## Going live on the Mac
+
+```bash
+# once, on a machine with open network access
+python3 scripts/smoke_live.py            # must exit 0
+
+# install as background services
+bash deploy/install_macos.sh
+```
+
+That installs two LaunchAgents:
+
+| agent | what it does |
+|---|---|
+| `com.cbbwp.live` | always on. Polls the scoreboard, follows every live game, writes JSONL, serves the API on :8808 |
+| `com.cbbwp.ratings` | daily at 09:30. Rebuilds the ratings snapshot |
+
+Check it:
+
+```bash
+curl -s http://127.0.0.1:8808/health
+tail -f data/logs/live.log
+bash deploy/install_macos.sh --remove     # stop and uninstall
+```
+
+The poller is cheap when nothing is on — it rescans the scoreboard every two
+minutes and does nothing else — so leaving it running is simpler than scheduling
+it around a slate.
+
+## What it produces
+
+**JSONL**, appended, one file per day at `data/live/wp_YYYYMMDD.jsonl`. This is
+the record of truth; it survives the API dying, and it is what any later
+analysis should read.
+
+**HTTP**, read-only, on `127.0.0.1:8808`:
+
+| endpoint | |
+|---|---|
+| `GET /health` | liveness, model version, ratings freshness. **503 when degraded** |
+| `GET /games` | every game currently tracked, latest state each |
+| `GET /games/{id}` | one game, with recent history |
+
+Every response carries `model_version` and `state_rules_version`. A probability
+served without saying what produced it cannot be checked afterwards, and this
+project has already had one near-miss where a model and the code feeding it
+disagreed about what a feature meant.
+
+The API binds to localhost by default. Set `CBBWP_API_HOST=0.0.0.0` only behind
+something that terminates TLS and controls access — there is no auth, because
+there is nothing to authenticate: it is a read-only view of public scores.
+
+## The ratings refresh is two steps, not one
+
+This is the operational trap worth knowing about.
+
+`build_live_context.py` computes ratings from `data/proc/games.parquet`, which
+only changes when `fetch_data.py` runs. **Rebuilding the snapshot without
+refreshing the data underneath it produces a file with today's timestamp and
+last month's ratings** — and until now nothing would have said so.
+
+So the snapshot records `latest_game_date`, the newest completed game the
+ratings actually saw, and `/health` reports `data_age_days` beside
+`ratings_age_days`. If the newest completed game is more than 10 days old
+*during the season*, the service reports **degraded** and the smoke test fails.
+Out of season it stays quiet, because between mid-April and November the newest
+game is meant to be months old.
+
+In season, weekly:
+
+```bash
+python3 scripts/fetch_data.py --seasons 2027    # refresh the play-by-play first
+python3 scripts/build_games.py
+python3 scripts/build_team_stats.py
+python3 scripts/build_live_context.py           # then rebuild the snapshot
+```
+
+In the preseason, `build_live_context.py` correctly falls back to last season's
+ratings at 0.70 carryover and says so.
+
+## Changing the model later
+
+This was a requirement, so it is a config change and a restart — never an edit:
+
+```bash
+CBBWP_MODEL_VERSION=v3 python3 scripts/serve_live.py
+```
+
+or change the value in `~/Library/LaunchAgents/com.cbbwp.live.plist` and reload.
+
+To publish a new version:
+
+```bash
+python3 scripts/fit_models.py         # needs ~6 GB RAM
+python3 scripts/publish_model.py v3   # writes registry/v3 + manifest
+python3 scripts/smoke_live.py         # confirm it loads and serves
+```
+
+Three guards make a careless swap fail at startup rather than silently:
+
+1. **The feature contract.** `serve.py` refuses a model whose feature list
+   differs from what the code builds.
+2. **`STATE_RULES_VERSION`.** It refuses a model fit under different state
+   rules even when the feature *names* still match — the case that nearly
+   shipped train/serve skew on 2026-09-01. **Bump it whenever the meaning of a
+   `GameState` field changes, and refit.**
+3. **Startup ordering.** `serve_live.py` loads the model before it binds a port
+   or opens a file, so a bad version is a failure to start, not a failure at
+   tip-off.
+
+Old versions stay in `registry/`. `registry/v1` is deliberately refused at load
+by current code and kept only for provenance — that refusal is itself tested.
+
+## The container, when you want it
+
+The same entry point; only the environment differs.
+
+```bash
+docker compose -f deploy/docker-compose.yml up --build
+curl -s http://127.0.0.1:8808/health
+```
+
+The image contains the code and **not** the 527 MB of training data: it scores
+games, it does not fit models. The registry is mounted read-only, because a
+serving process has no business rewriting the model it serves. Rebuild the
+ratings snapshot wherever the training data lives, and restart the container to
+pick it up.
+
+## Configuration
+
+Every setting is an environment variable with a working default, so a bare
+`python3 scripts/serve_live.py` does the right thing on a laptop.
+
+| variable | default | |
+|---|---|---|
+| `CBBWP_MODEL_VERSION` | `v2` | which model serves |
+| `CBBWP_REGISTRY` | `<root>/registry` | where artifacts live |
+| `CBBWP_CONTEXT` | `<registry>/context_latest.json` | ratings snapshot |
+| `CBBWP_LIVE_DIR` | `<root>/data/live` | JSONL output |
+| `CBBWP_API_HOST` / `CBBWP_API_PORT` | `127.0.0.1` / `8808` | API bind |
+| `CBBWP_API_HISTORY` | `240` | states kept per game in memory |
+| `CBBWP_RATINGS_MAX_AGE` | `3` | days before the snapshot file is called stale |
+| `CBBWP_FIXTURE_DIR` | unset | replay from disk instead of the network |
+
+Every entry point prints its resolved settings at startup, and names which came
+from the environment. A service quietly reading the wrong directory is the
+outage that costs the most to diagnose.
+
+## When something looks wrong
+
+**A probability that looks absurd.** Pull the game and look at the states:
+`python3 scripts/live_poller.py --game <id> --once`. It prints the last ten
+states with margin and clock, and warns if either team is missing from the
+ratings snapshot.
+
+**`/health` says degraded.** Read `reason`. It distinguishes "the snapshot file
+is old" from "the data behind the ratings is old" — different fixes.
+
+**Suspect the feed changed.** Record and inspect:
+`python3 scripts/record_espn_fixtures.py --limit 10` then
+`python3 scripts/check_espn_fixtures.py`. Unknown play type ids are the signal.
+
+**Reproduce a night offline.** Fixtures replay with no network at all:
+`CBBWP_FIXTURE_DIR=tmp/fixtures python3 scripts/serve_live.py --once`.
+
+**The poller stops following a game.** It gives up after 8 consecutive fetch
+failures and logs it. Discovery rescans every 120s, so a game usually comes
+back on its own; the JSONL will show the gap.
+
+## Known limits, carried into production deliberately
+
+- **The live path is unvalidated against the real endpoint** (top of this file).
+- **No licensed spread.** The pregame term uses ratings built from scratch;
+  a closing spread would close roughly 0.8 points of RMSE and is the single
+  largest available gain.
+- **The 40–20 minute bucket is 2–3× worse calibrated** than any other. Probably
+  the shape of the pregame decay rather than its strength.
+- **Late-game home advantage** is zeroed by the symmetry mirroring rather than
+  flipped (EXPLAIN §8.1) — the largest single accuracy gain available.
+- **The endgame table is built, tested and not wired in** (EXPLAIN §7.10). It
+  missed its pre-registered bar at 0.40% against 1%.
+- **No auth on the API**, by design. Do not expose it without a proxy.

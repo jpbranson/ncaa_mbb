@@ -62,13 +62,18 @@ ERROR_BACKOFF = (5.0, 15.0, 45.0, 90.0)   # per consecutive failure
 class Poller:
     def __init__(self, svc: WinProbabilityService, ctx: LiveContextProvider,
                  client: EspnClient, out_path: pathlib.Path, quiet: bool = False,
-                 fixture_dir: Optional[pathlib.Path] = None):
+                 fixture_dir: Optional[pathlib.Path] = None,
+                 sink=None):
+        # `sink` lets another process-local consumer -- the HTTP API -- see each
+        # emitted state without this module knowing anything about it. JSONL
+        # remains the record of truth; the sink is a view.
         self.svc = svc
         self.ctx = ctx
         self.client = client
         self.out_path = out_path
         self.quiet = quiet
         self.fixture_dir = fixture_dir
+        self.sink = sink
         self.sem = asyncio.Semaphore(MAX_CONCURRENT_FETCHES)
         self.watchers: Dict[int, asyncio.Task] = {}
         self.last_emitted: Dict[int, tuple] = {}
@@ -93,6 +98,13 @@ class Poller:
 
     def emit(self, row: dict, header) -> None:
         self._fh.write(json.dumps(row) + "\n")
+        if self.sink is not None:
+            try:
+                self.sink(row)
+            except Exception as e:                     # noqa: BLE001
+                # A failing view must never take down the feed.
+                print(f"sink failed ({type(e).__name__}: {e})",
+                      file=sys.stderr, flush=True)
         if self.quiet:
             return
         secs = row["game_seconds_remaining"]
@@ -217,6 +229,8 @@ class Poller:
             print(f"  P{r['period']} {mm:>2}:{ss:02d}  margin {r['margin']:>+4}  "
                   f"home {r['home_win_prob']:.4f}")
             self._fh.write(json.dumps(r) + "\n")
+            if self.sink is not None:
+                self.sink(r)
 
     def close(self) -> None:
         self._fh.close()

@@ -26,6 +26,17 @@ DEFAULT_HCA = 3.4
 DEFAULT_FT = 0.700
 DEFAULT_PPM = 3.45
 STALE_AFTER_DAYS = 3
+# In season, teams play at least twice a week. Ratings whose newest completed
+# game is older than this are being fit on a stale copy of the data, whatever
+# the snapshot file's own timestamp says.
+DATA_STALE_AFTER_DAYS = 10
+
+# ...but only while the sport is being played. Between mid-April and the start
+# of November the newest completed game is MEANT to be months old, and carrying
+# the previous season's ratings forward is the documented preseason behaviour.
+# A staleness alarm that cries every summer is one nobody reads in January.
+SEASON_START_MONTH = 11          # November
+SEASON_END_MONTH, SEASON_END_DAY = 4, 15   # through April 15
 
 
 @dataclass
@@ -36,6 +47,7 @@ class LiveContextProvider:
     ft_pct: Dict[int, float]
     ppm: Dict[int, float]
     generated: str = ""
+    latest_game_date: str = ""      # newest COMPLETED game the ratings saw
 
     @classmethod
     def load(cls, path: str | pathlib.Path) -> "LiveContextProvider":
@@ -48,6 +60,7 @@ class LiveContextProvider:
             ft_pct=as_int(d.get("ft_pct")),
             ppm=as_int(d.get("ppm")),
             generated=str(d.get("generated", "")),
+            latest_game_date=str(d.get("latest_game_date", "")),
         )
 
     @property
@@ -63,8 +76,45 @@ class LiveContextProvider:
         return (_dt.datetime.now(_dt.timezone.utc) - t).total_seconds() / 86400.0
 
     @property
+    def data_age_days(self) -> float | None:
+        """Days since the newest COMPLETED game these ratings were fit on.
+
+        `age_days` says when the snapshot file was written; this says how
+        current the data behind it is. They come apart in the way that matters:
+        a nightly job rebuilding from three-week-old parquet writes a file that
+        looks perfectly fresh and carries three-week-old ratings. Only this
+        property notices.
+
+        None in the preseason, where there are no completed games yet and
+        carrying last season's ratings forward is the documented behaviour.
+        """
+        if not self.latest_game_date:
+            return None
+        try:
+            t = _dt.datetime.fromisoformat(self.latest_game_date)
+        except ValueError:
+            return None
+        if t.tzinfo is None:
+            t = t.replace(tzinfo=_dt.timezone.utc)
+        return (_dt.datetime.now(_dt.timezone.utc) - t).total_seconds() / 86400.0
+
+    @staticmethod
+    def _in_season(now: "_dt.datetime | None" = None) -> bool:
+        n = now or _dt.datetime.now(_dt.timezone.utc)
+        if n.month >= SEASON_START_MONTH or n.month < SEASON_END_MONTH:
+            return True
+        return n.month == SEASON_END_MONTH and n.day <= SEASON_END_DAY
+
+    @property
+    def data_is_stale(self) -> bool:
+        """True only when we can tell, it matters, and the answer is bad."""
+        d = self.data_age_days
+        return (d is not None and d > DATA_STALE_AFTER_DAYS
+                and self._in_season())
+
+    @property
     def is_stale(self) -> bool:
-        return self.age_days > STALE_AFTER_DAYS
+        return self.age_days > STALE_AFTER_DAYS or self.data_is_stale
 
     def context_for(self, game_id: int, home_team_id: int, away_team_id: int,
                     neutral_site: bool = False) -> PregameContext:

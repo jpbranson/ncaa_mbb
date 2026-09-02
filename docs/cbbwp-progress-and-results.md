@@ -1,10 +1,15 @@
 # CBB Win Probability — build log and re-entry point
 
-**Last worked: 2026-09-02 (session 4).** Phases 1–5 of the main model are
-complete except a live smoke test against the real ESPN endpoint. The **endgame
-simulator is finished and has been tested once. It does not ship** — see
-`cbbwp-endgame-results.md`. All five pre-registered criteria were evaluated;
-it cleared four.
+**Last worked: 2026-09-02 (session 5).** The model is **checkpointed at
+`registry/v2` and tagged `checkpoint-2026-09-02`** — see `cbbwp-CHECKPOINT.md`.
+Deployment scaffolding is built and tested: `cbbwp-deployment.md` is the run
+book. The **endgame simulator is finished, tested once, and does not ship**
+(`cbbwp-endgame-results.md`).
+
+**The one open item is the live smoke test.** `python3 scripts/smoke_live.py`
+closes it in a single command, but it must run somewhere that can reach
+`site.api.espn.com`. Neither sandbox can — both get
+`Tunnel connection failed: 403 Forbidden`.
 
 Shipped model is **v2** (`registry/v2`, sha `2d4bf58134fa2e64`). v1 is kept for
 provenance where it exists and is deliberately refused at load by current code.
@@ -198,16 +203,54 @@ foul type names (519/521) are stable across all ten seasons, and the free-throw
 label change was a text-format change, not a rule change. The habit of checking
 the sport rather than the code is what settled both.
 
+## Session 5 (2026-09-02) — checkpoint and deployment
+
+Tagged `checkpoint-2026-09-02`. `cbbwp-CHECKPOINT.md` records the frozen shas,
+the scores, and what a future change has to beat. `cbbwp-deployment.md` is the
+run book. Nothing about the model changed.
+
+New:
+
+- `scripts/smoke_live.py` — the eight-step pre-flight check, one command. Exit 0
+  all pass, 1 broken, **2 = offline steps pass but ESPN unreachable, so the live
+  path is still unvalidated**. Exit 2 is where the project is today.
+- `scripts/serve_live.py` — the deployment entry point: poller and API in one
+  process, identical on a laptop and in a container.
+- `src/cbbwp/api.py` — read-only HTTP (`/health`, `/games`, `/games/{id}`),
+  standard library only. Every response carries `model_version` and
+  `state_rules_version`.
+- `src/cbbwp/config.py` — every setting is an environment variable with a
+  working default. Swapping the model is `CBBWP_MODEL_VERSION=v3` and a
+  restart, never an edit.
+- `deploy/` — `install_macos.sh` (two LaunchAgents), `Dockerfile`,
+  `docker-compose.yml`. Same entry point either way.
+
+**A silent-staleness bug found and fixed.** `LiveContextProvider.age_days`
+measured when the snapshot FILE was written, not how current the data behind it
+was. A nightly rebuild over stale play-by-play would have written a file that
+reported itself perfectly fresh while carrying month-old ratings — no symptom,
+exactly like the possession bug. The snapshot now records `latest_game_date`,
+`data_age_days` sits beside `ratings_age_days` in `/health`, and a stale one
+returns 503. Scoped to November–15 April so it does not cry all summer.
+
+**The ratings refresh is two steps, not one:** `fetch_data.py` then
+`build_live_context.py`. Rebuilding the snapshot alone only refreshes its
+timestamp.
+
+82 tests, none skipped. `tests/test_live_deployment.py` covers config, the API
+and the freshness signal.
+
 ## Next up
 
-1. **The live smoke test.** On a machine that can reach `site.api.espn.com`:
-   `python3 scripts/record_espn_fixtures.py --limit 5`, then
-   `python3 scripts/check_espn_fixtures.py`, then
-   `python3 scripts/live_poller.py --game <id> --once`. This is the only
-   unvalidated link in the chain and it must happen before the first live night.
-2. **Refresh the ratings for the 2027 season** once games start:
-   `python3 scripts/build_live_context.py --season 2027`, daily. In the preseason
-   it correctly falls back to 2026 ratings at 0.70 carryover.
+1. **The live smoke test — the only thing between here and production.**
+   On a machine that can reach `site.api.espn.com`: `python3 scripts/smoke_live.py`.
+   It must exit 0. Read step 6 carefully: unknown play type ids mean the ESPN
+   feed changed, and the honest fix is to refit with the new type present.
+2. **Then install it:** `bash deploy/install_macos.sh`, and
+   `curl -s http://127.0.0.1:8808/health`.
+3. **Refresh the ratings for the 2027 season** once games start — data first,
+   then snapshot (see above), weekly in season. In the preseason it correctly
+   falls back to 2026 ratings at 0.70 carryover.
 3. **Investigate the 40–20 minute over-confidence.** That bucket's ECE is 2–3x
    every other bucket's, consistently. Likely the shape of the pregame decay
    rather than its strength.

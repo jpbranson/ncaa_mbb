@@ -60,8 +60,18 @@ if cur.height and pbp.exists():
     for tid, tot, g in long.iter_rows():
         ppm[int(tid)] = (tot + LEAGUE_PPM * 40 * 5) / ((g + 5) * 40)
 
+# The date of the newest completed game these ratings were fit on. Without it,
+# the only freshness signal is when this file was written -- so a nightly job
+# running over a stale data copy produces a snapshot that reports itself fresh
+# and is not. See LiveContextProvider.data_age_days.
+latest_game_date = ""
+if cur.height and "date" in cur.columns:
+    m = cur["date"].max()
+    latest_game_date = m.isoformat() if hasattr(m, "isoformat") else str(m)
+
 out = {
     "generated": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+    "latest_game_date": latest_game_date,
     "season": season,
     "hca": hca,
     "n_completed_games": cur.height,
@@ -73,3 +83,4 @@ dest = pathlib.Path(a.out)
 dest.parent.mkdir(parents=True, exist_ok=True)
 dest.write_text(json.dumps(out))
 print(f"wrote {dest}  ({len(ratings)} ratings, {len(ft_pct)} ft, {len(ppm)} ppm)")
+print(f"  newest completed game: {latest_game_date or 'none yet (preseason)'}")

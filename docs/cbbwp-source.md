@@ -1,5 +1,5 @@
 # `cbbwp` source bundle
-Complete source. Regenerated 2026-09-02 16:18 from the `ncaa_mbb` working folder, at commit `441f496`.
+Complete source. Regenerated 2026-09-02 16:45 from the `ncaa_mbb` working folder, at commit `ae88bcb`.
 
 State rules v2, model v2. This bundle is a mirror for disaster recovery; the folder is the source of truth (it also holds the data, the fitted model and the git history). Regenerate with `python3 scripts/build_source_bundle.py` whenever the source changes.
 
@@ -572,6 +572,190 @@ def states_lazy(lf: pl.LazyFrame, timeouts_at_tip: int = 4) -> pl.LazyFrame:
     )
 ```
 
+## `src/cbbwp/api.py`
+
+```py
+"""A read-only HTTP view of what the poller is currently producing.
+
+Deliberately the standard library and nothing else. This runs beside a live feed
+on a laptop or in a small container, and a web framework would be a dependency,
+a version to keep current and a CVE feed to watch, in exchange for routing three
+endpoints.
+
+    GET /                index of endpoints
+    GET /health          liveness, model version, ratings freshness
+    GET /games           every game currently tracked, latest state each
+    GET /games/<id>      one game, with recent history
+
+**Every response carries `model_version` and `state_rules_version`.** A number
+served without saying what produced it cannot be checked later, and this project
+has already had one near-miss where a model and the code that fed it disagreed
+about what a feature meant.
+
+The store is written by the poller's asyncio thread and read by the HTTP
+threads, so it takes a lock. The critical sections are dictionary writes.
+"""
+from __future__ import annotations
+
+import collections
+import datetime
+import json
+import threading
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from typing import Any, Callable, Optional
+from urllib.parse import urlparse
+
+from .schemas import STATE_RULES_VERSION
+
+
+class LiveStore:
+    """Latest state per game, plus a bounded tail of history."""
+
+    def __init__(self, history: int = 240):
+        self._lock = threading.Lock()
+        self._latest: dict[int, dict] = {}
+        self._history: dict[int, collections.deque] = {}
+        self._history_len = history
+        self._updates = 0
+        self._last_update: Optional[float] = None
+
+    def update(self, row: dict) -> None:
+        gid = int(row["game_id"])
+        with self._lock:
+            self._latest[gid] = row
+            d = self._history.get(gid)
+            if d is None:
+                d = self._history[gid] = collections.deque(maxlen=self._history_len)
+            d.append({k: row[k] for k in
+                      ("seq", "period", "game_seconds_remaining", "margin",
+                       "home_win_prob") if k in row})
+            self._updates += 1
+            self._last_update = time.time()
+
+    def games(self) -> list[dict]:
+        with self._lock:
+            rows = list(self._latest.values())
+        return sorted(rows, key=lambda r: r.get("game_seconds_remaining", 1e9))
+
+    def game(self, game_id: int) -> Optional[dict]:
+        with self._lock:
+            latest = self._latest.get(game_id)
+            hist = list(self._history.get(game_id, ()))
+        if latest is None:
+            return None
+        return {**latest, "history": hist}
+
+    def stats(self) -> dict:
+        with self._lock:
+            return {"games_tracked": len(self._latest), "updates": self._updates,
+                    "last_update": self._last_update}
+
+
+def _iso(ts: Optional[float]) -> Optional[str]:
+    if ts is None:
+        return None
+    return datetime.datetime.fromtimestamp(ts, datetime.timezone.utc).isoformat()
+
+
+def make_handler(store: LiveStore, meta: dict,
+                 ratings_age_days: Callable[[], Optional[float]],
+                 started: float,
+                 data_age_days: Callable[[], Optional[float]] = lambda: None,
+                 data_is_stale: Callable[[], bool] = lambda: False):
+    class Handler(BaseHTTPRequestHandler):
+        server_version = "cbbwp/" + str(meta.get("model_version", "?"))
+        protocol_version = "HTTP/1.1"
+
+        def log_message(self, fmt: str, *args: Any) -> None:  # noqa: A003
+            return   # the poller owns stdout; access logs would bury it
+
+        def _send(self, code: int, payload: dict) -> None:
+            body = json.dumps(payload, indent=2, default=str).encode()
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            # A future front end will be a separate origin; this is a read-only
+            # public-by-nature feed, so allowing that is not a widening of access.
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
+
+        def _envelope(self, extra: dict) -> dict:
+            return {"model_version": meta.get("model_version"),
+                    "state_rules_version": STATE_RULES_VERSION,
+                    "served_at": _iso(time.time()), **extra}
+
+        def do_GET(self) -> None:  # noqa: N802
+            path = urlparse(self.path).path.rstrip("/") or "/"
+
+            if path == "/":
+                return self._send(200, self._envelope({"endpoints": {
+                    "/health": "liveness, model version, ratings freshness",
+                    "/games": "every game currently tracked",
+                    "/games/{game_id}": "one game, with recent history"}}))
+
+            if path in ("/health", "/healthz"):
+                age = ratings_age_days()
+                dage = data_age_days()
+                file_stale = age is not None and age > meta.get("ratings_max_age_days", 3)
+                feed_stale = data_is_stale()
+                s = store.stats()
+                ok = not (file_stale or feed_stale)
+                reason = None
+                if feed_stale:
+                    reason = ("ratings were fit on stale data -- newest completed "
+                              f"game is {dage:.1f} days old; refresh the play-by-play "
+                              "before rebuilding the snapshot")
+                elif file_stale:
+                    reason = "ratings snapshot file is stale; re-run build_live_context.py"
+                return self._send(200 if ok else 503, self._envelope({
+                    "status": "ok" if ok else "degraded",
+                    "reason": reason,
+                    "uptime_seconds": round(time.time() - started, 1),
+                    "ratings_age_days": None if age is None else round(age, 2),
+                    "data_age_days": None if dage is None else round(dage, 2),
+                    "games_tracked": s["games_tracked"],
+                    "updates": s["updates"],
+                    "last_update": _iso(s["last_update"]),
+                }))
+
+            if path == "/games":
+                return self._send(200, self._envelope({"games": store.games()}))
+
+            if path.startswith("/games/"):
+                raw = path.split("/", 2)[2]
+                if not raw.isdigit():
+                    return self._send(400, self._envelope(
+                        {"error": "game id must be numeric", "got": raw}))
+                g = store.game(int(raw))
+                if g is None:
+                    return self._send(404, self._envelope(
+                        {"error": "not tracked", "game_id": int(raw)}))
+                return self._send(200, self._envelope({"game": g}))
+
+            self._send(404, self._envelope({"error": "no such endpoint",
+                                            "path": path}))
+
+    return Handler
+
+
+def serve_in_thread(store: LiveStore, meta: dict,
+                    ratings_age_days: Callable[[], Optional[float]],
+                    host: str, port: int,
+                    data_age_days: Callable[[], Optional[float]] = lambda: None,
+                    data_is_stale: Callable[[], bool] = lambda: False) -> ThreadingHTTPServer:
+    """Start the API on a daemon thread and return the server."""
+    handler = make_handler(store, meta, ratings_age_days, time.time(),
+                           data_age_days, data_is_stale)
+    httpd = ThreadingHTTPServer((host, port), handler)
+    httpd.daemon_threads = True
+    threading.Thread(target=httpd.serve_forever, name="cbbwp-api",
+                     daemon=True).start()
+    return httpd
+```
+
 ## `src/cbbwp/calibration.py`
 
 ```py
@@ -628,6 +812,105 @@ class TimeBucketedCalibrator:
         w = np.clip((s - lo) / np.maximum(hi - lo, 1e-9), 0.0, 1.0)
         out = cols[np.arange(len(p)), idx - 1] * (1 - w) + cols[np.arange(len(p)), idx] * w
         return np.clip(out, *CLIP)
+```
+
+## `src/cbbwp/config.py`
+
+```py
+"""One place where deployment settings come from, for every entry point.
+
+The Mac and a container differ in paths and nothing else, so the difference is
+expressed as environment variables rather than as two copies of the code. Every
+setting has a working default, so `python3 scripts/serve_live.py` does the right
+thing on a laptop with no environment set at all.
+
+The model version is deliberately a setting rather than a constant. Swapping
+which model serves is then a config change and a restart -- not an edit -- which
+is what keeps "we can change the model later" true in practice. `serve.py` still
+refuses to load an artifact whose state-rules version disagrees with the code,
+so a careless swap fails loudly at startup instead of silently serving skew.
+
+    CBBWP_ROOT              project root (default: the repo this file is in)
+    CBBWP_REGISTRY          model registry dir      (default: <root>/registry)
+    CBBWP_MODEL_VERSION     which model to serve    (default: v2)
+    CBBWP_CONTEXT           ratings snapshot path   (default: <registry>/context_latest.json)
+    CBBWP_LIVE_DIR          JSONL output dir        (default: <root>/data/live)
+    CBBWP_FIXTURE_DIR       replay from disk instead of the network (default: unset)
+    CBBWP_API_HOST          API bind address        (default: 127.0.0.1)
+    CBBWP_API_PORT          API port                (default: 8808)
+    CBBWP_API_HISTORY       states kept per game    (default: 240)
+    CBBWP_RATINGS_MAX_AGE   days before the snapshot is called stale (default: 3)
+"""
+from __future__ import annotations
+
+import os
+import pathlib
+from dataclasses import dataclass, field
+
+_HERE = pathlib.Path(__file__).resolve()
+_DEFAULT_ROOT = _HERE.parents[2]
+
+
+def _env(name: str, default: str) -> str:
+    v = os.environ.get(name)
+    return default if v is None or v == "" else v
+
+
+@dataclass(frozen=True)
+class Settings:
+    root: pathlib.Path
+    registry: pathlib.Path
+    model_version: str
+    context_path: pathlib.Path
+    live_dir: pathlib.Path
+    fixture_dir: pathlib.Path | None
+    api_host: str
+    api_port: int
+    api_history: int
+    ratings_max_age_days: float
+    _source: dict = field(default_factory=dict, repr=False)
+
+    @classmethod
+    def from_env(cls) -> "Settings":
+        root = pathlib.Path(_env("CBBWP_ROOT", str(_DEFAULT_ROOT))).resolve()
+        registry = pathlib.Path(_env("CBBWP_REGISTRY", str(root / "registry")))
+        fixture = os.environ.get("CBBWP_FIXTURE_DIR") or None
+        overridden = {k: os.environ[k] for k in os.environ if k.startswith("CBBWP_")}
+        return cls(
+            root=root,
+            registry=registry,
+            model_version=_env("CBBWP_MODEL_VERSION", "v2"),
+            context_path=pathlib.Path(
+                _env("CBBWP_CONTEXT", str(registry / "context_latest.json"))),
+            live_dir=pathlib.Path(_env("CBBWP_LIVE_DIR", str(root / "data" / "live"))),
+            fixture_dir=pathlib.Path(fixture) if fixture else None,
+            api_host=_env("CBBWP_API_HOST", "127.0.0.1"),
+            api_port=int(_env("CBBWP_API_PORT", "8808")),
+            api_history=int(_env("CBBWP_API_HISTORY", "240")),
+            ratings_max_age_days=float(_env("CBBWP_RATINGS_MAX_AGE", "3")),
+            _source=overridden,
+        )
+
+    def describe(self) -> str:
+        """What every entry point prints at startup.
+
+        Printing the resolved settings, and which of them came from the
+        environment, is the cheapest possible defence against the class of
+        outage where a service is quietly serving from the wrong directory.
+        """
+        lines = [
+            f"  root            {self.root}",
+            f"  registry        {self.registry}",
+            f"  model version   {self.model_version}",
+            f"  ratings         {self.context_path}",
+            f"  live output     {self.live_dir}",
+            f"  api             http://{self.api_host}:{self.api_port}",
+        ]
+        if self.fixture_dir:
+            lines.append(f"  FIXTURES        {self.fixture_dir}  (no network)")
+        if self._source:
+            lines.append(f"  from environment: {', '.join(sorted(self._source))}")
+        return "\n".join(lines)
 ```
 
 ## `src/cbbwp/endgame.py`
@@ -1299,6 +1582,17 @@ DEFAULT_HCA = 3.4
 DEFAULT_FT = 0.700
 DEFAULT_PPM = 3.45
 STALE_AFTER_DAYS = 3
+# In season, teams play at least twice a week. Ratings whose newest completed
+# game is older than this are being fit on a stale copy of the data, whatever
+# the snapshot file's own timestamp says.
+DATA_STALE_AFTER_DAYS = 10
+
+# ...but only while the sport is being played. Between mid-April and the start
+# of November the newest completed game is MEANT to be months old, and carrying
+# the previous season's ratings forward is the documented preseason behaviour.
+# A staleness alarm that cries every summer is one nobody reads in January.
+SEASON_START_MONTH = 11          # November
+SEASON_END_MONTH, SEASON_END_DAY = 4, 15   # through April 15
 
 
 @dataclass
@@ -1309,6 +1603,7 @@ class LiveContextProvider:
     ft_pct: Dict[int, float]
     ppm: Dict[int, float]
     generated: str = ""
+    latest_game_date: str = ""      # newest COMPLETED game the ratings saw
 
     @classmethod
     def load(cls, path: str | pathlib.Path) -> "LiveContextProvider":
@@ -1321,6 +1616,7 @@ class LiveContextProvider:
             ft_pct=as_int(d.get("ft_pct")),
             ppm=as_int(d.get("ppm")),
             generated=str(d.get("generated", "")),
+            latest_game_date=str(d.get("latest_game_date", "")),
         )
 
     @property
@@ -1336,8 +1632,45 @@ class LiveContextProvider:
         return (_dt.datetime.now(_dt.timezone.utc) - t).total_seconds() / 86400.0
 
     @property
+    def data_age_days(self) -> float | None:
+        """Days since the newest COMPLETED game these ratings were fit on.
+
+        `age_days` says when the snapshot file was written; this says how
+        current the data behind it is. They come apart in the way that matters:
+        a nightly job rebuilding from three-week-old parquet writes a file that
+        looks perfectly fresh and carries three-week-old ratings. Only this
+        property notices.
+
+        None in the preseason, where there are no completed games yet and
+        carrying last season's ratings forward is the documented behaviour.
+        """
+        if not self.latest_game_date:
+            return None
+        try:
+            t = _dt.datetime.fromisoformat(self.latest_game_date)
+        except ValueError:
+            return None
+        if t.tzinfo is None:
+            t = t.replace(tzinfo=_dt.timezone.utc)
+        return (_dt.datetime.now(_dt.timezone.utc) - t).total_seconds() / 86400.0
+
+    @staticmethod
+    def _in_season(now: "_dt.datetime | None" = None) -> bool:
+        n = now or _dt.datetime.now(_dt.timezone.utc)
+        if n.month >= SEASON_START_MONTH or n.month < SEASON_END_MONTH:
+            return True
+        return n.month == SEASON_END_MONTH and n.day <= SEASON_END_DAY
+
+    @property
+    def data_is_stale(self) -> bool:
+        """True only when we can tell, it matters, and the answer is bad."""
+        d = self.data_age_days
+        return (d is not None and d > DATA_STALE_AFTER_DAYS
+                and self._in_season())
+
+    @property
     def is_stale(self) -> bool:
-        return self.age_days > STALE_AFTER_DAYS
+        return self.age_days > STALE_AFTER_DAYS or self.data_is_stale
 
     def context_for(self, game_id: int, home_team_id: int, away_team_id: int,
                     neutral_site: bool = False) -> PregameContext:
@@ -2699,8 +3032,18 @@ if cur.height and pbp.exists():
     for tid, tot, g in long.iter_rows():
         ppm[int(tid)] = (tot + LEAGUE_PPM * 40 * 5) / ((g + 5) * 40)
 
+# The date of the newest completed game these ratings were fit on. Without it,
+# the only freshness signal is when this file was written -- so a nightly job
+# running over a stale data copy produces a snapshot that reports itself fresh
+# and is not. See LiveContextProvider.data_age_days.
+latest_game_date = ""
+if cur.height and "date" in cur.columns:
+    m = cur["date"].max()
+    latest_game_date = m.isoformat() if hasattr(m, "isoformat") else str(m)
+
 out = {
     "generated": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+    "latest_game_date": latest_game_date,
     "season": season,
     "hca": hca,
     "n_completed_games": cur.height,
@@ -2712,6 +3055,7 @@ dest = pathlib.Path(a.out)
 dest.parent.mkdir(parents=True, exist_ok=True)
 dest.write_text(json.dumps(out))
 print(f"wrote {dest}  ({len(ratings)} ratings, {len(ft_pct)} ft, {len(ppm)} ppm)")
+print(f"  newest completed game: {latest_game_date or 'none yet (preseason)'}")
 ```
 
 ## `scripts/build_team_stats.py`
@@ -3890,13 +4234,18 @@ ERROR_BACKOFF = (5.0, 15.0, 45.0, 90.0)   # per consecutive failure
 class Poller:
     def __init__(self, svc: WinProbabilityService, ctx: LiveContextProvider,
                  client: EspnClient, out_path: pathlib.Path, quiet: bool = False,
-                 fixture_dir: Optional[pathlib.Path] = None):
+                 fixture_dir: Optional[pathlib.Path] = None,
+                 sink=None):
+        # `sink` lets another process-local consumer -- the HTTP API -- see each
+        # emitted state without this module knowing anything about it. JSONL
+        # remains the record of truth; the sink is a view.
         self.svc = svc
         self.ctx = ctx
         self.client = client
         self.out_path = out_path
         self.quiet = quiet
         self.fixture_dir = fixture_dir
+        self.sink = sink
         self.sem = asyncio.Semaphore(MAX_CONCURRENT_FETCHES)
         self.watchers: Dict[int, asyncio.Task] = {}
         self.last_emitted: Dict[int, tuple] = {}
@@ -3921,6 +4270,13 @@ class Poller:
 
     def emit(self, row: dict, header) -> None:
         self._fh.write(json.dumps(row) + "\n")
+        if self.sink is not None:
+            try:
+                self.sink(row)
+            except Exception as e:                     # noqa: BLE001
+                # A failing view must never take down the feed.
+                print(f"sink failed ({type(e).__name__}: {e})",
+                      file=sys.stderr, flush=True)
         if self.quiet:
             return
         secs = row["game_seconds_remaining"]
@@ -4045,6 +4401,8 @@ class Poller:
             print(f"  P{r['period']} {mm:>2}:{ss:02d}  margin {r['margin']:>+4}  "
                   f"home {r['home_win_prob']:.4f}")
             self._fh.write(json.dumps(r) + "\n")
+            if self.sink is not None:
+                self.sink(r)
 
     def close(self) -> None:
         self._fh.close()
@@ -4177,6 +4535,341 @@ for gid in ids:
     p.write_text(json.dumps(s))
     print(f"  wrote {p.name}  ({len(s.get('plays') or []):,} plays)")
 print(f"\n{len(ids)} fixture(s) in {out}")
+```
+
+## `scripts/serve_live.py`
+
+```py
+"""Run the live poller and the HTTP API together, as one process.
+
+This is the deployment entry point. It is the same on a laptop and in a
+container; everything that differs between them is an environment variable
+(see `cbbwp/config.py`).
+
+    python3 scripts/serve_live.py                    # tonight's slate
+    python3 scripts/serve_live.py --date 20261115    # a specific slate
+    CBBWP_FIXTURE_DIR=tmp/fixtures python3 scripts/serve_live.py --once
+                                                     # offline rehearsal
+
+Two outputs, both wanted:
+  * JSONL, appended, one file per day -- the durable record.
+  * HTTP, read-only -- what something else consumes while the game is on.
+
+The JSONL is the record of truth. The API is a view of the same rows, held in
+memory; if the API dies the feed keeps writing, which is the right way round.
+"""
+from __future__ import annotations
+
+import argparse
+import asyncio
+import contextlib
+import datetime
+import pathlib
+import signal
+import sys
+
+ROOT = pathlib.Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "src"))
+
+from cbbwp.adapters.espn import EspnClient          # noqa: E402
+from cbbwp.api import LiveStore, serve_in_thread    # noqa: E402
+from cbbwp.config import Settings                   # noqa: E402
+from cbbwp.live_context import LiveContextProvider  # noqa: E402
+from cbbwp.serve import WinProbabilityService       # noqa: E402
+
+sys.path.insert(0, str(ROOT / "scripts"))
+from live_poller import Poller                      # noqa: E402
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--date", help="slate to follow, YYYYMMDD (default: today)")
+    ap.add_argument("--game", type=int, help="follow a single game id")
+    ap.add_argument("--once", action="store_true", help="one pass, then exit")
+    ap.add_argument("--no-api", action="store_true", help="JSONL only")
+    ap.add_argument("--quiet", action="store_true")
+    a = ap.parse_args()
+
+    cfg = Settings.from_env()
+    print("cbbwp live\n" + cfg.describe(), flush=True)
+
+    if not cfg.context_path.exists():
+        print(f"\nno ratings snapshot at {cfg.context_path}\n"
+              "  run: python3 scripts/build_live_context.py --season <year>",
+              file=sys.stderr)
+        return 2
+    ctx = LiveContextProvider.load(cfg.context_path)
+    if ctx.data_is_stale:
+        print(f"warning: ratings were fit on stale data -- newest completed game is "
+              f"{ctx.data_age_days:.1f} days old.\n"
+              "  Refresh the play-by-play first (scripts/fetch_data.py), THEN rebuild\n"
+              "  the snapshot; rebuilding alone would only refresh its timestamp.",
+              file=sys.stderr, flush=True)
+    elif ctx.is_stale:
+        print(f"warning: ratings snapshot is {ctx.age_days:.1f} days old; "
+              "re-run scripts/build_live_context.py", file=sys.stderr, flush=True)
+
+    # Loading the model here, before anything binds a port or opens a file, is
+    # what makes a bad model version a startup failure rather than a live one.
+    svc = WinProbabilityService(cfg.registry, cfg.model_version)
+
+    day = a.date or datetime.datetime.now().strftime("%Y%m%d")
+    out = cfg.live_dir / f"wp_{day}.jsonl"
+
+    store = LiveStore(history=cfg.api_history)
+    httpd = None
+    if not a.no_api:
+        httpd = serve_in_thread(
+            store,
+            {"model_version": cfg.model_version,
+             "ratings_max_age_days": cfg.ratings_max_age_days},
+            lambda: ctx.age_days,
+            cfg.api_host, cfg.api_port,
+            lambda: ctx.data_age_days,
+            lambda: ctx.data_is_stale)
+        print(f"api listening on http://{cfg.api_host}:{cfg.api_port}", flush=True)
+
+    poller = Poller(svc, ctx, EspnClient(), out, quiet=a.quiet,
+                    fixture_dir=cfg.fixture_dir, sink=store.update)
+
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        with contextlib.suppress(NotImplementedError):
+            loop.add_signal_handler(sig, poller.stopping.set)
+    try:
+        loop.run_until_complete(poller.run(a.date, a.game, a.once))
+    except KeyboardInterrupt:
+        pass
+    finally:
+        poller.close()
+        if httpd is not None:
+            httpd.shutdown()
+        loop.close()
+    print(f"wrote {out}", flush=True)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+```
+
+## `scripts/smoke_live.py`
+
+```py
+"""The pre-flight check for a live night. One command, clear pass or fail.
+
+This is the only part of the system the offline test suite cannot cover, because
+it needs the real ESPN endpoint. It has never been run: neither the sandbox this
+was built in nor the Cowork device VM can reach `site.api.espn.com`. Run it on a
+machine with open network access, and run it BEFORE the first live night rather
+than during it.
+
+    python3 scripts/smoke_live.py                 # full check, records fixtures
+    python3 scripts/smoke_live.py --offline       # everything needing no network
+    python3 scripts/smoke_live.py --limit 8       # look at more games
+
+Steps 1-3 and 8 work offline. Steps 4-7 need the network; if step 4 fails, the
+network steps are reported BLOCKED rather than FAILED, because "we could not
+reach ESPN from here" is a different fact from "the adapter is broken".
+
+Exit code 0 only if nothing FAILED. Blocked steps exit 2, so a scheduled run can
+tell "not validated yet" from "validated and broken".
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import pathlib
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+
+ROOT = pathlib.Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "src"))
+
+from cbbwp.config import Settings          # noqa: E402
+
+PASS, FAIL, BLOCKED, SKIP = "PASS", "FAIL", "BLOCKED", "SKIP"
+results: list[tuple[str, str, str]] = []
+
+
+def record(name: str, status: str, detail: str = "") -> str:
+    results.append((name, status, detail))
+    mark = {PASS: "  ok  ", FAIL: " FAIL ", BLOCKED: "BLOCK ", SKIP: " skip "}[status]
+    print(f"[{mark}] {name}" + (f"  -- {detail}" if detail else ""), flush=True)
+    return status
+
+
+def run(cmd: list[str], timeout: int = 170) -> subprocess.CompletedProcess:
+    return subprocess.run([sys.executable] + cmd, cwd=ROOT, capture_output=True,
+                          text=True, timeout=timeout)
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--offline", action="store_true",
+                    help="skip everything that needs the network")
+    ap.add_argument("--limit", type=int, default=5, help="games to record")
+    ap.add_argument("--date", default=None, help="slate to record, YYYYMMDD")
+    ap.add_argument("--fixtures", default=str(ROOT / "tmp/fixtures"))
+    ap.add_argument("--no-tests", action="store_true",
+                    help="skip the offline suite (it is slow on a cold machine)")
+    a = ap.parse_args()
+
+    cfg = Settings.from_env()
+    print("cbbwp live smoke test\n" + cfg.describe() + "\n", flush=True)
+    fixtures = pathlib.Path(a.fixtures)
+
+    # 1 --- the model artifact loads, and its guards pass -------------------
+    try:
+        from cbbwp.serve import WinProbabilityService
+        svc = WinProbabilityService(cfg.registry, cfg.model_version)
+        record("1 model artifact loads", PASS,
+               f"{cfg.model_version}, {len(svc.manifest['features'])} features, "
+               f"state rules v{svc.manifest.get('state_rules_version', 1)}")
+    except Exception as e:                              # noqa: BLE001
+        record("1 model artifact loads", FAIL, f"{type(e).__name__}: {e}")
+        return 1
+
+    # 2 --- the ratings snapshot exists and is fresh ------------------------
+    try:
+        from cbbwp.live_context import LiveContextProvider
+        if not cfg.context_path.exists():
+            record("2 ratings snapshot", FAIL,
+                   f"missing: {cfg.context_path} -- run build_live_context.py")
+        else:
+            ctx = LiveContextProvider.load(cfg.context_path)
+            d = ctx.data_age_days
+            detail = (f"file {ctx.age_days:.1f}d old, newest completed game "
+                      + ("none yet (preseason)" if d is None else f"{d:.1f}d old"))
+            if ctx.data_is_stale:
+                detail += " -- STALE DATA: refresh play-by-play, then rebuild"
+            elif ctx.is_stale:
+                detail += " -- STALE FILE: re-run build_live_context.py"
+            record("2 ratings snapshot", FAIL if ctx.is_stale else PASS, detail)
+    except Exception as e:                              # noqa: BLE001
+        record("2 ratings snapshot", FAIL, f"{type(e).__name__}: {e}")
+
+    # 3 --- the offline test suite still passes ----------------------------
+    if a.no_tests:
+        record("3 offline test suite", SKIP, "--no-tests")
+    else:
+        try:
+            r = subprocess.run([sys.executable, "-m", "pytest", "-q"], cwd=ROOT,
+                               capture_output=True, text=True, timeout=170)
+            tail = (r.stdout.strip().splitlines() or ["no output"])[-1]
+            record("3 offline test suite", PASS if r.returncode == 0 else FAIL, tail)
+        except Exception as e:                          # noqa: BLE001
+            record("3 offline test suite", SKIP, f"{type(e).__name__}: {e}")
+
+    if a.offline:
+        for n in ("4 ESPN reachable", "5 record fixtures", "6 fixture sanity",
+                  "7 one live poll"):
+            record(n, SKIP, "--offline")
+    else:
+        # 4 --- can we reach ESPN at all? ----------------------------------
+        reachable = False
+        try:
+            from cbbwp.adapters.espn import EspnClient, scoreboard_games
+            t0 = time.time()
+            sb = EspnClient().scoreboard(a.date)
+            games = scoreboard_games(sb)
+            reachable = True
+            record("4 ESPN reachable", PASS,
+                   f"{len(games)} games on the slate, {time.time()-t0:.1f}s")
+        except (urllib.error.URLError, OSError, TimeoutError) as e:
+            record("4 ESPN reachable", BLOCKED,
+                   f"{type(e).__name__}: {e} -- run where egress is open")
+        except Exception as e:                          # noqa: BLE001
+            record("4 ESPN reachable", FAIL, f"{type(e).__name__}: {e}")
+
+        if not reachable:
+            for n in ("5 record fixtures", "6 fixture sanity", "7 one live poll"):
+                record(n, BLOCKED, "no route to ESPN")
+        else:
+            # 5 --- record what ESPN is sending today ----------------------
+            cmd = ["scripts/record_espn_fixtures.py", "--limit", str(a.limit),
+                   "--out", str(fixtures)]
+            if a.date:
+                cmd += ["--date", a.date]
+            r = run(cmd)
+            n_fix = len(list(fixtures.glob("summary_*.json")))
+            record("5 record fixtures", PASS if r.returncode == 0 and n_fix else FAIL,
+                   f"{n_fix} payloads in {fixtures}"
+                   + ("" if r.returncode == 0 else f" -- {r.stderr.strip()[:200]}"))
+
+            # 6 --- does the adapter understand them? ----------------------
+            r = run(["scripts/check_espn_fixtures.py", "--dir", str(fixtures)])
+            out = r.stdout
+            unknown = "PLAY TYPES THE MODEL HAS NEVER SEEN" in out
+            record("6 fixture sanity", PASS if r.returncode == 0 else FAIL,
+                   "unknown play types present -- see below" if unknown
+                   else "no unknown play types")
+            if unknown:
+                print(out[out.index("PLAY TYPES THE MODEL"):][:1200], flush=True)
+
+            # 7 --- one real poll, end to end ------------------------------
+            ids = sorted(p.stem.split("_")[1] for p in fixtures.glob("summary_*.json"))
+            if not ids:
+                record("7 one live poll", FAIL, "no fixture to pick a game id from")
+            else:
+                r = run(["scripts/live_poller.py", "--game", ids[0], "--once"])
+                good = r.returncode == 0 and "states" in r.stdout
+                record("7 one live poll", PASS if good else FAIL,
+                       (r.stdout.strip().splitlines() or [""])[0][:160]
+                       if good else r.stderr.strip()[:200])
+
+    # 8 --- the API serves; no network needed ------------------------------
+    try:
+        from cbbwp.api import LiveStore, serve_in_thread
+        store = LiveStore(history=8)
+        store.update({"game_id": 1, "seq": 1, "period": 2,
+                      "game_seconds_remaining": 30, "margin": 3,
+                      "home_win_prob": 0.8})
+        httpd = serve_in_thread(store, {"model_version": cfg.model_version,
+                                        "ratings_max_age_days": 1e9},
+                                lambda: 0.0, "127.0.0.1", 0)
+        port = httpd.server_address[1]
+        body = json.loads(urllib.request.urlopen(
+            f"http://127.0.0.1:{port}/health", timeout=5).read())
+        httpd.shutdown()
+        ok = body.get("status") == "ok" and body.get("state_rules_version") is not None
+        record("8 API serves", PASS if ok else FAIL,
+               f"port {port}, {body.get('games_tracked')} game tracked")
+    except Exception as e:                              # noqa: BLE001
+        record("8 API serves", FAIL, f"{type(e).__name__}: {e}")
+
+    # --- verdict ----------------------------------------------------------
+    failed = [n for n, s, _ in results if s == FAIL]
+    blocked = [n for n, s, _ in results if s == BLOCKED]
+    print("\n" + "=" * 62)
+    if failed:
+        print(f"FAILED: {len(failed)} step(s) -- {', '.join(failed)}")
+        print("Do not go live until these pass.")
+        return 1
+    if blocked:
+        print(f"BLOCKED: {len(blocked)} step(s) could not reach ESPN.")
+        print("Everything testable without the network passed. The live path is\n"
+              "still UNVALIDATED -- re-run this where egress is open.")
+        return 2
+    skipped_network = [n for n, s_, _ in results
+                       if s_ == SKIP and n[0] in "4567"]
+    if skipped_network:
+        print("Offline checks all pass. The network steps were SKIPPED, so the "
+              "live path\nis still UNVALIDATED -- re-run without --offline "
+              "before the first live night.")
+        return 2
+    print("ALL PASS -- the live path is validated end to end.")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
 ```
 
 ## `scripts/validate_endgame_table.py`
@@ -4828,6 +5521,171 @@ def test_mirroring_flips_sign_and_label():
     assert Xm[1, i["timeout_diff"]] == -1.0
     assert Xm[1, i["sqrt_time"]] == Xm[0, i["sqrt_time"]]   # time is not mirrored
     assert list(ym) == [1, 0]
+```
+
+## `tests/test_live_deployment.py`
+
+```py
+"""Tests for the deployment surface: config, the API, and ratings freshness.
+
+The freshness tests are the point of this file. A win probability model that
+serves confidently from stale ratings looks exactly like one serving from fresh
+ones -- there is no visible symptom until someone checks a number by hand. The
+project has already been bitten once by a defect with no symptom (the possession
+bug), so the staleness signal gets tests rather than trust.
+"""
+from __future__ import annotations
+
+import datetime as dt
+import json
+import pathlib
+import sys
+import urllib.request
+
+import pytest
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "src"))
+
+from cbbwp.api import LiveStore, serve_in_thread            # noqa: E402
+from cbbwp.config import Settings                            # noqa: E402
+from cbbwp.live_context import (DATA_STALE_AFTER_DAYS,        # noqa: E402
+                                 LiveContextProvider)
+from cbbwp.schemas import STATE_RULES_VERSION                # noqa: E402
+
+
+# --- config -----------------------------------------------------------------
+def test_settings_have_working_defaults_with_no_environment(monkeypatch):
+    for k in [k for k in list(__import__("os").environ) if k.startswith("CBBWP_")]:
+        monkeypatch.delenv(k, raising=False)
+    s = Settings.from_env()
+    assert s.model_version == "v2"
+    assert s.api_port == 8808
+    assert s.fixture_dir is None
+    assert s.registry.name == "registry"
+
+
+def test_environment_overrides_are_reported_not_silent(monkeypatch):
+    monkeypatch.setenv("CBBWP_MODEL_VERSION", "v99")
+    monkeypatch.setenv("CBBWP_API_PORT", "9999")
+    s = Settings.from_env()
+    assert s.model_version == "v99" and s.api_port == 9999
+    # Whatever came from the environment must appear in the startup banner --
+    # a service quietly reading the wrong directory is the outage this prevents.
+    assert "CBBWP_MODEL_VERSION" in s.describe()
+
+
+# --- ratings freshness ------------------------------------------------------
+def _ctx(latest_game_date: str, generated: str | None = None) -> LiveContextProvider:
+    now = generated or dt.datetime.now(dt.timezone.utc).isoformat()
+    return LiveContextProvider(season=2027, hca=3.4, ratings={}, ft_pct={}, ppm={},
+                               generated=now, latest_game_date=latest_game_date)
+
+
+def test_a_freshly_written_file_over_stale_data_is_not_called_fresh():
+    """The whole reason data_age_days exists.
+
+    A nightly rebuild always writes a file with today's timestamp. If the
+    play-by-play behind it has not been refreshed, the ratings are old and
+    nothing about the file says so.
+    """
+    # Ages are measured against the real clock, so build the dates from it --
+    # mixing a fictional "now" with the real one is how this test first failed.
+    old_game = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=30)).isoformat()
+    c = _ctx(old_game)
+    assert c.age_days < 1                      # the file looks perfectly fresh
+    assert c.data_age_days > 25                # the data behind it is not
+    assert c.data_age_days > DATA_STALE_AFTER_DAYS
+    # ...and in season that is what makes the whole snapshot stale.
+    assert LiveContextProvider._in_season(dt.datetime(2027, 1, 20, tzinfo=dt.timezone.utc))
+
+
+def test_data_staleness_is_not_raised_out_of_season():
+    """April to November the newest game is meant to be months old."""
+    for when in (dt.datetime(2026, 7, 1, tzinfo=dt.timezone.utc),
+                 dt.datetime(2026, 9, 2, tzinfo=dt.timezone.utc),
+                 dt.datetime(2026, 4, 20, tzinfo=dt.timezone.utc)):
+        assert not LiveContextProvider._in_season(when), when
+
+
+def test_season_window_covers_the_months_games_are_played():
+    for when, expected in [
+        (dt.datetime(2026, 11, 1, tzinfo=dt.timezone.utc), True),
+        (dt.datetime(2027, 1, 15, tzinfo=dt.timezone.utc), True),
+        (dt.datetime(2027, 3, 31, tzinfo=dt.timezone.utc), True),
+        (dt.datetime(2027, 4, 10, tzinfo=dt.timezone.utc), True),
+        (dt.datetime(2027, 4, 16, tzinfo=dt.timezone.utc), False),
+        (dt.datetime(2027, 10, 31, tzinfo=dt.timezone.utc), False),
+    ]:
+        assert LiveContextProvider._in_season(when) is expected, when
+
+
+def test_preseason_snapshot_with_no_games_reports_unknown_not_stale():
+    c = _ctx("")
+    assert c.data_age_days is None
+    assert c.data_is_stale is False
+
+
+# --- the API ----------------------------------------------------------------
+@pytest.fixture()
+def server():
+    store = LiveStore(history=4)
+    state = {"stale": False, "age": 0.0}
+    httpd = serve_in_thread(
+        store, {"model_version": "vtest", "ratings_max_age_days": 3},
+        lambda: 0.5, "127.0.0.1", 0,
+        lambda: state["age"], lambda: state["stale"])
+    yield httpd, store, state
+    httpd.shutdown()
+
+
+def _get(httpd, path: str):
+    port = httpd.server_address[1]
+    try:
+        r = urllib.request.urlopen(f"http://127.0.0.1:{port}{path}", timeout=5)
+        return r.status, json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        return e.code, json.loads(e.read())
+
+
+def test_every_response_says_what_produced_it(server):
+    httpd, store, _ = server
+    store.update({"game_id": 7, "seq": 1, "period": 2,
+                  "game_seconds_remaining": 20, "margin": 2, "home_win_prob": 0.7})
+    for path in ("/", "/health", "/games", "/games/7"):
+        _, body = _get(httpd, path)
+        assert body["model_version"] == "vtest", path
+        assert body["state_rules_version"] == STATE_RULES_VERSION, path
+
+
+def test_health_goes_degraded_when_the_data_behind_the_ratings_is_stale(server):
+    httpd, _, state = server
+    code, body = _get(httpd, "/health")
+    assert code == 200 and body["status"] == "ok"
+    state["stale"] = True
+    state["age"] = 31.0
+    code, body = _get(httpd, "/health")
+    # 503 so a container healthcheck or a load balancer notices without a human.
+    assert code == 503 and body["status"] == "degraded"
+    assert "stale data" in body["reason"] or "stale" in body["reason"]
+    assert body["data_age_days"] == 31.0
+
+
+def test_history_is_bounded_so_a_long_game_cannot_grow_without_limit(server):
+    httpd, store, _ = server
+    for i in range(50):
+        store.update({"game_id": 9, "seq": i, "period": 2,
+                      "game_seconds_remaining": 100 - i, "margin": 1,
+                      "home_win_prob": 0.5})
+    _, body = _get(httpd, "/games/9")
+    assert len(body["game"]["history"]) == 4
+    assert body["game"]["seq"] == 49
+
+
+def test_unknown_and_malformed_game_ids_are_distinguished(server):
+    httpd, _, _ = server
+    assert _get(httpd, "/games/12345")[0] == 404
+    assert _get(httpd, "/games/not-a-number")[0] == 400
+    assert _get(httpd, "/nope")[0] == 404
 ```
 
 ## `tests/test_monitor.py`
