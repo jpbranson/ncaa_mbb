@@ -58,6 +58,14 @@ out = (
         "game_id",
         ft_pct_diff=(pl.col("h_ft") - pl.col("a_ft")).fill_null(0.0),
         exp_points_per_min=((pl.col("h_ppm") + pl.col("a_ppm")) / 2).fill_null(LEAGUE_PPM),
+        # The two levels, not just their difference. The endgame table buckets
+        # each team's free-throw ability separately, and reconstructing the
+        # levels from the difference is not possible. Keeping only the diff here
+        # was what would have forced the endgame validation to assume both teams
+        # were average -- an assumption the live path would NOT have made, which
+        # is exactly the train/serve mismatch this project keeps tripping over.
+        home_ft_pct=pl.col("h_ft").fill_null(LEAGUE_FT),
+        away_ft_pct=pl.col("a_ft").fill_null(LEAGUE_FT),
     )
 )
 out.write_parquet(ROOT / "data/proc/team_stats.parquet")

@@ -1,0 +1,68 @@
+{
+  "version": "e1",
+  "state_rules_version": 2,
+  "built": "2026-09-02T16:06:27Z",
+  "sha256_16": "5ee6ed660768e3ba",
+  "seasons_used": [
+    2016,
+    2017,
+    2018,
+    2019,
+    2021,
+    2022,
+    2023,
+    2024
+  ],
+  "shape": [
+    61,
+    25,
+    11,
+    11,
+    3,
+    3
+  ],
+  "axes": [
+    "seconds_remaining",
+    "margin",
+    "own_fouls",
+    "opp_fouls",
+    "own_ft_bucket",
+    "opp_ft_bucket"
+  ],
+  "margin_range": [
+    -12,
+    12
+  ],
+  "foul_max": 10,
+  "ft_bucket_means": [
+    0.6687238101760424,
+    0.7109406711464303,
+    0.7497375620081773
+  ],
+  "monotonicity_before": {
+    "margin_min_increment": -0.006552480252652683,
+    "margin_violations": 98,
+    "own_ft_bucket_min_increment": -8.205384588537076e-06,
+    "own_ft_bucket_violations": 6543,
+    "opp_ft_bucket_max_increment": 2.3010668702694304e-06,
+    "opp_ft_bucket_violations": 6270,
+    "own_fouls_max_increment": 0.006927830437375715,
+    "opp_fouls_min_increment": -0.020784587910606223,
+    "possession_min_advantage": 0.0,
+    "possession_violations": 0
+  },
+  "monotonicity_after": {
+    "margin_min_increment": 0.0,
+    "margin_violations": 0,
+    "own_ft_bucket_min_increment": -8.205384588537076e-06,
+    "own_ft_bucket_violations": 6543,
+    "opp_ft_bucket_max_increment": 2.3010668702694304e-06,
+    "opp_ft_bucket_violations": 6270,
+    "own_fouls_max_increment": 0.006927830437375715,
+    "opp_fouls_min_increment": -0.020784587910606223,
+    "possession_min_advantage": 0.0,
+    "possession_violations": 0
+  },
+  "isotonic_max_correction": 0.006552480252652683,
+  "note": "V[t, m, fo, fd, bo, bd] = P(the team WITH THE BALL wins)."
+}
