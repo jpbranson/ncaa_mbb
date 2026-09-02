@@ -17,7 +17,7 @@ provenance where it exists and is deliberately refused at load by current code.
 **Two working copies exist and they have diverged.**
 
 - `~/Downloads/ncaa_mbb` on **cas-w7r21674vv** (this file's copy) — has
-  `registry/v1`, so all 72 tests run with none skipped. Session 4's endgame work
+  `registry/v1`, so all 82 tests run with none skipped. Sessions 4 and 5's work
   was done here.
 - `C:\Users\jpbra\Downloads\mbb_prob_claude` on **jpbranson-desk** — session 3's
   bit-identical rebuild. Lacks `registry/v1`, so one test skips there.
@@ -57,7 +57,13 @@ Beats ESPN in every time bucket; the gap is widest in the final minute
     build_endgame_table.py           Phase 3, backward induction + monotonicity
     validate_endgame_table.py        Phase 4, honesty check on 2024
     blend_endgame.py                 Phase 5, --tune then --test, once
-  tests/                 72 tests, ~4s
+    smoke_live.py                    pre-flight check for a live night
+    serve_live.py                    deployment entry point: poller + API
+    rebuild_test_preds.py            float64 predictions from the pinned model
+    build_report_data.py             data behind the published artifact
+    build_source_bundle.py           regenerates cbbwp-source.md
+  deploy/                LaunchAgents, Dockerfile, compose
+  tests/                 82 tests, ~6s
   data/raw/              527 MB of hoopR parquet, 10 seasons
   data/proc/             games, team stats, 8.56M state rows
   data/live/             poller output, one JSONL per day

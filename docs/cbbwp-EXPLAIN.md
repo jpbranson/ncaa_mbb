@@ -468,7 +468,7 @@ Both clip at 0.999 rather than 1.000. §7.8 explains why that last detail matter
   identical states — and identical win probabilities — to the *offline* hoopR adapter for the
   same game, including when the feed arrives shuffled. See §3.10.
 
-Current status: 37 tests, all passing, about 1 second.
+Current status: 82 tests, all passing, none skipped, about 6 seconds.
 
 ### 3.10 The live path (added 2026-09-01)
 
