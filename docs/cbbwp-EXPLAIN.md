@@ -15,7 +15,7 @@ snapshots of "here is the score, the clock, who has the ball, and how good each 
 labelled each snapshot with who eventually won, and let a model learn the relationship.
 
 **How good it is.** On two seasons it had never seen (2025 and 2026 — 12,398 games,
-2.23 million snapshots), it scores **0.3104 log loss** against ESPN's own deployed model at
+2.23 million snapshots), it scores **0.3103 log loss** against ESPN's own deployed model at
 **0.3295** on exactly the same plays. It is better in every phase of the game, and the gap is
 widest in the last minute (0.125 vs 0.155), which is where people are actually watching.
 
@@ -707,11 +707,11 @@ mode:
 | Time remaining | Snapshots | Ours | Logistic | ESPN | Ours vs ESPN |
 |---|---|---|---|---|---|
 | 40–20 min | 823,955 | 0.4416 | 0.4418 | 0.4708 | −6.2% |
-| 20–10 min | 393,654 | 0.3400 | 0.3405 | 0.3538 | −3.9% |
-| 10–5 min | 212,904 | 0.2643 | 0.2648 | 0.2715 | −2.7% |
-| 5–2 min | 393,658 | 0.2126 | 0.2128 | 0.2190 | −2.9% |
-| 2–1 min | 148,020 | 0.1554 | 0.1553 | 0.1638 | −5.1% |
-| **1–0 min** | 261,532 | **0.1249** | 0.1267 | 0.1551 | **−19.5%** |
+| 20–10 min | 393,654 | 0.3399 | 0.3405 | 0.3538 | −3.9% |
+| 10–5 min | 212,904 | 0.2642 | 0.2648 | 0.2715 | −2.7% |
+| 5–2 min | 393,658 | 0.2125 | 0.2128 | 0.2190 | −3.0% |
+| 2–1 min | 148,020 | 0.1553 | 0.1553 | 0.1638 | −5.2% |
+| **1–0 min** | 261,532 | **0.1246** | 0.1267 | 0.1551 | **−19.7%** |
 
 Log loss is highest early. That is correct and expected — early in a game you genuinely know
 less, and a model that claimed otherwise would be lying.
@@ -752,14 +752,15 @@ main known flaw, and it traces directly to this decision.
 **Because** a chart where a made basket lowers the scoring team's probability destroys trust
 instantly, however defensible it is statistically.
 **The surprise:** we expected to pay for this. We measured it and the constrained model is
-*better* — 0.3104 versus 0.3113 unconstrained. The constraints act as regularisation: they
+*better* — 0.3104 versus 0.3113 unconstrained (both measured at v1, the fit where
+the ablation was run; the comparison is between the two, not against today's headline). The constraints act as regularisation: they
 stop the trees fitting noise in directions we know are wrong. **There is no
 trust-versus-accuracy tradeoff here.** This is worth mentioning; most people assume there is.
 
 ### 7.6 Ship LightGBM even though logistic regression nearly matches it
-**The numbers:** 0.3104 vs 0.3109 overall. In the final minute, 0.1249 vs 0.1267 — a 1.4%
+**The numbers:** 0.3103 vs 0.3109 overall. In the final minute, 0.1246 vs 0.1267 — a 1.7%
 improvement in the place people scrutinise most.
-**Why LightGBM anyway:** it wins where it counts, it is better calibrated (0.0028 vs 0.0043),
+**Why LightGBM anyway:** it wins where it counts, it is better calibrated (0.0026 vs 0.0043),
 and it is the foundation for the extra features still to come.
 **Be honest about it:** the hand-built `margin ÷ √time` term is doing almost all the work.
 If the gradient boosting ever becomes an operational burden, the logistic model is a
@@ -770,9 +771,13 @@ This one contradicts the plan and the textbook, so here is the full evidence.
 
 | Variant | Log loss | Calibration error |
 |---|---|---|
-| **Raw model (shipped)** | **0.3104** | **0.0028** |
+| **Raw model** | **0.3104** | **0.0028** |
 | + time-bucketed isotonic | 0.3116 | 0.0043 |
 | + per-bucket Platt scaling | 0.3109 | 0.0041 |
+
+*(This ablation was run on the v1 fit; all three rows come from it, so the
+comparison between them stands. The shipped v2 raw model scores 0.3103 / 0.0026
+— the possession fix moved the headline, not the conclusion.)*
 
 Both corrections made *both* metrics worse. The diagnosis: the theory says miscalibration
 here is time-dependent — overconfident early, underconfident late — so per-bucket correction
@@ -1073,7 +1078,8 @@ trained; adding a correction fit on one season just imports that season's noise.
 
 **"Why constrain the model? Doesn't that hurt accuracy?"**
 That's the usual assumption and it is wrong here. Constrained scores 0.3104, unconstrained
-0.3113. The constraints stop the trees fitting noise in directions we already know are wrong.
+0.3113 — both from the v1 fit where the ablation was run. The constraints stop the trees
+fitting noise in directions we already know are wrong.
 
 **"Why does possession barely matter?"**
 Because that number is a whole-game average, and possession only matters late. In a tied

@@ -4,7 +4,27 @@ import numpy as np
 from cbbwp.evaluate import by_time_bucket, log_loss, brier, calibration_table, ece, accuracy
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
-d = np.load(ROOT / "artifacts/test_preds.npz")
+# fit_models.py writes test_preds.npz; a later step exported the same columns
+# as eval_preds.parquet for the results report. artifacts/ is gitignored, so a
+# restored working copy can have either, or only one. Accept both -- otherwise
+# "scripts/evaluate.py regenerates every number" is a claim that fails on any
+# machine that happens to have the other file.
+_npz = ROOT / "artifacts/test_preds.npz"
+_pq = ROOT / "artifacts/eval_preds.parquet"
+if _npz.exists():
+    d = np.load(_npz)
+    print(f"source: {_npz.name} (float64 as fitted)\n")
+elif _pq.exists():
+    import polars as pl
+    _t = pl.read_parquet(_pq)
+    # The parquet stores predictions as float32. Metrics agree with the float64
+    # originals to three decimals; accuracy and ECE can differ in the fourth.
+    d = {c: _t[c].to_numpy().astype(np.float64) for c in _t.columns}
+    print(f"source: {_pq.name} (float32 export -- acc/ECE may differ in the 4th decimal)\n")
+else:
+    raise SystemExit(
+        "no predictions found. Expected artifacts/test_preds.npz (written by "
+        "fit_models.py) or artifacts/eval_preds.parquet. Re-run scripts/fit_models.py.")
 y, secs, espn = d["y"], d["secs"], d["espn"]
 preds = {"logistic": d["p_lr"], "lightgbm": d["p_gbm"], "espn": espn}
 

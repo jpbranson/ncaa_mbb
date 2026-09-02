@@ -32,11 +32,11 @@ By time remaining — never quote the average alone, it hides the failure mode:
 | Time left | States | Ours | ESPN | vs ESPN |
 |---|---|---|---|---|
 | 40–20 min | 823,955 | 0.4416 | 0.4708 | −6.2% |
-| 20–10 min | 393,654 | 0.3400 | 0.3538 | −3.9% |
-| 10–5 min | 212,904 | 0.2643 | 0.2715 | −2.7% |
-| 5–2 min | 393,658 | 0.2126 | 0.2190 | −2.9% |
-| 2–1 min | 148,020 | 0.1554 | 0.1638 | −5.1% |
-| **1–0 min** | 261,532 | **0.1249** | 0.1551 | **−19.5%** |
+| 20–10 min | 393,654 | 0.3399 | 0.3538 | −3.9% |
+| 10–5 min | 212,904 | 0.2642 | 0.2715 | −2.7% |
+| 5–2 min | 393,658 | 0.2125 | 0.2190 | −3.0% |
+| 2–1 min | 148,020 | 0.1553 | 0.1638 | −5.2% |
+| **1–0 min** | 261,532 | **0.1246** | 0.1551 | **−19.7%** |
 
 **These numbers are on this project's own event-driven row set.** Re-weighted so
 each minute of game clock counts equally, the same model scores log loss 0.3645
@@ -48,6 +48,13 @@ changing only the weighting moves the headline by 17%.
 
 1. **Reproduce this first.** `scripts/evaluate.py` regenerates every number
    above. If it does not reproduce, fix that before changing anything.
+   It needs `artifacts/test_preds.npz`, which is gitignored and therefore absent
+   from a restored copy — `python3 scripts/rebuild_test_preds.py` recreates it
+   from the pinned model in seconds, without refitting. **Do not compute these
+   from `artifacts/eval_preds.parquet`:** it stores predictions as float32,
+   which lands about 0.0001 low on log loss and gives 85.19% / 0.0024 instead of
+   85.20% / 0.0026. That is storage precision, not drift, and it has already
+   been mistaken for the latter once.
 2. **Compare on identical rows.** Against v2 and against ESPN, in the same run.
 3. **Break it out by time bucket.** A change that improves the average while
    hurting the last minute is not an improvement.
@@ -76,6 +83,18 @@ python3 -m pytest -q
 Session 3 rebuilt this on a different machine and got sha `2d4bf58134fa2e64`
 **bit-identically**, so the seed pinning holds across machines. `fit_models.py`
 is OOM-killed under about 6 GB; everything else runs comfortably in 3 GB.
+
+## Two portability traps found while checking this
+
+- **`artifacts/lr_v1.pkl` is version-locked.** The logistic baseline is a
+  scikit-learn pickle written by 1.8.0; it raises `AttributeError` on 1.7.2. The
+  LightGBM artifact is plain text and has no such problem, which is an argument
+  for the format rather than for pinning the library. The baseline's figures
+  cannot be recomputed on a machine with a different scikit-learn.
+- **`artifacts/` is entirely gitignored**, so a restored working copy has the
+  model (in `registry/`) but none of the prediction files. Everything needed is
+  rebuildable — `rebuild_test_preds.py` for the predictions, `fetch_data.py`
+  onward for the data — but nothing says so until something fails.
 
 ## Deliberately not shipped
 
