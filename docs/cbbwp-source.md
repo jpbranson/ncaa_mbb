@@ -1,15 +1,2392 @@
 # `cbbwp` source bundle
-Complete source. Regenerated 2026-09-01 21:25 from `~/Downloads/ncaa_mbb` on cas-w7r21674vv, which is the working copy.
+Complete source. Regenerated 2026-09-02 16:18 from the `ncaa_mbb` working folder, at commit `441f496`.
 
-State rules v2, model v2. This bundle is a mirror for disaster recovery; the folder is the source of truth (it also holds the data, the fitted model and the git history).
+State rules v2, model v2. This bundle is a mirror for disaster recovery; the folder is the source of truth (it also holds the data, the fitted model and the git history). Regenerate with `python3 scripts/build_source_bundle.py` whenever the source changes.
 
 See `cbbwp-EXPLAIN.md` for what every piece does and why.
 
 ---
 
+## `pyproject.toml`
+
+```toml
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cbbwp"
+version = "0.2.0"
+description = "College basketball live win probability model"
+requires-python = ">=3.10"
+dependencies = ["numpy", "polars", "scikit-learn", "lightgbm"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+```
+
+## `README.md`
+
+```markdown
+# cbbwp — college basketball live win probability
+
+Live win probability for NCAA men's basketball. Trained on 2016–2023,
+calibrated on 2024, tested on 2025–2026 (2.23M states, 12,398 games).
+Beats ESPN's deployed model in every time bucket.
+
+| Model | Log loss | Brier | Accuracy | ECE |
+|---|---|---|---|---|
+| **LightGBM v1 (shipped)** | **0.3104** | 0.1008 | 85.17% | 0.0028 |
+| Logistic baseline | 0.3109 | 0.1009 | 85.19% | 0.0043 |
+| ESPN (deployed, same rows) | 0.3295 | 0.1061 | 84.58% | 0.0069 |
+
+Full explanation of the model, every design decision and its rejected
+alternative: **`docs/cbbwp-EXPLAIN.md`**. Read that first.
+
+## Setup
+
+```bash
+pip3 install --break-system-packages polars pyarrow lightgbm scikit-learn pytest numpy
+```
+
+## Rebuild everything from scratch
+
+```bash
+python3 scripts/fetch_data.py          # ~540 MB of hoopR parquet, ~1 min
+python3 scripts/build_games.py         # results + as-of pregame ratings
+python3 scripts/build_team_stats.py    # as-of FT% and pace
+python3 scripts/build_dataset.py       # replay -> 8.5M state rows + features
+python3 scripts/fit_models.py          # logistic + LightGBM  (needs ~6 GB RAM)
+python3 scripts/publish_model.py v1    # pinned registry artifact
+python3 scripts/evaluate.py            # metrics by time bucket vs ESPN
+pytest tests -q
+```
+
+Seeds are pinned (`seed=20260831`, `deterministic=True`), so a refit on the
+same machine reproduces `registry/v1` exactly.
+
+**Memory note:** `fit_models.py` peaks around 4–6 GB — the symmetry mirroring
+doubles 5.4M rows and briefly holds them as float64. It will be OOM-killed in a
+3 GB container.
+
+## Run it live
+
+```bash
+python3 scripts/build_live_context.py     # daily, before the slate
+python3 scripts/live_poller.py            # follow tonight's games
+python3 scripts/live_poller.py --date 20261115
+python3 scripts/live_poller.py --game 401585555 --once     # smoke test
+```
+
+Output goes to stdout and to `data/live/wp_YYYYMMDD.jsonl`.
+
+Before the first live night, on a machine that can reach ESPN:
+
+```bash
+python3 scripts/record_espn_fixtures.py --limit 5   # save real payloads
+python3 scripts/check_espn_fixtures.py              # flag unknown play types
+```
+
+`check_espn_fixtures.py` is the one check the offline suite cannot do: it
+reports play-type ids the model was never trained on. **A frequent unknown type
+means the ESPN feed has changed and the model needs a refit, not a patched
+adapter.**
+
+## Monitor it
+
+```bash
+python3 scripts/calibration_monitor.py --source backtest --days 7
+python3 scripts/calibration_monitor.py --source live --glob 'data/live/*.jsonl'
+```
+
+Exit code 1 means a decile is off both statistically (|z| > 3) *and*
+practically (gap > 2 points). Both are required — a million rows will make a
+0.3-point gap "significant", and that is a large sample, not drift.
+
+## Layout
+
+```
+src/cbbwp/
+  schemas.py       data contracts; FEATURE_NAMES is the model's input contract
+  state.py         replayable state builder — a pure function of the event list
+  features.py      the 11 features, one definition, used by training AND serving
+  ratings.py       in-house pregame ratings (our stand-in for the betting spread)
+  serve.py         WinProbabilityService; refuses to start on a contract mismatch
+  live_context.py  pregame context for a game that has not been played yet
+  endgame.py       rule-based clamps the data cannot teach efficiently
+  calibration.py   time-bucketed isotonic (diagnostic only — see EXPLAIN)
+  monitor.py       calibration drift statistics
+  adapters/
+    hoopr.py       historical parquet -> Events   (offline)
+    espn.py        live ESPN feed     -> Events   (live)
+scripts/           the pipeline, the poller, the monitor
+tests/             37 tests
+docs/              the project docs, kept alongside the code
+data/, artifacts/, registry/   built locally; not source
+```
+
+## The two parity tests that matter
+
+The whole design rests on training and serving sharing one definition of state
+and features. Two tests enforce it:
+
+- `tests/test_parity.py` — the fast vectorised Polars path must agree
+  row-for-row with the canonical state builder on real games.
+- `tests/test_espn_adapter.py` — the **live** ESPN adapter must produce
+  byte-identical states and win probabilities to the **offline** hoopR adapter
+  for the same game, including when the feed arrives shuffled.
+
+`tests/test_replay_harness.py` adds the third: a finished game fed through the
+live path in irregular chunks must match the offline answer exactly.
+```
+
+## `src/cbbwp/__init__.py`
+
+```py
+"""cbbwp - college basketball win probability.
+
+The state builder and feature builder in this package are imported by BOTH the
+offline training pipeline and the live serving path. That is deliberate: it is
+the single defence against train/serve skew.
+"""
+__version__ = "0.2.0"
+
+from .schemas import Event, GameState, PregameContext, FEATURE_NAMES  # noqa: F401
+from .state import build_states  # noqa: F401
+from .features import build_feature_matrix, feature_dict  # noqa: F401
+```
+
+## `src/cbbwp/adapters/__init__.py`
+
+```py
+
+```
+
+## `src/cbbwp/adapters/espn.py`
+
+```py
+"""Adapter: ESPN's live men's college basketball feed -> canonical Events.
+
+This is the live twin of `adapters/hoopr.py`. hoopR is itself a scrape of this
+same ESPN feed, so the two adapters must agree exactly - that is what keeps the
+live path and the training path on the same definitions.
+
+The one subtlety is play *type*. hoopR stores ESPN's `type.text` verbatim, and
+the state builder's possession rules are written against those exact strings.
+ESPN occasionally reworks the display text of a play type but almost never its
+numeric `type.id`, so this adapter maps id -> the text the model was TRAINED on
+and only falls back to whatever text the feed sent when the id is unknown.
+
+`TYPE_ID_TO_TEXT` was extracted from the 2016-2026 hoopR files: every
+(type_id, type_text) pair that actually occurs.
+
+Note what this map is and is not for. Possession no longer depends on play-type
+NAMES at all - `state._possession_after` keys made field goals on the feed's
+scoring/shooting flags, precisely because ESPN renamed the made-three type
+between 2019 and 2021 and a name whitelist silently missed 324,043 made threes.
+The map survives because the type text is still what the model was trained on
+for every OTHER rule (fouls, timeouts, rebounds, turnovers), and because an id
+is a more stable key for those than a display string.
+"""
+from __future__ import annotations
+
+import json
+import urllib.error
+import urllib.request
+from dataclasses import dataclass
+from typing import Any, Iterable, List, Optional, Sequence
+
+from ..schemas import Event, PregameContext
+from ..state import clock_to_seconds
+
+SITE_API = "https://site.api.espn.com/apis/site/v2/sports/basketball/mens-college-basketball"
+SCOREBOARD_URL = SITE_API + "/scoreboard"
+SUMMARY_URL = SITE_API + "/summary"
+
+# Play type id -> the type_text the model was trained on. See module docstring.
+TYPE_ID_TO_TEXT = {
+    0: "Not Available",
+    91: "Shot",
+    215: "Coach's Challenge (Overturned)",
+    216: "Coach's Challenge (Stands)",
+    402: "End Game",
+    412: "End Period",
+    437: "TipShot",
+    449: "Dead Ball Rebound",
+    519: "PersonalFoul",
+    521: "Technical Foul",
+    540: "MadeFreeThrow",
+    558: "JumpShot",
+    572: "LayUpShot",
+    574: "DunkShot",
+    578: "RegularTimeOut",
+    579: "ShortTimeOut",
+    580: "OfficialTVTimeOut",
+    584: "Substitution",
+    586: "Offensive Rebound",
+    587: "Defensive Rebound",
+    598: "Lost Ball Turnover",
+    607: "Steal",
+    615: "Jumpball",
+    618: "Block Shot",
+    20437: "TipShot",
+    20558: "JumpShot",
+    20572: "LayUpShot",
+    20574: "DunkShot",
+    30558: "Three Point Jump Shot",
+}
+
+# Statuses ESPN reports. Only IN means the clock is (or may be) running.
+STATUS_PRE = "STATUS_SCHEDULED"
+STATUS_FINAL = "STATUS_FINAL"
+
+
+def _int(v, default=None) -> Optional[int]:
+    if v is None or v == "":
+        return default
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        try:
+            return int(float(v))
+        except (TypeError, ValueError):
+            return default
+
+
+def play_type_text(play: dict) -> str:
+    """Canonical type_text for one ESPN play."""
+    t = play.get("type") or {}
+    tid = _int(t.get("id"))
+    if tid is not None and tid in TYPE_ID_TO_TEXT:
+        return TYPE_ID_TO_TEXT[tid]
+    # Unknown id: fall back to the feed's own text. The state builder treats an
+    # unrecognised type as "carry possession", which is the safe default.
+    return (t.get("text") or "").strip()
+
+
+def _sequence_key(play: dict, fallback: int) -> int:
+    """ESPN's sequenceNumber, numeric, for ordering. Falls back to feed order."""
+    s = _int(play.get("sequenceNumber"))
+    return s if s is not None else fallback
+
+
+def events_from_plays(plays: Sequence[dict], game_id: int) -> List[Event]:
+    """ESPN `plays` array -> Events, numbered 1..N like hoopR's game_play_number.
+
+    ESPN's own sequenceNumber is used only for ORDERING; the emitted `seq` is a
+    dense 1-based ordinal, exactly as hoopR's game_play_number is, so a state
+    built live is directly comparable to the same state built offline.
+    """
+    ordered = sorted(
+        ((_sequence_key(p, i), i, p) for i, p in enumerate(plays)),
+        key=lambda x: (x[0], x[1]),
+    )
+    out: List[Event] = []
+    for n, (_key, _i, p) in enumerate(ordered, start=1):
+        period = _int((p.get("period") or {}).get("number"), 1) or 1
+        clock = (p.get("clock") or {}).get("displayValue") or ""
+        team = (p.get("team") or {}).get("id")
+        out.append(
+            Event(
+                game_id=game_id,
+                seq=n,
+                period=period,
+                clock_seconds=clock_to_seconds(clock),
+                home_score=_int(p.get("homeScore"), 0) or 0,
+                away_score=_int(p.get("awayScore"), 0) or 0,
+                event_type=play_type_text(p),
+                team_id=_int(team),
+                score_value=_int(p.get("scoreValue"), 0) or 0,
+                scoring_play=bool(p.get("scoringPlay")),
+                shooting_play=bool(p.get("shootingPlay")),
+                text=(p.get("text") or ""),
+            )
+        )
+    return out
+
+
+@dataclass(frozen=True)
+class GameHeader:
+    """The pregame facts the summary endpoint carries, before ratings."""
+    game_id: int
+    home_team_id: int
+    away_team_id: int
+    home_name: str
+    away_name: str
+    neutral_site: bool
+    status: str
+    period: int
+    clock_display: str
+    home_score: int
+    away_score: int
+
+    @property
+    def is_final(self) -> bool:
+        return self.status == STATUS_FINAL
+
+    @property
+    def is_live(self) -> bool:
+        return self.status not in (STATUS_PRE, STATUS_FINAL)
+
+
+def header_from_summary(summary: dict) -> GameHeader:
+    """Pull team ids, neutral-site flag and status out of a summary payload."""
+    header = summary.get("header") or {}
+    comps = header.get("competitions") or [{}]
+    comp = comps[0]
+    home = away = None
+    for c in comp.get("competitors") or []:
+        if c.get("homeAway") == "home":
+            home = c
+        elif c.get("homeAway") == "away":
+            away = c
+    if home is None or away is None:
+        raise ValueError("summary payload has no home/away competitors")
+
+    st = ((comp.get("status") or {}).get("type") or {})
+    return GameHeader(
+        game_id=_int(header.get("id") or comp.get("id")) or 0,
+        home_team_id=_int((home.get("team") or {}).get("id")) or 0,
+        away_team_id=_int((away.get("team") or {}).get("id")) or 0,
+        home_name=((home.get("team") or {}).get("displayName") or ""),
+        away_name=((away.get("team") or {}).get("displayName") or ""),
+        neutral_site=bool(comp.get("neutralSite")),
+        status=st.get("name") or "",
+        period=_int((comp.get("status") or {}).get("period"), 0) or 0,
+        clock_display=str((comp.get("status") or {}).get("displayClock") or ""),
+        home_score=_int(home.get("score"), 0) or 0,
+        away_score=_int(away.get("score"), 0) or 0,
+    )
+
+
+def parse_summary(summary: dict) -> tuple[List[Event], GameHeader]:
+    """One summary payload -> (events, header). No network, no state."""
+    h = header_from_summary(summary)
+    return events_from_plays(summary.get("plays") or [], h.game_id), h
+
+
+def scoreboard_games(scoreboard: dict) -> List[dict]:
+    """Flatten a scoreboard payload to one dict per game."""
+    out = []
+    for ev in scoreboard.get("events") or []:
+        comp = (ev.get("competitions") or [{}])[0]
+        st = ((comp.get("status") or {}).get("type") or {})
+        home = away = None
+        for c in comp.get("competitors") or []:
+            if c.get("homeAway") == "home":
+                home = c
+            elif c.get("homeAway") == "away":
+                away = c
+        out.append({
+            "game_id": _int(ev.get("id")) or 0,
+            "name": ev.get("shortName") or ev.get("name") or "",
+            "status": st.get("name") or "",
+            "state": st.get("state") or "",
+            "completed": bool(st.get("completed")),
+            "neutral_site": bool(comp.get("neutralSite")),
+            "home_team_id": _int((home or {}).get("team", {}).get("id")) or 0,
+            "away_team_id": _int((away or {}).get("team", {}).get("id")) or 0,
+            "start": ev.get("date") or "",
+        })
+    return out
+
+
+# --------------------------------------------------------------------------
+# Network. Kept in one small class so everything above stays testable offline.
+# --------------------------------------------------------------------------
+class EspnClient:
+    """Minimal, dependency-free ESPN reader.
+
+    Deliberately synchronous and tiny: the poller runs these in a thread pool,
+    which keeps the asyncio loop free of a third-party HTTP dependency.
+    """
+
+    def __init__(self, timeout: float = 10.0, user_agent: str = "cbbwp/0.2"):
+        self.timeout = timeout
+        self.user_agent = user_agent
+
+    def _get(self, url: str, params: dict | None = None) -> dict:
+        if params:
+            q = "&".join(f"{k}={v}" for k, v in params.items() if v is not None)
+            url = f"{url}?{q}"
+        req = urllib.request.Request(url, headers={"User-Agent": self.user_agent})
+        with urllib.request.urlopen(req, timeout=self.timeout) as r:
+            return json.loads(r.read().decode("utf-8"))
+
+    def scoreboard(self, date: str | None = None, groups: str = "50",
+                   limit: int = 500) -> dict:
+        """`date` is YYYYMMDD. groups=50 is Division I."""
+        return self._get(SCOREBOARD_URL,
+                         {"dates": date, "groups": groups, "limit": limit})
+
+    def summary(self, event_id: int | str) -> dict:
+        return self._get(SUMMARY_URL, {"event": event_id})
+```
+
+## `src/cbbwp/adapters/hoopr.py`
+
+```py
+"""Adapter: hoopR / sportsdataverse historical play-by-play parquet -> Events.
+
+Two paths, deliberately:
+  * `load_events` builds canonical Event objects for one or a few games. This is
+    the reference path and the one the live pipeline mirrors.
+  * `states_lazy` does the same transformation in Polars for tens of millions of
+    rows. It exists only for speed, and `tests/test_parity.py` asserts it agrees
+    with the reference path row-for-row on real games.
+"""
+from __future__ import annotations
+
+from typing import Iterable, List, Optional
+
+import polars as pl
+
+from ..schemas import Event, HALF_SECONDS, OT_SECONDS
+from ..state import TEAM_TIMEOUT_TYPES, FOUL_TYPES, clock_to_seconds
+
+# Columns present in every season 2016-2026 of the hoopR mbb pbp files.
+BASE_COLS = [
+    "game_id", "game_play_number", "period_number", "clock_display_value",
+    "home_score", "away_score", "type_text", "team_id", "score_value",
+    "scoring_play", "shooting_play", "home_team_id", "away_team_id",
+    "season", "season_type", "game_date",
+]
+
+MADE_SHOT_TYPES = ["JumpShot", "LayUpShot", "DunkShot", "TipShot"]
+
+
+def load_events(path: str, game_id: int) -> tuple[List[Event], int, int]:
+    """Reference path: one game's parquet rows -> canonical Events."""
+    df = (
+        pl.scan_parquet(path)
+        .filter(pl.col("game_id") == game_id)
+        .select(BASE_COLS)
+        .sort("game_play_number")
+        .collect()
+    )
+    if df.is_empty():
+        raise KeyError(f"game {game_id} not in {path}")
+    home_id = int(df["home_team_id"][0])
+    away_id = int(df["away_team_id"][0])
+    events = [
+        Event(
+            game_id=int(r["game_id"]),
+            seq=int(r["game_play_number"]),
+            period=int(r["period_number"] or 1),
+            clock_seconds=clock_to_seconds(r["clock_display_value"] or ""),
+            home_score=int(r["home_score"] or 0),
+            away_score=int(r["away_score"] or 0),
+            event_type=r["type_text"] or "",
+            team_id=None if r["team_id"] is None else int(r["team_id"]),
+            score_value=int(r["score_value"] or 0),
+            scoring_play=bool(r["scoring_play"]),
+            shooting_play=bool(r["shooting_play"]),
+        )
+        for r in df.iter_rows(named=True)
+    ]
+    return events, home_id, away_id
+
+
+# --------------------------------------------------------------------------
+# Vectorised bulk path
+# --------------------------------------------------------------------------
+def _clock_seconds_expr(col: str = "clock_display_value") -> pl.Expr:
+    parts = pl.col(col).str.split_exact(":", 1)
+    mm = parts.struct.field("field_0").cast(pl.Float64, strict=False)
+    ss = parts.struct.field("field_1").cast(pl.Float64, strict=False)
+    return (
+        pl.when(pl.col(col).str.contains(":"))
+        .then(mm * 60 + ss.floor())
+        .otherwise(pl.col(col).cast(pl.Float64, strict=False).floor())
+        .fill_null(0)
+        .cast(pl.Int32)
+    )
+
+
+def states_lazy(lf: pl.LazyFrame, timeouts_at_tip: int = 4) -> pl.LazyFrame:
+    """Vectorised equivalent of state.build_states over many games at once."""
+    t = pl.col("type_text")
+    actor = (
+        pl.when(pl.col("team_id") == pl.col("home_team_id")).then(pl.lit(1.0))
+        .when(pl.col("team_id") == pl.col("away_team_id")).then(pl.lit(0.0))
+        .otherwise(pl.lit(None, dtype=pl.Float64))
+    )
+    other = 1.0 - actor
+    made = pl.col("scoring_play").fill_null(False)
+    shooting = pl.col("shooting_play").fill_null(False)
+
+    poss_set = (
+        # Same rule, same order, as state._possession_after. Made field goals are
+        # detected by the scoring/shooting flags, not by play-type name - see the
+        # comment there for why the name whitelist was wrong for 2016-2019.
+        pl.when(t.str.contains("FreeThrow") & made).then(other)
+        .when(made & shooting).then(other)
+        .when(t.is_in(["Defensive Rebound", "Offensive Rebound"])).then(actor)
+        .when(t.str.contains("Turnover")).then(other)
+        .when(t == "Steal").then(actor)
+        .when(t == "Jumpball").then(pl.lit(0.5))
+        .otherwise(pl.lit(None, dtype=pl.Float64))
+    )
+
+    is_team_to = t.is_in(list(TEAM_TIMEOUT_TYPES))
+    is_foul = t.is_in(list(FOUL_TYPES))
+    period = pl.col("period_number").fill_null(1).clip(lower_bound=1).cast(pl.Int32)
+    plen = pl.when(period <= 2).then(pl.lit(HALF_SECONDS)).otherwise(pl.lit(OT_SECONDS))
+    clock = _clock_seconds_expr().clip(0, None)
+    clock = pl.min_horizontal(clock, plen).cast(pl.Int32)
+    gsr = pl.when(period <= 1).then(pl.lit(HALF_SECONDS) + clock).otherwise(clock)
+
+    allot = pl.lit(timeouts_at_tip) + (period - 2).clip(lower_bound=0)
+
+    return (
+        lf.sort(["game_id", "game_play_number"])
+        .with_columns(
+            _period=period,
+            _clock=clock,
+            _gsr=gsr.cast(pl.Int32),
+            _poss_set=poss_set,
+            _to_home=(is_team_to & (pl.col("team_id") == pl.col("home_team_id"))).cast(pl.Int32),
+            _to_away=(is_team_to & (pl.col("team_id") == pl.col("away_team_id"))).cast(pl.Int32),
+            _allot=allot,
+            _half=pl.when(period <= 1).then(pl.lit(1)).otherwise(pl.lit(2)),
+            _foul_home=(is_foul & (pl.col("team_id") == pl.col("home_team_id"))).cast(pl.Int32),
+            _foul_away=(is_foul & (pl.col("team_id") == pl.col("away_team_id"))).cast(pl.Int32),
+        )
+        .with_columns(
+            possession=pl.col("_poss_set").forward_fill().over("game_id").fill_null(0.5),
+            home_used=pl.col("_to_home").cum_sum().over("game_id"),
+            away_used=pl.col("_to_away").cum_sum().over("game_id"),
+            home_fouls=pl.col("_foul_home").cum_sum().over(["game_id", "_half"]),
+            away_fouls=pl.col("_foul_away").cum_sum().over(["game_id", "_half"]),
+        )
+        .with_columns(
+            margin=(pl.col("home_score").fill_null(0) - pl.col("away_score").fill_null(0)).cast(pl.Int32),
+            home_timeouts=(pl.col("_allot") - pl.col("home_used")).clip(lower_bound=0).cast(pl.Int32),
+            away_timeouts=(pl.col("_allot") - pl.col("away_used")).clip(lower_bound=0).cast(pl.Int32),
+            is_ot=(pl.col("_period") >= 3),
+        )
+        .rename({"_period": "period", "_clock": "clock_seconds",
+                 "_gsr": "game_seconds_remaining", "game_play_number": "seq"})
+        .drop(["_poss_set", "_to_home", "_to_away", "_allot", "home_used", "away_used",
+               "_half", "_foul_home", "_foul_away"])
+    )
+```
+
+## `src/cbbwp/calibration.py`
+
+```py
+"""Time-bucketed probability calibration.
+
+Miscalibration in these models is almost entirely time-dependent, so a single
+global calibrator averages two opposite errors and fixes neither (plan 9.3).
+We fit one isotonic curve per time bucket on a HELD-OUT season, then blend
+between adjacent buckets so the curve never visibly jumps.
+"""
+from __future__ import annotations
+
+import numpy as np
+from sklearn.isotonic import IsotonicRegression
+
+# (lower, upper) seconds remaining, and the anchor point used for blending.
+BUCKETS = [(1200, 2400), (600, 1200), (300, 600), (120, 300), (60, 120), (0, 60)]
+ANCHORS = np.array([np.sqrt((lo + hi) / 2) for lo, hi in BUCKETS])
+CLIP = (0.001, 0.999)
+
+
+class TimeBucketedCalibrator:
+    def __init__(self, buckets=BUCKETS, min_rows=20_000):
+        self.buckets = list(buckets)
+        self.min_rows = min_rows
+        self.models: list[IsotonicRegression | None] = []
+
+    def fit(self, p, y, seconds):
+        self.models = []
+        for lo, hi in self.buckets:
+            m = (seconds >= lo) & (seconds < hi)
+            if m.sum() < self.min_rows:
+                self.models.append(None)
+                continue
+            iso = IsotonicRegression(out_of_bounds="clip", y_min=0.0, y_max=1.0)
+            iso.fit(p[m], y[m])
+            self.models.append(iso)
+        return self
+
+    def _apply(self, i, p):
+        m = self.models[i]
+        return p if m is None else m.predict(p)
+
+    def transform(self, p, seconds):
+        """Blend the two nearest bucket calibrators, weighted in sqrt-time."""
+        p = np.asarray(p, dtype=np.float64)
+        s = np.sqrt(np.maximum(np.asarray(seconds, dtype=np.float64), 0.0))
+        # anchors run from long time remaining down to zero
+        order = np.argsort(ANCHORS)
+        a = ANCHORS[order]
+        cols = np.stack([self._apply(order[i], p) for i in range(len(a))], axis=1)
+        idx = np.clip(np.searchsorted(a, s), 1, len(a) - 1)
+        lo, hi = a[idx - 1], a[idx]
+        w = np.clip((s - lo) / np.maximum(hi - lo, 1e-9), 0.0, 1.0)
+        out = cols[np.arange(len(p)), idx - 1] * (1 - w) + cols[np.arange(len(p)), idx] * w
+        return np.clip(out, *CLIP)
+```
+
+## `src/cbbwp/endgame.py`
+
+```py
+"""Rule-based overrides the training data cannot teach efficiently (plan 10).
+
+The model does not know the rules; we do. These are constraints, not hacks.
+"""
+from __future__ import annotations
+
+import numpy as np
+
+# A possession is worth at most 3 points (ignoring 4-point plays, which are rare
+# enough that treating them as impossible costs less than the states it saves).
+MAX_POINTS_PER_POSSESSION = 3
+# Seconds a trailing team needs to score and foul once more.
+SECONDS_PER_POSSESSION = 6.0
+
+
+def max_points_remaining(seconds_remaining: np.ndarray) -> np.ndarray:
+    """Optimistic ceiling on what a trailing team can still score."""
+    poss = np.floor(np.asarray(seconds_remaining, dtype=np.float64) / SECONDS_PER_POSSESSION) + 1
+    return poss * MAX_POINTS_PER_POSSESSION
+
+
+def apply(p, margin, seconds_remaining, is_ot=None):
+    """Clamp probabilities that the rules have already decided."""
+    p = np.array(p, dtype=np.float64, copy=True)
+    margin = np.asarray(margin)
+    t = np.asarray(seconds_remaining, dtype=np.float64)
+
+    # 1. Time expired in the final period: the result is known.
+    over = t <= 0
+    p[over & (margin > 0)] = 1.0
+    p[over & (margin < 0)] = 0.0
+    # A tie at 0:00 goes to overtime -> a coin flip, nudged by nothing else here.
+    p[over & (margin == 0)] = 0.5
+
+    # 2. Mathematically decided: the trailing team cannot catch up in the
+    #    possessions that remain, however well it plays.
+    ceiling = max_points_remaining(t)
+    decided_home = (~over) & (margin > ceiling)
+    decided_away = (~over) & (-margin > ceiling)
+    p[decided_home] = 1.0
+    p[decided_away] = 0.0
+    return p
+```
+
+## `src/cbbwp/endgame_sim.py`
+
+```py
+"""Exhaustive endgame solver: the last 60 seconds, by backward induction.
+
+Endgame plan, Phase 3. The plan's design decision was "a table, not a live
+simulation", for three reasons: serving becomes a lookup, monotonicity can be
+ENFORCED across the whole table rather than hoped for, and a person can read a
+row and check it against their own judgement.
+
+This module goes one step further than the plan asked and replaces Monte Carlo
+with **backward induction**. The endgame state space is small, discrete and
+acyclic in time -- every transition burns at least one second -- so the exact
+value of every state can be computed directly. That removes simulation noise
+entirely, which matters because two identical states must never disagree, and
+it makes the monotonicity checks meaningful: a violation is then a statement
+about the model, not about how many samples were drawn.
+
+STATE, from the point of view of the team WITH THE BALL
+    t   seconds remaining, 0..60
+    m   that team's margin, clamped to -12..+12
+    fo  that team's own team fouls this half, 0..10 (10 = "10 or more")
+    fd  the defending team's team fouls, same encoding
+    bo  that team's free-throw ability bucket, 0=poor 1=average 2=good
+    bd  the defending team's bucket
+
+V[t][m, fo, fd, bo, bd] = P(the team with the ball wins).
+
+Symmetry is structural rather than fitted. When possession changes, the value
+of the state to the team that just lost the ball is
+
+    1 - V[t'][-m, fd, fo, bd, bo]
+
+so the table cannot disagree with itself about which side of a game it is
+describing, and a mirrored state cannot drift from its twin.
+
+Every probability comes from artifacts/endgame_params.json and
+artifacts/endgame_possessions.json, both measured on 2016-2024 only. Nothing
+here is hand-set except the state-space bounds and the smoothing window, and
+both are declared as constants below.
+
+WHAT THIS DELIBERATELY DOES NOT MODEL, and why
+  * Timeouts. The plan lists them in the state space, but no separable effect
+    was measured -- the possession-length and foul-rate cells already average
+    over however teams actually used their timeouts. Adding a state dimension
+    with an invented coefficient would add sampling error to sparse states for
+    no measured gain. See `docs/cbbwp-endgame-phase2.md`.
+  * Optimal play. The fouling rule is OBSERVED behaviour. The model predicts
+    real games, in which coaches foul later and less often than optimally.
+  * Team strength. The table is deliberately team-agnostic apart from free-throw
+    ability. Strength enters at blend time, where the model already carries it.
+    A tie at 0:00 is therefore 0.5 here, not a rating-adjusted overtime number.
+"""
+from __future__ import annotations
+
+import json
+from dataclasses import dataclass
+from pathlib import Path
+
+import numpy as np
+
+# --- state space ------------------------------------------------------------
+T_MAX = 60
+MARGIN_MIN, MARGIN_MAX = -12, 12
+FOUL_MAX = 10           # 10 encodes "10 or more"
+N_FT_BUCKETS = 3
+
+MARGINS = np.arange(MARGIN_MIN, MARGIN_MAX + 1)
+NM = len(MARGINS)
+NF = FOUL_MAX + 1
+NB = N_FT_BUCKETS
+SHAPE = (NM, NF, NF, NB, NB)
+
+BONUS_FOULS = 7          # the 7th team foul of a half starts the one-and-one
+DOUBLE_BONUS_FOULS = 10
+
+# Possession lengths are measured as means; a single deterministic length would
+# put artificial parity structure into the table ("exactly three possessions
+# left"). Spread each mean over three adjacent seconds instead.
+DURATION_SMOOTHING = (0.25, 0.50, 0.25)
+MAX_DURATION = 30
+
+
+def _mi(m: np.ndarray | int):
+    """Margin -> index, clamped."""
+    return np.clip(m, MARGIN_MIN, MARGIN_MAX) - MARGIN_MIN
+
+
+REV = np.arange(NM)[::-1]     # index of -m
+
+
+@dataclass(frozen=True)
+class Params:
+    """Everything the solver needs, already smoothed onto the state grid."""
+    p_foul: np.ndarray        # (T_MAX+1, NM)  defence sends the offence to the line
+    p_to: np.ndarray          # (T_MAX+1, NM)  turnover, conditional on not fouled
+    p3a: np.ndarray           # (NM,) share of shots that are threes
+    p3: np.ndarray            # (NM,)
+    p2: np.ndarray            # (NM,)
+    dur: np.ndarray           # (T_MAX+1, NM) mean seconds, played out
+    dur_foul: np.ndarray      # (T_MAX+1, NM) mean seconds to the foul
+    ft1_bonus: np.ndarray     # (NB,) front end of a one-and-one
+    ft2_bonus: np.ndarray     # (NB,) the bonus shot
+    ft1_two: np.ndarray       # (NB,) first of two
+    ft2_two: np.ndarray       # (NB,) second of two
+    oreb_ft: float
+    oreb_3: float
+    oreb_2: float
+
+
+# --- parameter assembly -----------------------------------------------------
+def _cell_grid(cells: dict, field: str, default: float) -> np.ndarray:
+    """The (m, 10s-bucket) measurements, interpolated onto (t, m)."""
+    buckets = sorted({float(k.split("|")[1]) for k in cells})
+    raw = np.full((len(buckets), NM), np.nan)
+    for key, v in cells.items():
+        ms, tbs = key.split("|")
+        m = int(float(ms))
+        if not (MARGIN_MIN <= m <= MARGIN_MAX):
+            continue
+        val = v.get(field)
+        if val is None:
+            continue
+        raw[buckets.index(float(tbs)), _mi(m)] = val
+    # Fill margin gaps by nearest neighbour along m, then interpolate in t.
+    for r in range(raw.shape[0]):
+        row = raw[r]
+        if np.all(np.isnan(row)):
+            row[:] = default
+        else:
+            idx = np.arange(NM)
+            good = ~np.isnan(row)
+            row[~good] = np.interp(idx[~good], idx[good], row[good])
+    centres = np.array(buckets) + 5.0
+    out = np.empty((T_MAX + 1, NM))
+    for j in range(NM):
+        out[:, j] = np.interp(np.arange(T_MAX + 1), centres, raw[:, j])
+    return out
+
+
+def load_params(params_path: Path, poss_path: Path, ft_bucket_offsets) -> Params:
+    P = json.loads(Path(params_path).read_text())
+    Q = json.loads(Path(poss_path).read_text())
+    cells = Q["cells"]
+
+    p_foul = np.clip(_cell_grid(cells, "p_fouled_to_line", 0.15), 0.0, 0.95)
+    p_to_raw = np.clip(_cell_grid(cells, "p_turnover", 0.13), 0.0, 0.9)
+    # Measured turnover share is unconditional; the solver needs it conditional
+    # on the possession not having ended at the foul line.
+    p_to = np.clip(p_to_raw / np.maximum(1e-6, 1.0 - p_foul), 0.0, 0.95)
+
+    dur = np.clip(_cell_grid(cells, "mean_dur", 6.0), 1.0, MAX_DURATION)
+    dur_foul = np.clip(_cell_grid(cells, "mean_dur_when_fouled", 5.0), 1.0, MAX_DURATION)
+
+    shots = P["late_shots_by_actor_margin"]
+    p3a = np.empty(NM); p3 = np.empty(NM); p2 = np.empty(NM)
+    for j, m in enumerate(MARGINS):
+        key = str(int(np.clip(m, -6, 6)))
+        s = shots.get(key)
+        p3a[j] = s["p3a"]; p3[j] = s["p3"]; p2[j] = s["p2"]
+
+    ft = P["free_throws"]["last_60s"]
+    off = np.asarray(ft_bucket_offsets, dtype=float)
+
+    def band(key, fallback):
+        base = ft[key]["p"] if key in ft else fallback
+        return np.clip(base + off, 0.30, 0.99)
+
+    reb = P["rebounds"]
+    return Params(
+        p_foul=p_foul, p_to=p_to, p3a=p3a, p3=p3, p2=p2, dur=dur, dur_foul=dur_foul,
+        ft1_bonus=band("one_and_one_1", 0.709),
+        ft2_bonus=band("one_and_one_2", 0.769),
+        ft1_two=band("two_shot_1", 0.718),
+        ft2_two=band("two_shot_2", 0.770),
+        oreb_ft=reb["oreb_after_missed_ft_last60"]["p"],
+        oreb_3=reb["oreb_after_missed_3_last60"]["p"],
+        oreb_2=reb["oreb_after_missed_2_last60"]["p"],
+    )
+
+
+# --- the solver -------------------------------------------------------------
+def _terminal() -> np.ndarray:
+    """t = 0. The team with the ball wins iff it is ahead; a tie is overtime."""
+    v = np.empty(SHAPE)
+    win = np.where(MARGINS > 0, 1.0, np.where(MARGINS < 0, 0.0, 0.5))
+    v[:] = win.reshape(NM, 1, 1, 1, 1)
+    return v
+
+
+def _flip(v: np.ndarray) -> np.ndarray:
+    """Value of a state to the team that has just LOST the ball."""
+    return 1.0 - v[REV][:, :, :, :, :].transpose(0, 2, 1, 4, 3)
+
+
+def _shift_margin(v: np.ndarray, pts: int) -> np.ndarray:
+    """v evaluated at margin m + pts, clamped at the ends of the grid."""
+    if pts == 0:
+        return v
+    idx = np.clip(np.arange(NM) + pts, 0, NM - 1)
+    return v[idx]
+
+
+def _foul_index() -> np.ndarray:
+    """fd -> fd + 1, capped at FOUL_MAX."""
+    return np.minimum(np.arange(NF) + 1, FOUL_MAX)
+
+
+def solve(p: Params) -> np.ndarray:
+    """V[t] for t = 0..T_MAX. Exact, no sampling."""
+    V = np.empty((T_MAX + 1,) + SHAPE)
+    V[0] = _terminal()
+
+    inc = _foul_index()
+    # shots awarded by the foul that takes the defence to fd+1
+    after = np.minimum(np.arange(NF) + 1, FOUL_MAX + 1)
+    shots_for = np.where(after >= DOUBLE_BONUS_FOULS, 2, np.where(after >= BONUS_FOULS, 1, 0))
+
+    # Slices below are (margin, own_fouls, own_bucket, opp_bucket): the free-throw
+    # rate varies on the SHOOTING team's bucket, which is axis 2 of that slice.
+    ft1b = p.ft1_bonus.reshape(1, 1, NB, 1)
+    ft2b = p.ft2_bonus.reshape(1, 1, NB, 1)
+    ft1t = p.ft1_two.reshape(1, 1, NB, 1)
+    ft2t = p.ft2_two.reshape(1, 1, NB, 1)
+
+    for t in range(1, T_MAX + 1):
+
+        def look(tau_grid: np.ndarray, transform):
+            """Expected value after burning `tau_grid` seconds, per margin.
+
+            tau_grid is (NM,) of mean seconds; each is spread over three
+            adjacent whole seconds so the table carries no parity artefacts.
+            """
+            acc = np.zeros(SHAPE)
+            base = np.rint(tau_grid).astype(int)
+            for w, d in zip(DURATION_SMOOTHING, (-1, 0, 1)):
+                tau = np.clip(base + d, 1, MAX_DURATION)
+                for u in np.unique(tau):
+                    sel = tau == u
+                    nxt = V[max(0, t - int(u))]
+                    contrib = transform(nxt)
+                    acc[sel] += w * contrib[sel]
+            return acc
+
+        # ---- branch A: the defence fouls -------------------------------
+        def fouled(nxt: np.ndarray) -> np.ndarray:
+            keep = nxt                      # offence still has the ball
+            lost = _flip(nxt)               # offence has given it up
+            out = np.empty(SHAPE)
+
+            for f in range(NF):
+                fd_new = inc[f]
+                s = shots_for[f]
+                k = keep[:, :, fd_new, :, :]
+                l = lost[:, :, fd_new, :, :]
+
+                def at(arr, pts):
+                    return _shift_margin(arr, pts)
+
+                if s == 0:
+                    # No shots: the ball goes back in from the side.
+                    out[:, :, f, :, :] = k
+                    continue
+
+                if s == 1:
+                    p1 = ft1b; p2_ = ft2b
+                    # miss the front end -> live rebound
+                    miss1 = (1 - p1) * (p.oreb_ft * at(k, 0) + (1 - p.oreb_ft) * at(l, 0))
+                    # make it, then the bonus shot
+                    make2 = p2_ * at(l, 2)
+                    miss2 = (1 - p2_) * (p.oreb_ft * at(k, 1) + (1 - p.oreb_ft) * at(l, 1))
+                    out[:, :, f, :, :] = miss1 + p1 * (make2 + miss2)
+                    continue
+
+                # Two shots. The first only adds a point; the trip -- and so the
+                # possession -- is decided by the second.
+                p1 = ft1t; p2_ = ft2t
+                def trip(made1: int):
+                    return (
+                        p2_ * at(l, made1 + 1)
+                        + (1 - p2_) * (p.oreb_ft * at(k, made1) + (1 - p.oreb_ft) * at(l, made1))
+                    )
+                out[:, :, f, :, :] = p1 * trip(1) + (1 - p1) * trip(0)
+            return out
+
+        # ---- branch B: turnover ----------------------------------------
+        def turned_over(nxt: np.ndarray) -> np.ndarray:
+            return _flip(nxt)
+
+        # ---- branch C: a shot goes up -----------------------------------
+        def shot(nxt: np.ndarray) -> np.ndarray:
+            keep, lost = nxt, _flip(nxt)
+            three = (
+                p.p3[:, None, None, None, None] * _shift_margin(lost, 3)
+                + (1 - p.p3[:, None, None, None, None])
+                * (p.oreb_3 * keep + (1 - p.oreb_3) * lost)
+            )
+            two = (
+                p.p2[:, None, None, None, None] * _shift_margin(lost, 2)
+                + (1 - p.p2[:, None, None, None, None])
+                * (p.oreb_2 * keep + (1 - p.oreb_2) * lost)
+            )
+            a = p.p3a[:, None, None, None, None]
+            return a * three + (1 - a) * two
+
+        pf = p.p_foul[t][:, None, None, None, None]
+        pt = p.p_to[t][:, None, None, None, None]
+
+        v_foul = look(p.dur_foul[t], fouled)
+        v_to = look(p.dur[t], turned_over)
+        v_shot = look(p.dur[t], shot)
+
+        V[t] = pf * v_foul + (1 - pf) * (pt * v_to + (1 - pt) * v_shot)
+        np.clip(V[t], 0.0, 1.0, out=V[t])
+
+    return V
+
+
+# --- monotonicity -----------------------------------------------------------
+def monotonicity_report(V: np.ndarray) -> dict:
+    """Every violation the endgame plan names, checked exhaustively."""
+    d_margin = np.diff(V, axis=1)                     # scoring must not hurt
+    d_bo = np.diff(V, axis=4)                         # better own FT shooting
+    d_bd = np.diff(V, axis=5)                         # better opponent FT shooting
+    own_foul = np.diff(V, axis=2)                     # more fouls of your own
+    opp_foul = np.diff(V, axis=3)                     # more fouls by the opponent
+    have_ball = V - _flip_all(V)
+    return {
+        "margin_min_increment": float(d_margin.min()),
+        "margin_violations": int((d_margin < -1e-12).sum()),
+        "own_ft_bucket_min_increment": float(d_bo.min()),
+        "own_ft_bucket_violations": int((d_bo < -1e-12).sum()),
+        "opp_ft_bucket_max_increment": float(d_bd.max()),
+        "opp_ft_bucket_violations": int((d_bd > 1e-12).sum()),
+        "own_fouls_max_increment": float(own_foul.max()),
+        "opp_fouls_min_increment": float(opp_foul.min()),
+        "possession_min_advantage": float(have_ball.min()),
+        "possession_violations": int((have_ball < -1e-12).sum()),
+    }
+
+
+def _flip_all(V: np.ndarray) -> np.ndarray:
+    return 1.0 - V[:, REV].transpose(0, 1, 3, 2, 5, 4)
+
+
+def enforce_margin_monotonicity(V: np.ndarray) -> tuple[np.ndarray, float]:
+    """Isotonic projection along margin; returns the largest correction made.
+
+    Parameters are estimated from finite samples, so a cell can end up a
+    fraction below its neighbour. Projecting is honest as long as the size of
+    the correction is reported -- a large one would mean the model is wrong,
+    not merely noisy.
+    """
+    out = np.maximum.accumulate(V, axis=1)
+    return out, float(np.abs(out - V).max())
+
+
+# --- serving ----------------------------------------------------------------
+def ft_bucket(pct, bucket_means) -> np.ndarray:
+    """Nearest free-throw ability bucket for a team's season FT%."""
+    means = np.asarray(bucket_means, dtype=float)
+    p = np.asarray(pct, dtype=float)
+    return np.abs(p[..., None] - means).argmin(axis=-1).astype(np.int64)
+
+
+def lookup_home(
+    table: np.ndarray,
+    seconds_remaining,
+    margin_home,
+    possession,
+    home_fouls,
+    away_fouls,
+    home_bucket,
+    away_bucket,
+) -> np.ndarray:
+    """P(home wins), from a table stored in the ball-holder's point of view.
+
+    `possession` is the pipeline's convention: 1.0 home, 0.0 away, 0.5 unknown.
+    An unknown possession is averaged rather than guessed, which is the only
+    answer that cannot be wrong in a way that shows up as a discontinuity.
+    """
+    t = np.clip(np.rint(np.asarray(seconds_remaining)).astype(int), 0, T_MAX)
+    # margin arrives as a float in the state frame; the table is indexed by
+    # whole points, so round rather than truncate.
+    m = np.rint(np.asarray(margin_home, dtype=float)).astype(int)
+    fh = np.clip(np.asarray(home_fouls), 0, FOUL_MAX).astype(int)
+    fa = np.clip(np.asarray(away_fouls), 0, FOUL_MAX).astype(int)
+    bh = np.asarray(home_bucket).astype(int)
+    ba = np.asarray(away_bucket).astype(int)
+
+    home_ball = table[t, _mi(m), fh, fa, bh, ba]
+    away_ball = 1.0 - table[t, _mi(-m), fa, fh, ba, bh]
+    poss = np.asarray(possession, dtype=float)
+    return np.where(poss >= 0.75, home_ball,
+                    np.where(poss <= 0.25, away_ball, 0.5 * (home_ball + away_ball)))
+```
+
+## `src/cbbwp/evaluate.py`
+
+```py
+"""Probability metrics, always broken out by time remaining (plan 11.2)."""
+from __future__ import annotations
+
+import numpy as np
+
+EPS = 1e-6
+
+# (label, lower bound seconds, upper bound seconds)
+TIME_BUCKETS = [
+    ("40-20 min", 1200, 2400),
+    ("20-10 min", 600, 1200),
+    ("10-5 min", 300, 600),
+    ("5-2 min", 120, 300),
+    ("2-0 min", 0, 120),
+]
+
+
+def log_loss(y, p):
+    p = np.clip(p, EPS, 1 - EPS)
+    return float(-np.mean(y * np.log(p) + (1 - y) * np.log(1 - p)))
+
+
+def brier(y, p):
+    return float(np.mean((p - y) ** 2))
+
+
+def accuracy(y, p):
+    return float(np.mean((p >= 0.5) == (y == 1)))
+
+
+def by_time_bucket(y, p, seconds, extra=None):
+    """Metrics per bucket. `extra` is an optional dict of other prediction sets."""
+    rows = []
+    for name, lo, hi in TIME_BUCKETS:
+        m = (seconds >= lo) & (seconds < hi) if lo > 0 else (seconds >= lo) & (seconds < hi)
+        if m.sum() == 0:
+            continue
+        row = {"bucket": name, "n": int(m.sum()),
+               "log_loss": log_loss(y[m], p[m]), "brier": brier(y[m], p[m]),
+               "acc": accuracy(y[m], p[m])}
+        if extra:
+            for k, v in extra.items():
+                ok = m & np.isfinite(v)
+                row[f"log_loss_{k}"] = log_loss(y[ok], v[ok]) if ok.sum() else float("nan")
+                row[f"n_{k}"] = int(ok.sum())
+        rows.append(row)
+    return rows
+
+
+def calibration_table(y, p, n_bins=10):
+    """Predicted vs observed, in equal-width probability bins."""
+    edges = np.linspace(0, 1, n_bins + 1)
+    idx = np.clip(np.digitize(p, edges[1:-1]), 0, n_bins - 1)
+    out = []
+    for b in range(n_bins):
+        m = idx == b
+        if m.sum() == 0:
+            continue
+        out.append({"bin": f"{edges[b]:.1f}-{edges[b+1]:.1f}", "n": int(m.sum()),
+                    "pred": float(p[m].mean()), "obs": float(y[m].mean())})
+    return out
+
+
+def ece(y, p, n_bins=20):
+    """Expected calibration error: mean |predicted - observed|, size-weighted."""
+    edges = np.linspace(0, 1, n_bins + 1)
+    idx = np.clip(np.digitize(p, edges[1:-1]), 0, n_bins - 1)
+    tot, n = 0.0, len(y)
+    for b in range(n_bins):
+        m = idx == b
+        if m.sum():
+            tot += m.sum() / n * abs(p[m].mean() - y[m].mean())
+    return float(tot)
+```
+
+## `src/cbbwp/features.py`
+
+```py
+"""Feature builder. Imported by BOTH the training pipeline and the live server.
+
+If you change anything here you have changed the model's inputs: bump the model
+version and refit. `FEATURE_NAMES` in schemas.py fixes the column order.
+"""
+from __future__ import annotations
+
+import math
+from typing import Dict, Iterable, List, Sequence
+
+import numpy as np
+
+from .schemas import (GameState, FEATURE_NAMES, REGULATION_SECONDS,
+                      BONUS_FOULS, DOUBLE_BONUS_FOULS)
+
+_SQRT_REG = math.sqrt(REGULATION_SECONDS)
+
+
+def _bonus_level(opp_fouls: int) -> int:
+    """0 = no bonus, 1 = one-and-one, 2 = double bonus."""
+    if opp_fouls >= DOUBLE_BONUS_FOULS:
+        return 2
+    if opp_fouls >= BONUS_FOULS:
+        return 1
+    return 0
+
+
+def feature_dict(s: GameState) -> Dict[str, float]:
+    """Features for one state. The single source of truth for both pipelines."""
+    t = max(float(s.game_seconds_remaining), 1.0)
+    sqrt_t = math.sqrt(t)
+    # Pregame edge is the only information at tip-off and should fade to nothing
+    # by the buzzer, because by then the score has absorbed it.
+    decay = sqrt_t / _SQRT_REG
+    return {
+        "margin": float(s.margin),
+        "sqrt_time": sqrt_t,
+        "margin_per_sqrt_time": float(s.margin) / sqrt_t,
+        "possession": float(s.possession),
+        "pregame_exp_margin": float(s.pregame_exp_margin),
+        "pregame_exp_margin_decayed": float(s.pregame_exp_margin) * decay,
+        "is_ot": 1.0 if s.is_ot else 0.0,
+        "timeout_diff": float(s.home_timeouts - s.away_timeouts),
+        # Bonus level a team SHOOTS in is driven by its opponent's fouls.
+        "bonus_diff": float(_bonus_level(s.away_fouls) - _bonus_level(s.home_fouls)),
+        "ft_pct_diff": float(s.ft_pct_diff),
+        # Pace-aware twin of margin/sqrt(time): two slow teams have fewer
+        # chances left than two fast ones with the same clock.
+        "margin_per_sqrt_points_left": float(s.margin) / math.sqrt(
+            max(s.exp_points_per_min * t / 60.0, 1.0)),
+    }
+
+
+def build_feature_matrix(states: Sequence[GameState]) -> np.ndarray:
+    """(n_states, n_features) float64 array in FEATURE_NAMES order."""
+    out = np.empty((len(states), len(FEATURE_NAMES)), dtype=np.float64)
+    for i, s in enumerate(states):
+        d = feature_dict(s)
+        for j, name in enumerate(FEATURE_NAMES):
+            out[i, j] = d[name]
+    return out
+
+
+def mirror_features(X: np.ndarray, y: np.ndarray):
+    """Symmetry augmentation (plan 8.3): swap the two teams, flip the label.
+
+    Forces the model to treat the teams identically except through terms that
+    are genuinely home-specific. Free data, and it stabilises the fit.
+    """
+    idx = {n: i for i, n in enumerate(FEATURE_NAMES)}
+    Xm = X.copy()
+    for name in ("margin", "margin_per_sqrt_time", "pregame_exp_margin",
+                 "pregame_exp_margin_decayed", "timeout_diff", "bonus_diff",
+                 "ft_pct_diff", "margin_per_sqrt_points_left"):
+        Xm[:, idx[name]] *= -1.0
+    Xm[:, idx["possession"]] = 1.0 - Xm[:, idx["possession"]]
+    return np.vstack([X, Xm]), np.concatenate([y, 1 - y])
+
+
+# --------------------------------------------------------------------------
+# Vectorised twin of `feature_dict`, for building tens of millions of rows.
+# tests/test_parity.py asserts the two agree.
+# --------------------------------------------------------------------------
+def feature_exprs():
+    import polars as pl
+    t = pl.max_horizontal(pl.col("game_seconds_remaining").cast(pl.Float64), pl.lit(1.0))
+    sqrt_t = t.sqrt()
+    return [
+        pl.col("margin").cast(pl.Float64).alias("margin"),
+        sqrt_t.alias("sqrt_time"),
+        (pl.col("margin").cast(pl.Float64) / sqrt_t).alias("margin_per_sqrt_time"),
+        pl.col("possession").cast(pl.Float64).alias("possession"),
+        pl.col("pregame_exp_margin").cast(pl.Float64).alias("pregame_exp_margin"),
+        (pl.col("pregame_exp_margin").cast(pl.Float64) * sqrt_t / _SQRT_REG)
+        .alias("pregame_exp_margin_decayed"),
+        pl.col("is_ot").cast(pl.Float64).alias("is_ot"),
+        (pl.col("home_timeouts") - pl.col("away_timeouts")).cast(pl.Float64).alias("timeout_diff"),
+        (_bonus_expr(pl.col("away_fouls")) - _bonus_expr(pl.col("home_fouls")))
+        .cast(pl.Float64).alias("bonus_diff"),
+        pl.col("ft_pct_diff").cast(pl.Float64).alias("ft_pct_diff"),
+        (pl.col("margin").cast(pl.Float64) / pl.max_horizontal(
+            pl.col("exp_points_per_min").cast(pl.Float64) * t / 60.0, pl.lit(1.0)).sqrt())
+        .alias("margin_per_sqrt_points_left"),
+    ]
+
+
+def _bonus_expr(fouls):
+    import polars as pl
+    return (pl.when(fouls >= DOUBLE_BONUS_FOULS).then(pl.lit(2))
+              .when(fouls >= BONUS_FOULS).then(pl.lit(1))
+              .otherwise(pl.lit(0)))
+```
+
+## `src/cbbwp/live_context.py`
+
+```py
+"""Pregame context for games that have not been played yet.
+
+Offline, `PregameContext` fields come from `games.parquet` / `team_stats.parquet`,
+which are built AFTER the fact. A live game has no such row, so the same three
+quantities have to be produced from what is known this morning:
+
+    pregame_exp_margin  = rating(home) - rating(away) + (0 if neutral else hca)
+    ft_pct_diff         = season-to-date FT% home minus away
+    exp_points_per_min  = the two teams' combined scoring rate
+
+`scripts/build_live_context.py` writes the snapshot this class reads. Refresh it
+daily (and it is cheap enough to refresh hourly); a stale snapshot degrades
+gracefully - it just means yesterday's ratings.
+"""
+from __future__ import annotations
+
+import datetime as _dt
+import json
+import pathlib
+from dataclasses import dataclass
+from typing import Dict
+
+from .schemas import PregameContext
+
+DEFAULT_HCA = 3.4
+DEFAULT_FT = 0.700
+DEFAULT_PPM = 3.45
+STALE_AFTER_DAYS = 3
+
+
+@dataclass
+class LiveContextProvider:
+    season: int
+    hca: float
+    ratings: Dict[int, float]
+    ft_pct: Dict[int, float]
+    ppm: Dict[int, float]
+    generated: str = ""
+
+    @classmethod
+    def load(cls, path: str | pathlib.Path) -> "LiveContextProvider":
+        d = json.loads(pathlib.Path(path).read_text())
+        as_int = lambda m: {int(k): float(v) for k, v in (m or {}).items()}
+        return cls(
+            season=int(d.get("season", 0)),
+            hca=float(d.get("hca", DEFAULT_HCA)),
+            ratings=as_int(d.get("ratings")),
+            ft_pct=as_int(d.get("ft_pct")),
+            ppm=as_int(d.get("ppm")),
+            generated=str(d.get("generated", "")),
+        )
+
+    @property
+    def age_days(self) -> float:
+        if not self.generated:
+            return float("inf")
+        try:
+            t = _dt.datetime.fromisoformat(self.generated)
+        except ValueError:
+            return float("inf")
+        if t.tzinfo is None:
+            t = t.replace(tzinfo=_dt.timezone.utc)
+        return (_dt.datetime.now(_dt.timezone.utc) - t).total_seconds() / 86400.0
+
+    @property
+    def is_stale(self) -> bool:
+        return self.age_days > STALE_AFTER_DAYS
+
+    def context_for(self, game_id: int, home_team_id: int, away_team_id: int,
+                    neutral_site: bool = False) -> PregameContext:
+        """Best available pregame context. Unknown teams fall back to average.
+
+        An unknown team id is not an error: it is a first-time opponent, a
+        non-D1 side, or an id ESPN has just renumbered. Rating 0.0 means
+        'league average', which is the right prior for a team we know nothing
+        about, and the model's pregame term decays away within a few minutes.
+        """
+        r_h = self.ratings.get(home_team_id, 0.0)
+        r_a = self.ratings.get(away_team_id, 0.0)
+        margin = r_h - r_a + (0.0 if neutral_site else self.hca)
+        ft_h = self.ft_pct.get(home_team_id, DEFAULT_FT)
+        ft_a = self.ft_pct.get(away_team_id, DEFAULT_FT)
+        ppm_h = self.ppm.get(home_team_id, DEFAULT_PPM)
+        ppm_a = self.ppm.get(away_team_id, DEFAULT_PPM)
+        return PregameContext(
+            game_id=game_id,
+            home_team_id=home_team_id,
+            away_team_id=away_team_id,
+            neutral_site=neutral_site,
+            pregame_exp_margin=float(margin),
+            season=self.season,
+            ft_pct_diff=float(ft_h - ft_a),
+            exp_points_per_min=float((ppm_h + ppm_a) / 2.0),
+        )
+
+    def known(self, team_id: int) -> bool:
+        return team_id in self.ratings
+```
+
+## `src/cbbwp/monitor.py`
+
+```py
+"""Calibration drift monitoring (plan phase 5, item 16).
+
+A win probability model fails quietly. Log loss barely moves when the model
+starts saying 0.80 to situations that win 0.74, but that gap is the whole
+product. So the check that matters is not "is the loss still good" but
+"does what we SAY still match what HAPPENS", sliced by time remaining -
+because that is the axis along which this model's error actually varies.
+
+Two thresholds, deliberately both required to fire:
+  * statistical  - the gap is larger than sampling noise (|z| > Z_ALERT);
+  * practical    - the gap is larger than anyone would care about
+                   (|gap| > MIN_GAP).
+A million rows will make a 0.3-point gap "significant"; that is not drift,
+that is a large sample. Requiring both keeps the alert honest.
+
+THE CLUSTERING POINT, which is the difference between this being useful and
+being a weekly false alarm: the ~400 states in one game are NOT independent
+observations. They share one outcome. A game the home team won contributes 400
+rows all labelled 1, and if the model was 3 points low on that game it is 3
+points low on all 400 of them. So the standard error must be computed on the
+number of GAMES in a bin, not the number of states - the same principle the
+train/test split rests on ("effective sample size is games, not rows").
+
+Treating states as independent inflates z by roughly sqrt(states per game),
+which here is about 6x. The first version of this file did exactly that and
+reported z = -10.6 for a gap that is really about z = -1.7. Pass `game_ids`
+and the correction is automatic; omit them and the report says so, loudly,
+rather than quietly overstating its own confidence.
+"""
+from __future__ import annotations
+
+import math
+from dataclasses import dataclass, asdict, field
+from typing import Dict, List, Optional, Sequence
+
+import numpy as np
+
+# Time buckets, as everywhere else in this package.
+TIME_BUCKETS = [
+    ("40-20 min", 1200, 2400),
+    ("20-10 min", 600, 1200),
+    ("10-5 min", 300, 600),
+    ("5-2 min", 120, 300),
+    ("2-1 min", 60, 120),
+    ("1-0 min", 0, 60),
+]
+
+Z_ALERT = 3.0        # ~1 false positive per 370 independent checks
+MIN_GAP = 0.02       # 2 percentage points: below this nobody would notice
+MIN_ROWS = 500       # a decile thinner than this says nothing either way
+MIN_GAMES = 100      # ...and neither does one drawn from a handful of games
+N_DECILES = 10
+
+
+@dataclass
+class BinReport:
+    bucket: str
+    decile: int
+    n: int              # states
+    n_games: int        # independent observations behind those states
+    pred: float
+    obs: float
+    gap: float
+    z: float
+    alert: bool
+
+    def as_dict(self) -> dict:
+        return asdict(self)
+
+
+@dataclass
+class DriftReport:
+    generated: str = ""
+    window: str = ""
+    n_rows: int = 0
+    n_games: int = 0
+    clustered: bool = True
+    bins: List[BinReport] = field(default_factory=list)
+    bucket_ece: Dict[str, float] = field(default_factory=dict)
+    alerts: List[str] = field(default_factory=list)
+    notes: List[str] = field(default_factory=list)
+
+    @property
+    def ok(self) -> bool:
+        return not self.alerts
+
+    def as_dict(self) -> dict:
+        return {
+            "generated": self.generated,
+            "window": self.window,
+            "n_rows": self.n_rows,
+            "n_games": self.n_games,
+            "ok": self.ok,
+            "clustered": self.clustered,
+            "alerts": self.alerts,
+            "notes": self.notes,
+            "bucket_ece": self.bucket_ece,
+            "bins": [b.as_dict() for b in self.bins],
+        }
+
+
+def _z_score(pred: float, obs: float, n_independent: int) -> float:
+    """How many standard errors the observed rate sits from the predicted one.
+
+    `n_independent` must be the number of GAMES contributing to the bin, not the
+    number of states - see the module docstring. Uses the predicted probability
+    for the standard error (the null hypothesis is that the model is right),
+    which is the conservative choice near 0 and 1.
+    """
+    var = pred * (1.0 - pred)
+    if n_independent <= 0 or var <= 0:
+        return 0.0
+    return (obs - pred) / math.sqrt(var / n_independent)
+
+
+def decile_edges(p: np.ndarray, n_deciles: int = N_DECILES) -> np.ndarray:
+    """Equal-COUNT edges. Equal-width bins leave the interesting tails empty."""
+    qs = np.linspace(0, 1, n_deciles + 1)[1:-1]
+    return np.unique(np.quantile(p, qs))
+
+
+def check(y: Sequence[int], p: Sequence[float], seconds: Sequence[float],
+          game_ids: Optional[Sequence] = None, window: str = "",
+          z_alert: float = Z_ALERT, min_gap: float = MIN_GAP,
+          min_rows: int = MIN_ROWS, min_games: int = MIN_GAMES,
+          generated: str = "") -> DriftReport:
+    """Decile calibration check within each time bucket.
+
+    `game_ids` is not optional in spirit: without it every state is treated as
+    an independent observation and the z-scores are inflated by roughly the
+    square root of the number of states per game. Omitting it is supported for
+    synthetic data and unit tests, and the report says so.
+    """
+    y = np.asarray(y, dtype=np.float64)
+    p = np.asarray(p, dtype=np.float64)
+    s = np.asarray(seconds, dtype=np.float64)
+    if not (len(y) == len(p) == len(s)):
+        raise ValueError("y, p and seconds must be the same length")
+    if game_ids is None:
+        g = np.arange(len(y))          # every row its own "game": no clustering
+        clustered = False
+    else:
+        g = np.asarray(game_ids)
+        if len(g) != len(y):
+            raise ValueError("game_ids must be the same length as y")
+        clustered = True
+
+    rep = DriftReport(generated=generated, window=window, n_rows=int(len(y)),
+                      n_games=int(len(np.unique(g))) if clustered else 0,
+                      clustered=clustered)
+    if not clustered:
+        rep.notes.append(
+            "no game_ids supplied: states treated as independent, so z-scores "
+            "are optimistic. Fine for synthetic data, wrong for real games.")
+
+    for name, lo, hi in TIME_BUCKETS:
+        m = (s >= lo) & (s < hi)
+        if m.sum() < min_rows:
+            continue
+        pb, yb, gb = p[m], y[m], g[m]
+        edges = decile_edges(pb)
+        idx = np.digitize(pb, edges)
+        ece = 0.0
+        for d in range(len(edges) + 1):
+            dm = idx == d
+            n = int(dm.sum())
+            if n == 0:
+                continue
+            n_games = int(len(np.unique(gb[dm])))
+            pred = float(pb[dm].mean())
+            obs = float(yb[dm].mean())
+            gap = obs - pred
+            ece += n / len(pb) * abs(gap)
+            # The independent-observation count is the number of games.
+            z = _z_score(pred, obs, n_games)
+            alert = bool(n >= min_rows and n_games >= min_games
+                         and abs(z) > z_alert and abs(gap) > min_gap)
+            rep.bins.append(BinReport(name, d, n, n_games, pred, obs, gap, z, alert))
+            if alert:
+                rep.alerts.append(
+                    f"{name} decile {d}: model says {pred:.3f}, observed "
+                    f"{obs:.3f} over {n:,} states from {n_games:,} games "
+                    f"(gap {gap:+.3f}, z {z:+.1f})")
+        rep.bucket_ece[name] = float(ece)
+    return rep
+
+
+def format_report(rep: DriftReport) -> str:
+    """Human-readable table, for a terminal or an alert email."""
+    out = []
+    head = f"calibration check  {rep.window}".strip()
+    out.append(head)
+    out.append(f"{rep.n_rows:,} states"
+               + (f" from {rep.n_games:,} games" if rep.n_games else ""))
+    for n in rep.notes:
+        out.append(f"NOTE: {n}")
+    out.append("")
+    out.append(f"{'bucket':<12}{'dec':>4}{'states':>10}{'games':>8}"
+               f"{'pred':>8}{'obs':>8}{'gap':>8}{'z':>7}  ")
+    last = None
+    for b in rep.bins:
+        sep = "" if b.bucket == last else "\n"
+        last = b.bucket
+        flag = "  <-- ALERT" if b.alert else ""
+        out.append(f"{sep}{b.bucket if sep else '':<12}{b.decile:>4}{b.n:>10,}"
+                   f"{b.n_games:>8,}{b.pred:>8.3f}{b.obs:>8.3f}{b.gap:>+8.3f}"
+                   f"{b.z:>+7.1f}{flag}")
+    out.append("")
+    out.append("ECE by bucket: " + "  ".join(
+        f"{k} {v:.4f}" for k, v in rep.bucket_ece.items()))
+    out.append("")
+    if rep.ok:
+        out.append("OK - no bucket/decile is both statistically and practically off\n"
+                   "     (z computed on games, not states - see monitor.py).")
+    else:
+        out.append(f"{len(rep.alerts)} ALERT(S):")
+        out.extend("  " + a for a in rep.alerts)
+    return "\n".join(out)
+```
+
+## `src/cbbwp/ratings.py`
+
+```py
+"""As-of-date pregame team ratings - our stand-in for the closing spread.
+
+hoopR carries a betting spread only through ~2023, so we fit our own team
+strength model. The output, `pregame_exp_margin`, is on the same scale as a
+negated point spread: expected home margin in points.
+
+Leakage discipline (plan 8.2): a game's rating inputs are refit from games
+that finished STRICTLY BEFORE that game's date. Nothing a season later, and
+nothing from the game itself, can reach the model.
+
+Method: ridge regression of final margin on (home indicator - away indicator)
+plus a home-court term, shrunk toward a prior. The prior is last season's final
+rating regressed toward the mean, which is what carries a team through the
+first few November games when the in-season sample is empty.
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Dict
+
+import numpy as np
+import polars as pl
+
+CARRYOVER = 0.70     # how much of last season's rating survives into this one
+RIDGE_LAMBDA = 0.5   # tuned against 2016-23 closing spreads: corr 0.87, HCA 3.8
+REFIT_EVERY_DAYS = 7
+
+
+@dataclass
+class SeasonRatings:
+    season: int
+    ratings: Dict[int, float]   # team_id -> points above average
+    hca: float
+
+
+def _fit_ridge(games: pl.DataFrame, teams: list[int], prior: Dict[int, float],
+               lam: float | None = None) -> tuple[Dict[int, float], float]:
+    """Ridge fit of margin ~ home_team - away_team + hca, shrunk toward `prior`."""
+    lam = RIDGE_LAMBDA if lam is None else lam
+    idx = {t: i for i, t in enumerate(teams)}
+    n_t = len(teams)
+    if games.height == 0:
+        return dict(prior), 3.4
+
+    rows = games.height
+    X = np.zeros((rows, n_t + 1), dtype=np.float64)
+    h = games["home_id"].to_numpy()
+    a = games["away_id"].to_numpy()
+    X[np.arange(rows), [idx[t] for t in h]] = 1.0
+    X[np.arange(rows), [idx[t] for t in a]] = -1.0
+    X[:, n_t] = 1.0 - games["neutral_site"].cast(pl.Float64).to_numpy()
+    y = games["margin"].to_numpy().astype(np.float64)
+
+    b_prior = np.zeros(n_t + 1)
+    for t, v in prior.items():
+        if t in idx:
+            b_prior[idx[t]] = v
+    b_prior[n_t] = 3.4  # prior on home-court advantage, in points
+
+    resid = y - X @ b_prior
+    A = X.T @ X
+    pen = np.full(n_t + 1, lam)
+    pen[n_t] = 1.0          # barely shrink the home-court term
+    A[np.diag_indices_from(A)] += pen
+    d = np.linalg.solve(A, X.T @ resid)
+    b = b_prior + d
+    b[:n_t] -= b[:n_t].mean()   # ratings are relative; centre them
+    return {t: float(b[idx[t]]) for t in teams}, float(b[n_t])
+
+
+def season_pregame_margins(games: pl.DataFrame, prior: Dict[int, float], lam: float | None = None) -> tuple[pl.DataFrame, Dict[int, float], float]:
+    """For one season, attach `pregame_exp_margin` to every game.
+
+    `games` needs: game_id, date (datetime), home_id, away_id, margin, neutral_site.
+    Returns (games+column, end-of-season ratings, fitted home-court advantage).
+    """
+    games = games.sort("date")
+    teams = sorted(set(games["home_id"].to_list()) | set(games["away_id"].to_list()))
+    day = games["date"].dt.date()
+    games = games.with_columns(_day=day)
+    days = sorted(games["_day"].unique().to_list())
+
+    out_ids, out_vals = [], []
+    ratings, hca = dict(prior), 3.4
+    last_refit_i = -10_000
+    for i, d in enumerate(days):
+        if i - last_refit_i >= REFIT_EVERY_DAYS or i == 0:
+            past = games.filter(pl.col("_day") < d)
+            ratings, hca = _fit_ridge(past, teams, prior, lam)
+            last_refit_i = i
+        todays = games.filter(pl.col("_day") == d)
+        for gid, hid, aid, neu in zip(todays["game_id"], todays["home_id"],
+                                      todays["away_id"], todays["neutral_site"]):
+            out_ids.append(gid)
+            out_vals.append(ratings.get(hid, 0.0) - ratings.get(aid, 0.0)
+                            + (0.0 if neu else hca))
+
+    final_ratings, final_hca = _fit_ridge(games, teams, prior, lam)
+    joined = games.join(
+        pl.DataFrame({"game_id": out_ids, "pregame_exp_margin": out_vals}),
+        on="game_id", how="left",
+    ).drop("_day")
+    return joined, final_ratings, final_hca
+
+
+def build_all_seasons(games: pl.DataFrame, lam: float | None = None) -> pl.DataFrame:
+    """Walk seasons in order, carrying each season's ratings into the next."""
+    prior: Dict[int, float] = {}
+    frames = []
+    for season in sorted(games["season"].unique().to_list()):
+        sg = games.filter(pl.col("season") == season)
+        out, final, hca = season_pregame_margins(sg, prior, lam)
+        frames.append(out)
+        prior = {t: v * CARRYOVER for t, v in final.items()}
+        print(f"  season {season}: {out.height} games, hca={hca:.2f}, "
+              f"rating sd={np.std(list(final.values())):.2f}")
+    return pl.concat(frames, how="vertical_relaxed")
+```
+
+## `src/cbbwp/schemas.py`
+
+```py
+"""Canonical data contracts shared by the offline and live pipelines.
+
+Every adapter (historical parquet, live ESPN feed, a paid feed later) must emit
+`Event` objects. Nothing downstream of an adapter knows where the data came from.
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Optional
+
+# --- Rules constants (men's NCAA, 2015-16 rules onward) ----------------------
+HALF_SECONDS = 20 * 60          # 1200
+REGULATION_SECONDS = 2 * HALF_SECONDS  # 2400
+OT_SECONDS = 5 * 60             # 300
+TIMEOUTS_AT_TIP = 4             # approximation of the men's allotment
+
+
+@dataclass(frozen=True, slots=True)
+class Event:
+    """One play, normalised. `seq` orders events within a game."""
+    game_id: int
+    seq: int
+    period: int                  # 1,2 = halves; 3+ = overtime
+    clock_seconds: int           # seconds left IN THE PERIOD at the play
+    home_score: int
+    away_score: int
+    event_type: str              # e.g. "JumpShot", "Timeout", "DefensiveRebound"
+    team_id: Optional[int]       # team the event is attributed to
+    score_value: int = 0
+    scoring_play: bool = False
+    shooting_play: bool = False
+    text: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class PregameContext:
+    """Known before tip-off. Loaded once per game, never re-fetched mid-game."""
+    game_id: int
+    home_team_id: int
+    away_team_id: int
+    neutral_site: bool = False
+    # Expected home margin in points (positive = home favoured).
+    # Either the negated closing spread, or a model-derived rating differential.
+    pregame_exp_margin: float = 0.0
+    season: int = 0
+    ft_pct_diff: float = 0.0
+    exp_points_per_min: float = 3.4
+
+
+@dataclass(slots=True)
+class GameState:
+    """A snapshot AFTER one event. One event -> one state row."""
+    game_id: int
+    seq: int
+    period: int
+    is_ot: bool
+    clock_seconds: int            # left in the period
+    game_seconds_remaining: int   # left in regulation, or in the current OT
+    home_score: int
+    away_score: int
+    margin: int                   # home - away
+    possession: float             # 1.0 home, 0.0 away, 0.5 unknown
+    home_timeouts: int
+    away_timeouts: int
+    home_fouls: int = 0            # team fouls in the current half
+    away_fouls: int = 0
+    pregame_exp_margin: float = 0.0
+    neutral_site: bool = False
+    ft_pct_diff: float = 0.0       # home season-to-date FT% minus away's
+    exp_points_per_min: float = 3.4  # combined scoring rate of the two teams
+
+
+# Column order is part of the contract: the fitted model's coefficients are
+# positional. Changing this list requires a new model version.
+FEATURE_NAMES = [
+    "margin",
+    "sqrt_time",
+    "margin_per_sqrt_time",
+    "possession",
+    "pregame_exp_margin",
+    "pregame_exp_margin_decayed",
+    "is_ot",
+    "timeout_diff",
+    "bonus_diff",
+    "ft_pct_diff",
+    "margin_per_sqrt_points_left",
+]
+
+# Men's NCAA bonus thresholds, in team fouls per half.
+BONUS_FOULS = 7        # 1-and-1
+DOUBLE_BONUS_FOULS = 10
+
+# Version of the STATE RULES, as opposed to the feature list above.
+#
+# FEATURE_NAMES catches someone adding, removing or reordering a column. It does
+# NOT catch someone changing what an existing column MEANS - and that is the
+# more dangerous edit, because nothing downstream looks any different.
+#
+# This happened on 2026-09-01: the possession rule was corrected so that made
+# three-pointers in 2016-2019 flip possession (they had not, because ESPN typed
+# them "Three Point Jump Shot" and the rule keyed on play-type names). The
+# feature list was untouched, so the manifest check passed, and a model trained
+# on the old meaning would have been served states built with the new one.
+#
+# Bump this whenever the meaning of any GameState field changes, and refit.
+#   1 - original rules, shipped 2026-08-31 (registry/v1)
+#   2 - made field goals detected by scoring+shooting flags, not type names
+STATE_RULES_VERSION = 2
+```
+
+## `src/cbbwp/serve.py`
+
+```py
+"""The live scoring path. Deliberately thin: it calls the SAME state and
+feature builders the training pipeline used, then a pinned model artifact.
+"""
+from __future__ import annotations
+
+import json
+import pathlib
+import pickle
+from typing import Iterable, List
+
+import numpy as np
+
+from .schemas import (Event, PregameContext, FEATURE_NAMES,
+                      STATE_RULES_VERSION)
+from .state import build_states
+from .features import build_feature_matrix
+from . import endgame
+
+OVERRIDE_CLIP = 0.999   # never assert more certainty than the feed supports
+
+
+class WinProbabilityService:
+    def __init__(self, registry_dir: str | pathlib.Path, version: str):
+        self.dir = pathlib.Path(registry_dir) / version
+        self.version = version
+        self.manifest = json.loads((self.dir / "manifest.json").read_text())
+        if self.manifest["features"] != FEATURE_NAMES:
+            raise RuntimeError(
+                f"model {version} was fit on different features than this code builds; "
+                "the feature contract changed - refit or pin an older code version"
+            )
+        # The names can match while the MEANING has changed underneath them.
+        # A model fit before a state-rule change must not be served states built
+        # after it. An artifact with no stamp predates the check and is treated
+        # as version 1.
+        fit_rules = self.manifest.get("state_rules_version", 1)
+        if fit_rules != STATE_RULES_VERSION:
+            raise RuntimeError(
+                f"model {version} was fit with state rules v{fit_rules} but this "
+                f"code builds states with v{STATE_RULES_VERSION}. The feature NAMES "
+                "still match, so this would have been silent: the model would be "
+                "served inputs that mean something different from its training "
+                "data. Refit, or pin the code version that matches the artifact."
+            )
+        kind = self.manifest["kind"]
+        if kind == "lightgbm":
+            import lightgbm as lgb
+            self.model = lgb.Booster(model_file=str(self.dir / "model.txt"))
+            self._predict = lambda X: self.model.predict(X)
+        else:
+            with open(self.dir / "model.pkl", "rb") as f:
+                b = pickle.load(f)
+            self._predict = lambda X: b["model"].predict_proba(b["scaler"].transform(X))[:, 1]
+
+    def score_game(self, events: Iterable[Event], ctx: PregameContext) -> List[dict]:
+        """Replay a game from event zero and return one prediction per state.
+
+        Called on every poll. Replaying from scratch costs milliseconds and makes
+        retroactive feed corrections a non-event.
+        """
+        states = build_states(events, ctx)
+        if not states:
+            return []
+        X = build_feature_matrix(states)
+        p = np.asarray(self._predict(X), dtype=np.float64)
+
+        margin = np.array([s.margin for s in states])
+        secs = np.array([s.game_seconds_remaining for s in states], dtype=np.float64)
+        adj = endgame.apply(p, margin, secs)
+        touched = adj != p
+        p[touched] = np.clip(adj[touched], 1 - OVERRIDE_CLIP, OVERRIDE_CLIP)
+
+        return [
+            {"game_id": s.game_id, "seq": s.seq, "period": s.period,
+             "game_seconds_remaining": s.game_seconds_remaining, "margin": s.margin,
+             "home_win_prob": float(pi), "model_version": self.version}
+            for s, pi in zip(states, p)
+        ]
+```
+
+## `src/cbbwp/state.py`
+
+```py
+"""Replayable game-state builder.
+
+`build_states` is a PURE function of the full event list. Feed it the same
+events in any arrival order and it produces the same states, so a retroactive
+correction from a live feed is handled by simply replaying the game from
+event zero (milliseconds).
+"""
+from __future__ import annotations
+
+from typing import Iterable, List, Optional
+
+from .schemas import (
+    Event,
+    GameState,
+    PregameContext,
+    HALF_SECONDS,
+    OT_SECONDS,
+    TIMEOUTS_AT_TIP,
+)
+
+# Fouls that count toward the team-foul total for bonus purposes.
+FOUL_TYPES = {"PersonalFoul", "Technical Foul"}
+
+# --- possession rules -------------------------------------------------------
+# What the state's `possession` should be AFTER each kind of event.
+#   "actor"  -> the team the event is attributed to has the ball
+#   "other"  -> the other team has the ball
+#   "carry"  -> unchanged from the previous state
+#   "unknown"-> 0.5
+# NOTE: this list is NO LONGER used to decide possession - see _possession_after.
+# It is kept only for documentation of what the field-goal types look like.
+_MADE_SHOT_TYPES = {"JumpShot", "LayUpShot", "DunkShot", "TipShot"}
+_TURNOVER_MARKER = "Turnover"
+
+TEAM_TIMEOUT_TYPES = {"ShortTimeOut", "RegularTimeOut", "TeamTimeOut", "Timeout"}
+OFFICIAL_TIMEOUT_TYPES = {"OfficialTVTimeOut", "MediaTimeOut"}
+
+
+def clock_to_seconds(display: str) -> int:
+    """'19:48' -> 1188.  '0:23.4' -> 23.  Returns 0 on anything unparseable."""
+    if not display:
+        return 0
+    s = display.strip()
+    try:
+        if ":" in s:
+            mm, ss = s.split(":", 1)
+            return int(mm) * 60 + int(float(ss))
+        return int(float(s))
+    except (ValueError, TypeError):
+        return 0
+
+
+def period_length(period: int) -> int:
+    return HALF_SECONDS if period <= 2 else OT_SECONDS
+
+
+def game_seconds_remaining(period: int, clock_seconds: int) -> int:
+    """Seconds left in regulation; inside overtime, seconds left in that OT.
+
+    Each overtime is treated as its own clock reset (see plan section 8.2).
+    """
+    if period <= 1:
+        return HALF_SECONDS + clock_seconds
+    if period == 2:
+        return clock_seconds
+    return clock_seconds
+
+
+def _possession_after(ev: Event, home_id: int, away_id: int, prev: float) -> float:
+    """Return 1.0 (home has ball), 0.0 (away), or 0.5 (unknown)."""
+    t = ev.event_type or ""
+    tid = ev.team_id
+    actor: Optional[float]
+    if tid is None:
+        actor = None
+    elif tid == home_id:
+        actor = 1.0
+    elif tid == away_id:
+        actor = 0.0
+    else:
+        actor = None
+    other = None if actor is None else 1.0 - actor
+
+    if "FreeThrow" in t:
+        return other if (ev.scoring_play and other is not None) else prev
+    # A made field goal -> the other team inbounds. A miss leaves the ball live,
+    # so possession carries until a rebound resolves it.
+    #
+    # This is keyed on the feed's own scoring/shooting flags rather than on a
+    # list of play-type NAMES, and that is not a style preference. ESPN typed
+    # made three-pointers as "Three Point Jump Shot" through 2019 and as
+    # "JumpShot" from 2021 onward. A name whitelist therefore missed 324,043
+    # made threes - 89% of every made three in 2016-2019 - and left the ball
+    # with the team that had just scored. The flags are stable across that
+    # rename; the names are not.
+    if ev.scoring_play and ev.shooting_play:
+        return other if other is not None else prev
+    if t == "Defensive Rebound" or t == "Offensive Rebound":
+        return actor if actor is not None else prev
+    if t == "Dead Ball Rebound":
+        return prev
+    if _TURNOVER_MARKER in t:
+        return other if other is not None else prev
+    if t == "Steal":
+        return actor if actor is not None else prev
+    if t == "Jumpball":
+        return 0.5
+    return prev  # fouls, blocks, subs, timeouts, period markers
+
+
+def build_states(
+    events: Iterable[Event],
+    ctx: PregameContext,
+    timeouts_at_tip: int = TIMEOUTS_AT_TIP,
+) -> List[GameState]:
+    """Replay a game's events into one state per event.
+
+    Pure: no dependence on arrival order, no hidden state, no I/O.
+    """
+    evs = sorted(events, key=lambda e: e.seq)
+    home_id, away_id = ctx.home_team_id, ctx.away_team_id
+
+    states: List[GameState] = []
+    poss = 0.5
+    home_used = away_used = 0
+    home_fouls = away_fouls = 0
+    half_of = lambda p: 1 if p <= 1 else 2   # men's fouls reset once, at the break
+    cur_half = 1
+
+    for ev in evs:
+        period = max(1, ev.period or 1)
+        if half_of(period) != cur_half:
+            cur_half = half_of(period)
+            home_fouls = away_fouls = 0
+
+        if ev.event_type in FOUL_TYPES:
+            if ev.team_id == home_id:
+                home_fouls += 1
+            elif ev.team_id == away_id:
+                away_fouls += 1
+
+        if ev.event_type in TEAM_TIMEOUT_TYPES:
+            if ev.team_id == home_id:
+                home_used += 1
+            elif ev.team_id == away_id:
+                away_used += 1
+
+        # NCAA grants one extra timeout per overtime period.
+        allot = timeouts_at_tip + max(0, period - 2)
+
+        poss = _possession_after(ev, home_id, away_id, poss)
+        clock = max(0, min(int(ev.clock_seconds or 0), period_length(period)))
+
+        states.append(
+            GameState(
+                game_id=ev.game_id,
+                seq=ev.seq,
+                period=period,
+                is_ot=period >= 3,
+                clock_seconds=clock,
+                game_seconds_remaining=game_seconds_remaining(period, clock),
+                home_score=ev.home_score,
+                away_score=ev.away_score,
+                margin=ev.home_score - ev.away_score,
+                possession=poss,
+                home_timeouts=max(0, allot - home_used),
+                away_timeouts=max(0, allot - away_used),
+                home_fouls=home_fouls,
+                away_fouls=away_fouls,
+                pregame_exp_margin=ctx.pregame_exp_margin,
+                neutral_site=ctx.neutral_site,
+                ft_pct_diff=ctx.ft_pct_diff,
+                exp_points_per_min=ctx.exp_points_per_min,
+            )
+        )
+    return states
+```
+
+## `scripts/blend_endgame.py`
+
+```py
+"""Phase 5: blend the endgame table with the model, tune once, test once.
+
+The endgame plan pre-registered five criteria and one verdict rule: "If it
+clears 2-5 but not 1, it does not ship." That is only credible if the tuning and
+the test are separate acts, so they are separate invocations here:
+
+    python3 scripts/blend_endgame.py --tune          # 2024 only, writes the config
+    python3 scripts/blend_endgame.py --test          # 2025-2026, reads it, once
+
+--test refuses to run unless the config file already exists, and records a
+hash of it in the result, so a result can always be traced to the configuration
+that produced it rather than to one chosen afterwards.
+
+The blend is in log-odds, with a weight that is exactly 0 at 60 seconds and
+exactly 1 at 0. Criterion 4 -- no visible discontinuity at the handoff -- is
+therefore satisfied by construction rather than by tuning, and is verified
+empirically anyway.
+"""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import sys
+from pathlib import Path
+
+import numpy as np
+import polars as pl
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "src"))
+from cbbwp import endgame as endgame_rules  # noqa: E402
+from cbbwp import endgame_sim as E  # noqa: E402
+from cbbwp.schemas import FEATURE_NAMES  # noqa: E402
+
+CONFIG = ROOT / "registry" / "endgame" / "blend.json"
+HANDOFF = 60.0
+EPS = 1e-15
+TUNE_SEASON = 2024
+TEST_SEASONS = [2025, 2026]
+
+
+def logit(p):
+    p = np.clip(p, 1e-6, 1 - 1e-6)
+    return np.log(p / (1 - p))
+
+
+def sigmoid(z):
+    return 1.0 / (1.0 + np.exp(-z))
+
+
+def log_loss(y, p):
+    p = np.clip(p, EPS, 1 - EPS)
+    return float(-(y * np.log(p) + (1 - y) * np.log(1 - p)).mean())
+
+
+def ece(y, p, bins=20):
+    edges = np.linspace(0, 1, bins + 1)
+    idx = np.clip(np.digitize(p, edges) - 1, 0, bins - 1)
+    tot = 0.0
+    for b in range(bins):
+        s = idx == b
+        if s.sum():
+            tot += s.mean() * abs(p[s].mean() - y[s].mean())
+    return float(tot)
+
+
+def load_frame(season: int, table, means, booster, seconds: float = 130.0) -> dict:
+    st = (
+        pl.scan_parquet(ROOT / "data" / "proc" / "states" / f"states_{season}.parquet")
+        .filter((pl.col("period") >= 2) & (pl.col("game_seconds_remaining") <= seconds))
+        # margin and possession are already in FEATURE_NAMES; asking for them
+        # twice is a duplicate projection.
+        .select(FEATURE_NAMES + [c for c in
+                ["game_id", "game_seconds_remaining", "margin", "possession",
+                 "home_fouls", "away_fouls", "home_win", "espn_wp"]
+                if c not in FEATURE_NAMES])
+        .collect()
+    )
+    ts = pl.read_parquet(ROOT / "data" / "proc" / "team_stats.parquet").select(
+        ["game_id", "home_ft_pct", "away_ft_pct"]
+    )
+    d = st.join(ts, on="game_id", how="left").with_columns(
+        [pl.col("home_ft_pct").fill_null(0.70), pl.col("away_ft_pct").fill_null(0.70)]
+    )
+    X = d.select(FEATURE_NAMES).to_numpy().astype(np.float32)
+    p_model = np.asarray(booster.predict(X), dtype=np.float64)
+    secs = d["game_seconds_remaining"].to_numpy().astype(np.float64)
+    p_table = E.lookup_home(
+        table, np.minimum(secs, E.T_MAX), d["margin"].to_numpy(), d["possession"].to_numpy(),
+        d["home_fouls"].to_numpy(), d["away_fouls"].to_numpy(),
+        E.ft_bucket(d["home_ft_pct"].to_numpy(), means),
+        E.ft_bucket(d["away_ft_pct"].to_numpy(), means),
+    )
+    return {
+        "y": d["home_win"].to_numpy().astype(float),
+        "secs": secs,
+        "margin": d["margin"].to_numpy(),
+        "game_id": d["game_id"].to_numpy(),
+        "p_model": p_model,
+        "p_table": p_table,
+        "espn": d["espn_wp"].to_numpy(),
+    }
+
+
+def blend(p_model, p_table, secs, gamma, alpha, beta, w_max=1.0):
+    """Log-odds blend with a weight that is exactly 0 at the handoff.
+
+    The plan assumed the simulator's weight should rise to 1.0 by 0:00. Tuning
+    on 2024 falsified that: the model is at its BEST at 0:00 (log loss 0.0859 in
+    the last five seconds, against the table's 0.1368), because by then the
+    margin and the clock have decided almost everything and there is nothing
+    left for a possession model to add. Forcing the weight to 1 there throws
+    away the model's strongest region. The weight therefore has a free ceiling.
+
+        w(t) = w_max * (1 - (t / 60)^gamma)
+
+    which is 0 at 60s -- so criterion 4 holds by construction, not by tuning --
+    and w_max at 0:00. Large gamma keeps the weight near its ceiling across most
+    of the window and spends the ramp near the handoff.
+    """
+    frac = np.clip(secs / HANDOFF, 0.0, 1.0)
+    w = w_max * (1.0 - frac ** gamma)
+    z = (1 - w) * logit(p_model) + w * (alpha * logit(p_table) + beta)
+    return sigmoid(z)
+
+
+def apply_rules(p, margin, secs):
+    """The same rule-based clamps the live path applies, after blending."""
+    adj = endgame_rules.apply(p, margin, secs)
+    touched = adj != p
+    out = p.copy()
+    out[touched] = np.clip(adj[touched], 1 - 0.999, 0.999)
+    return out
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--tune", action="store_true")
+    ap.add_argument("--test", action="store_true")
+    ap.add_argument("--table", default="registry/endgame/e1")
+    ap.add_argument("--model", default="registry/v2")
+    a = ap.parse_args()
+
+    import lightgbm as lgb
+    booster = lgb.Booster(model_file=str(ROOT / a.model / "model.txt"))
+    tdir = ROOT / a.table
+    table = np.load(tdir / "table.npz")["table"].astype(np.float64)
+    means = json.loads((tdir / "manifest.json").read_text())["ft_bucket_means"]
+
+    if a.tune:
+        d = load_frame(TUNE_SEASON, table, means, booster)
+        inside = d["secs"] <= HANDOFF
+        y, sec = d["y"][inside], d["secs"][inside]
+        pm, pt = d["p_model"][inside], d["p_table"][inside]
+        best = None
+        for gamma in (1.0, 1.5, 2.0, 3.0, 4.0, 6.0, 8.0):
+            for w_max in np.arange(0.05, 0.85, 0.05):
+                for alpha in np.arange(0.7, 1.35, 0.05):
+                    for beta in (-0.05, 0.0, 0.05):
+                        ll = log_loss(y, blend(pm, pt, sec, gamma, alpha, beta, w_max))
+                        if best is None or ll < best[0]:
+                            best = (ll, gamma, float(alpha), beta, float(w_max))
+        ll, gamma, alpha, beta, w_max = best
+        cfg = {
+            "handoff_seconds": HANDOFF, "gamma": gamma, "alpha": alpha, "beta": beta,
+            "w_max": w_max,
+            "table": a.table, "model": a.model, "tuned_on_season": TUNE_SEASON,
+            "tune_log_loss_inside_60s": ll,
+            "tune_baseline_model_only": log_loss(y, pm),
+            "tune_table_only": log_loss(y, pt),
+            "n_tune_rows": int(inside.sum()),
+        }
+        CONFIG.parent.mkdir(parents=True, exist_ok=True)
+        CONFIG.write_text(json.dumps(cfg, indent=2))
+        print(json.dumps(cfg, indent=2))
+        return
+
+    if not a.test:
+        ap.error("pass --tune or --test")
+
+    if not CONFIG.exists():
+        raise SystemExit(
+            "no blend config: run --tune on 2024 first. The test is single-shot and "
+            "must not choose its own parameters."
+        )
+    cfg = json.loads(CONFIG.read_text())
+    cfg_hash = hashlib.sha256(CONFIG.read_bytes()).hexdigest()[:16]
+
+    parts = [load_frame(s, table, means, booster) for s in TEST_SEASONS]
+    d = {k: np.concatenate([p[k] for p in parts]) for k in parts[0]}
+
+    p_blend_raw = blend(d["p_model"], d["p_table"], d["secs"], cfg["gamma"], cfg["alpha"], cfg["beta"], cfg["w_max"])
+    p_blend = apply_rules(p_blend_raw, d["margin"], d["secs"])
+    p_model = d["p_model"]
+
+    inside = d["secs"] <= HANDOFF
+    ok = np.isfinite(d["espn"])
+    res = {
+        "config_sha256_16": cfg_hash, "config": cfg, "seasons": TEST_SEASONS,
+        "criterion_1_log_loss_under_60s": {
+            "model_only": log_loss(d["y"][inside], p_model[inside]),
+            "blended": log_loss(d["y"][inside], p_blend[inside]),
+            "table_only": log_loss(d["y"][inside], d["p_table"][inside]),
+            "espn": log_loss(d["y"][inside & ok], d["espn"][inside & ok]),
+            "n": int(inside.sum()),
+        },
+        "criterion_2_ece_under_60s": {
+            "model_only": ece(d["y"][inside], p_model[inside]),
+            "blended": ece(d["y"][inside], p_blend[inside]),
+        },
+    }
+    c1 = res["criterion_1_log_loss_under_60s"]
+    c1["relative_improvement"] = (c1["model_only"] - c1["blended"]) / c1["model_only"]
+    c1["passes"] = bool(c1["relative_improvement"] >= 0.01)
+    c2 = res["criterion_2_ece_under_60s"]
+    c2["passes"] = bool(c2["blended"] <= c2["model_only"] + 1e-9)
+
+    # criterion 4: the handoff must be invisible
+    near = (d["secs"] >= 55) & (d["secs"] <= 65)
+    res["criterion_4_handoff"] = {
+        "max_abs_delta_at_boundary": float(np.abs(p_blend - p_model)[np.abs(d["secs"] - 60) <= 0.5].max()
+                                           if (np.abs(d["secs"] - 60) <= 0.5).any() else 0.0),
+        "max_abs_delta_55_to_65s": float(np.abs(p_blend - p_model)[near].max() if near.any() else 0.0),
+        "passes": True,
+    }
+    res["criterion_4_handoff"]["passes"] = bool(res["criterion_4_handoff"]["max_abs_delta_at_boundary"] < 0.02)
+
+    for lo, hi, name in [(0, 10, "0-10s"), (10, 30, "10-30s"), (30, 60, "30-60s")]:
+        m = (d["secs"] >= lo) & (d["secs"] < hi)
+        res.setdefault("by_bucket", {})[name] = {
+            "n": int(m.sum()),
+            "model_only": log_loss(d["y"][m], p_model[m]),
+            "blended": log_loss(d["y"][m], p_blend[m]),
+            "table_only": log_loss(d["y"][m], d["p_table"][m]),
+        }
+
+    # criterion 3: monotonicity, exhaustive over the table, plus a check that
+    # blending cannot break it. Both components are monotone in margin and the
+    # blend is a positive combination in log-odds, so it is monotone too -- but
+    # "so it is" is how the possession bug survived, so it is measured.
+    mono = json.loads((tdir / "manifest.json").read_text())["monotonicity_after"]
+    grid_secs = np.repeat(np.arange(0, 61, 1.0), 25)
+    grid_m = np.tile(np.arange(-12, 13, 1.0), 61)
+    pmg = sigmoid(np.linspace(-3, 3, len(grid_m)) * 0 + grid_m * 0.35)
+    ptg = E.lookup_home(table, np.minimum(grid_secs, E.T_MAX), grid_m,
+                        np.ones_like(grid_m), np.full_like(grid_m, 6, dtype=int),
+                        np.full_like(grid_m, 8, dtype=int),
+                        np.ones_like(grid_m, dtype=int), np.ones_like(grid_m, dtype=int))
+    bg = blend(pmg, ptg, grid_secs, cfg["gamma"], cfg["alpha"], cfg["beta"], cfg["w_max"])
+    bg = bg.reshape(61, 25)
+    res["criterion_3_monotonicity"] = {
+        "table_exhaustive": mono,
+        "blend_margin_min_increment": float(np.diff(bg, axis=1).min()),
+        "passes": bool(mono["margin_violations"] == 0
+                       and mono["possession_violations"] == 0
+                       and np.diff(bg, axis=1).min() >= -1e-9),
+    }
+
+    # criterion 5: it has to be fast enough to serve.
+    import time as _t
+    n = 200_000
+    idx = np.random.default_rng(0).integers(0, len(d["secs"]), n)
+    t0 = _t.perf_counter()
+    E.lookup_home(table, np.minimum(d["secs"][idx], E.T_MAX), d["margin"][idx],
+                  np.ones(n), np.full(n, 6), np.full(n, 8), np.ones(n, dtype=int),
+                  np.ones(n, dtype=int))
+    per_state_ms = (_t.perf_counter() - t0) / n * 1000
+    res["criterion_5_speed"] = {"ms_per_state": per_state_ms, "n": n,
+                                "passes": bool(per_state_ms < 1.0)}
+
+    res["verdict"] = {
+        "criteria_passed": {k: res[k]["passes"] for k in res if k.startswith("criterion")},
+        "ships": bool(all(res[k]["passes"] for k in res if k.startswith("criterion"))),
+    }
+    res["verdict"]["note"] = (
+        "The plan's rule: if it clears 2-5 but not 1, it does not ship -- it becomes "
+        "a documented diagnostic."
+    )
+
+    out = ROOT / "reports" / "endgame_blend_test.json"
+    out.write_text(json.dumps(res, indent=2))
+    print(json.dumps(res, indent=2))
+
+
+if __name__ == "__main__":
+    main()
+```
+
 ## `scripts/build_dataset.py`
 
-```python
+```py
 """Replay every game into state rows and write the modelling dataset."""
 import sys, pathlib, time
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "src"))
@@ -76,11 +2453,147 @@ for y in SEASONS:
           f"{time.time()-t0:5.1f}s")
 ```
 
----
+## `scripts/build_endgame_table.py`
+
+```py
+"""Solve the endgame exactly and publish the lookup table.
+
+Endgame plan, Phase 3. Reads the Phase 2 measurements, runs the backward
+induction in src/cbbwp/endgame_sim.py, checks every monotonicity property the
+plan named -- exhaustively, across the whole table, not sampled -- and writes a
+versioned artifact next to the model.
+
+Also writes a small human-readable CSV of canonical states. The plan's third
+argument for a table over a live simulation was that a person can read a row and
+check it against their own judgement; that only holds if someone actually
+prints the rows.
+"""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import sys
+import time
+from pathlib import Path
+
+import numpy as np
+import polars as pl
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "src"))
+
+from cbbwp import endgame_sim as E  # noqa: E402
+from cbbwp.schemas import STATE_RULES_VERSION  # noqa: E402
+
+RAW = ROOT / "data" / "raw" / "pbp"
+TRAIN_SEASONS = [2016, 2017, 2018, 2019, 2021, 2022, 2023, 2024]
+
+
+def ft_bucket_offsets(seasons=TRAIN_SEASONS) -> tuple[list[float], list[float]]:
+    """Terciles of team season free-throw percentage, as offsets from the mean.
+
+    The table needs free-throw ability as a small number of buckets. Rather than
+    pick cut points, take the terciles the sport actually has and carry the mean
+    of each as an offset. Measured on training seasons only.
+    """
+    rows = []
+    for s in seasons:
+        d = (
+            pl.scan_parquet(RAW / f"pbp_{s}.parquet")
+            .select(["team_id", "type_id", "scoring_play"])
+            .filter(pl.col("type_id").cast(pl.Int64) == 540)
+            .group_by("team_id")
+            .agg([pl.len().alias("n"), pl.col("scoring_play").mean().alias("p")])
+            .filter(pl.col("n") >= 200)
+            .collect()
+        )
+        rows.append(d)
+    d = pl.concat(rows)
+    p = d["p"].to_numpy()
+    lo, hi = np.quantile(p, [1 / 3, 2 / 3])
+    means = [float(p[p <= lo].mean()), float(p[(p > lo) & (p <= hi)].mean()), float(p[p > hi].mean())]
+    overall = float(p.mean())
+    return [m - overall for m in means], means
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--version", default="e1")
+    ap.add_argument("--params", default=None)
+    ap.add_argument("--poss", default=None)
+    ap.add_argument("--seasons", nargs="*", type=int, default=None,
+                    help="seasons the parameters came from; recorded in the manifest")
+    ap.add_argument("--out", default=None)
+    a = ap.parse_args()
+
+    seasons = a.seasons or TRAIN_SEASONS
+    offsets, bucket_means = ft_bucket_offsets(seasons)
+    print(f"free-throw buckets (team season FT%): {[round(x,4) for x in bucket_means]}")
+    print(f"offsets from mean:                   {[round(x,4) for x in offsets]}")
+
+    params = E.load_params(
+        Path(a.params) if a.params else ROOT / "artifacts" / "endgame_params.json",
+        Path(a.poss) if a.poss else ROOT / "artifacts" / "endgame_possessions.json",
+        offsets,
+    )
+    t0 = time.time()
+    V = E.solve(params)
+    print(f"solved {V.size:,} states in {time.time()-t0:.1f}s")
+
+    report = E.monotonicity_report(V)
+    print(json.dumps(report, indent=2))
+
+    V2, moved = E.enforce_margin_monotonicity(V)
+    print(f"isotonic projection along margin moved at most {moved:.2e}")
+    report_after = E.monotonicity_report(V2)
+
+    out = Path(a.out) if a.out else ROOT / "registry" / "endgame" / a.version
+    out.mkdir(parents=True, exist_ok=True)
+    table = V2.astype(np.float32)
+    np.savez_compressed(out / "table.npz", table=table)
+
+    sha = hashlib.sha256((out / "table.npz").read_bytes()).hexdigest()[:16]
+    manifest = {
+        "version": a.version,
+        "state_rules_version": STATE_RULES_VERSION,
+        "built": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "sha256_16": sha,
+        "seasons_used": seasons,
+        "shape": list(table.shape),
+        "axes": ["seconds_remaining", "margin", "own_fouls", "opp_fouls",
+                 "own_ft_bucket", "opp_ft_bucket"],
+        "margin_range": [E.MARGIN_MIN, E.MARGIN_MAX],
+        "foul_max": E.FOUL_MAX,
+        "ft_bucket_means": bucket_means,
+        "monotonicity_before": report,
+        "monotonicity_after": report_after,
+        "isotonic_max_correction": moved,
+        "note": "V[t, m, fo, fd, bo, bd] = P(the team WITH THE BALL wins).",
+    }
+    (out / "manifest.json").write_text(json.dumps(manifest, indent=2))
+
+    # A readable slice: no bonus differential, average free-throw teams.
+    mid = E.N_FT_BUCKETS // 2
+    rows = []
+    for t in (0, 5, 10, 15, 20, 30, 45, 60):
+        for m in range(-6, 7):
+            for fd, label in ((6, "none"), (8, "1-and-1"), (10, "double")):
+                rows.append({
+                    "seconds_left": t, "margin": m, "opp_bonus": label,
+                    "p_win_with_ball": round(float(table[t, E._mi(m), 6, fd, mid, mid]), 4),
+                })
+    pl.DataFrame(rows).write_csv(out / "readable.csv")
+    print(f"wrote {out}/table.npz  sha {sha}  ({(out/'table.npz').stat().st_size/1e6:.1f} MB)")
+
+
+if __name__ == "__main__":
+    main()
+```
 
 ## `scripts/build_games.py`
 
-```python
+```py
 """Build the game-level table (results + as-of pregame ratings)."""
 import sys, pathlib
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "src"))
@@ -121,11 +2634,9 @@ games.write_parquet(ROOT / "data/proc/games.parquet")
 print("wrote games.parquet", games.height)
 ```
 
----
-
 ## `scripts/build_live_context.py`
 
-```python
+```py
 """Snapshot today's team ratings and season-to-date stats for the live poller.
 
 Uses the SAME ridge fit as the offline pipeline (cbbwp.ratings._fit_ridge) and
@@ -203,11 +2714,9 @@ dest.write_text(json.dumps(out))
 print(f"wrote {dest}  ({len(ratings)} ratings, {len(ft_pct)} ft, {len(ppm)} ppm)")
 ```
 
----
-
 ## `scripts/build_team_stats.py`
 
-```python
+```py
 """Season-to-date team stats, as of the day BEFORE each game (no leakage).
 
 Produces per game: ft_pct_diff (home minus away) and exp_points_per_min
@@ -268,17 +2777,23 @@ out = (
         "game_id",
         ft_pct_diff=(pl.col("h_ft") - pl.col("a_ft")).fill_null(0.0),
         exp_points_per_min=((pl.col("h_ppm") + pl.col("a_ppm")) / 2).fill_null(LEAGUE_PPM),
+        # The two levels, not just their difference. The endgame table buckets
+        # each team's free-throw ability separately, and reconstructing the
+        # levels from the difference is not possible. Keeping only the diff here
+        # was what would have forced the endgame validation to assume both teams
+        # were average -- an assumption the live path would NOT have made, which
+        # is exactly the train/serve mismatch this project keeps tripping over.
+        home_ft_pct=pl.col("h_ft").fill_null(LEAGUE_FT),
+        away_ft_pct=pl.col("a_ft").fill_null(LEAGUE_FT),
     )
 )
 out.write_parquet(ROOT / "data/proc/team_stats.parquet")
 print(out.describe())
 ```
 
----
-
 ## `scripts/calibrate_and_eval.py`
 
-```python
+```py
 import sys, pathlib, pickle
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "src"))
 import numpy as np
@@ -331,11 +2846,9 @@ np.savez_compressed(ROOT / "artifacts/final_preds.npz", y=y, p=final, secs=secs,
                     espn=espn, margin=margin, game_id=te["game_id"], season=te["season"])
 ```
 
----
-
 ## `scripts/calibration_monitor.py`
 
-```python
+```py
 """Weekly calibration drift check. Exit code 1 means "look at this".
 
 Two sources, same check:
@@ -464,11 +2977,9 @@ if __name__ == "__main__":
     raise SystemExit(main())
 ```
 
----
-
 ## `scripts/check_espn_fixtures.py`
 
-```python
+```py
 """Validate recorded ESPN payloads against the adapter's expectations.
 
 This is the check that the offline test suite CANNOT do: it looks at what ESPN
@@ -541,11 +3052,605 @@ else:
 raise SystemExit(1 if problems else 0)
 ```
 
----
+## `scripts/estimate_endgame_params.py`
+
+```py
+"""Estimate every parameter the endgame simulator needs, from play-by-play.
+
+Endgame plan, Phase 2: "No hand-set constants." Every number the simulator uses
+is measured here, on TRAINING seasons only (2016-2024). 2025 and 2026 are the
+held-out test seasons and this script refuses to read them -- the pre-registered
+bar in docs/cbbwp-endgame-plan.md is a single-shot test and stays that way.
+
+Three things this file deliberately does NOT do:
+
+1. It does not key on ESPN's "free throw N of M" text. That text appears only in
+   the 2026 feed, so using it would be both unavailable for training seasons and
+   a test-set leak. Trips are classified by the OPPONENT'S TEAM FOUL COUNT
+   instead -- the rule the sport actually uses, which reproduces the 2026 text
+   labels 94.9% of the time.
+
+2. It does not read `scoring_play` on a play labelled "1 of 1" and call the
+   result a free-throw percentage. ESPN labels a trip by the attempts actually
+   TAKEN, so a MADE one-and-one front end is logged as a two-shot trip and never
+   appears as "1 of 1" at all. Conditioning on that label conditions on the
+   outcome, which is why the raw figure is 0.537 and the true one is 0.70.
+   Trips are rebuilt first; only then is the first shot of each trip read.
+
+3. It does not hold every season in memory at once. hoopR play-by-play is large
+   and the device VM is small, so each season is reduced to COUNTS
+   (n, successes) and the counts are summed. Means are formed at the end, from
+   the totals. This also makes each season's contribution auditable.
+
+Run:
+    python3 scripts/estimate_endgame_params.py --season 2016   # ... one at a time
+    python3 scripts/estimate_endgame_params.py --combine
+"""
+from __future__ import annotations
+
+import argparse
+import json
+from pathlib import Path
+
+import polars as pl
+
+ROOT = Path(__file__).resolve().parents[1]
+RAW = ROOT / "data" / "raw" / "pbp"
+PART = ROOT / "artifacts" / "endgame_parts"
+OUT = ROOT / "artifacts" / "endgame_params.json"
+
+TRAIN_SEASONS = [2016, 2017, 2018, 2019, 2021, 2022, 2023, 2024]
+TEST_SEASONS = {2025, 2026}
+
+FT, FOUL, TECH = 540, 519, 521
+OREB, DREB = 586, 587
+SHOT_TYPES = [558, 572, 574, 437]
+TURNOVER_TYPES = [598, 601, 602]
+BONUS_FOULS, DOUBLE_BONUS_FOULS = 7, 10
+
+ENDGAME_SECONDS = 60
+WIDE_SECONDS = 180
+
+COLS = [
+    "game_id", "sequence_number", "type_id", "text", "scoring_play", "score_value",
+    "team_id", "home_team_id", "away_team_id", "athlete_id_1",
+    "period_number", "clock_minutes", "clock_seconds",
+]
+
+
+# --------------------------------------------------------------------------
+# loading
+# --------------------------------------------------------------------------
+def load(season: int) -> pl.DataFrame:
+    """One season, ordered, with a season-independent game clock.
+
+    hoopR's seconds-remaining column is named `start_half_seconds_remaining` in
+    2016-2022 and `start_period_seconds_remaining` in 2023+. The raw clock
+    fields are present in every season, so the clock is rebuilt from those
+    rather than picking one of the two names and silently failing on the other.
+    """
+    df = (
+        pl.scan_parquet(RAW / f"pbp_{season}.parquet")
+        .select(COLS)
+        .collect()
+        .with_columns(pl.col("sequence_number").cast(pl.Int64))
+        .sort(["game_id", "sequence_number"])
+        .with_row_index("i")
+    )
+    return df.with_columns(
+        [
+            pl.col("type_id").cast(pl.Int64).alias("tid"),
+            pl.when(pl.col("period_number") <= 1).then(1).otherwise(2).alias("half"),
+            (
+                pl.col("clock_minutes").cast(pl.Float64).fill_null(0) * 60
+                + pl.col("clock_seconds").cast(pl.Float64).fill_null(0)
+            ).alias("sec"),
+        ]
+    )
+
+
+def annotate(df: pl.DataFrame) -> pl.DataFrame:
+    """Team fouls, the and-one flag, free-throw trip ids, and elapsed time."""
+    df = df.with_columns(
+        [
+            (pl.col("tid").is_in([FOUL, TECH]) & (pl.col("team_id") == pl.col("home_team_id"))).alias("hf"),
+            (pl.col("tid").is_in([FOUL, TECH]) & (pl.col("team_id") == pl.col("away_team_id"))).alias("af"),
+            (pl.col("tid") == FT).alias("isft"),
+            (pl.col("scoring_play") & (pl.col("tid") != FT)).alias("madefg"),
+            pl.col("text").str.contains("(?i)three point").fill_null(False).alias("is3"),
+        ]
+    )
+    # Team fouls reset once, at the half. Counted BEFORE the current row, so the
+    # count describes the situation the current event was played under -- which
+    # is what decides whether a foul sends the shooter to a one-and-one.
+    df = df.with_columns(
+        [
+            (pl.col("hf").cum_sum().over(["game_id", "half"]) - pl.col("hf").cast(pl.Int32)).alias("home_fouls"),
+            (pl.col("af").cum_sum().over(["game_id", "half"]) - pl.col("af").cast(pl.Int32)).alias("away_fouls"),
+        ]
+    )
+    df = df.with_columns(
+        pl.when(pl.col("team_id") == pl.col("home_team_id"))
+        .then(pl.col("away_fouls"))
+        .otherwise(pl.col("home_fouls"))
+        .alias("opp_fouls")
+    )
+
+    # And-one: the shooter made a field goal at effectively the same game clock.
+    # Substitutions and TV timeouts pad the gap, so the window is events, not
+    # rows adjacent -- 12 is comfortably past the longest observed run of subs.
+    andone = None
+    for k in range(1, 13):
+        t = (
+            pl.col("madefg").shift(k).over("game_id")
+            & (pl.col("athlete_id_1").shift(k).over("game_id") == pl.col("athlete_id_1"))
+            & ((pl.col("sec").shift(k).over("game_id") - pl.col("sec")).abs() <= 3)
+        )
+        andone = t if andone is None else (andone | t)
+    df = df.with_columns(andone.fill_null(False).alias("andone"))
+
+    # A trip is a run of free throws by one team at one dead ball.
+    ft = pl.col("isft")
+    prev_i = pl.when(ft).then(pl.col("i")).otherwise(None).forward_fill().over("game_id").shift(1)
+    prev_team = pl.when(ft).then(pl.col("team_id")).otherwise(None).forward_fill().over("game_id").shift(1)
+    prev_sec = pl.when(ft).then(pl.col("sec")).otherwise(None).forward_fill().over("game_id").shift(1)
+    new_trip = ft & (
+        prev_i.is_null()
+        | (pl.col("team_id") != prev_team)
+        | ((prev_sec - pl.col("sec")).abs() > 4)
+        | ((pl.col("i") - prev_i) > 8)
+    )
+    df = df.with_columns(
+        pl.when(ft).then(new_trip.fill_null(True).cast(pl.Int32).cum_sum().over("game_id")).alias("trip")
+    )
+
+    # Seconds until the clock next moves. The next ROW is usually a substitution
+    # at the same dead ball, so a plain shift(-1) measures nothing and returns a
+    # median of 0. Take the first following event whose clock is strictly lower.
+    nxt = None
+    for k in range(1, 13):
+        s = pl.col("sec").shift(-k).over("game_id")
+        cand = pl.when(s < pl.col("sec")).then(s).otherwise(None)
+        nxt = cand if nxt is None else pl.coalesce([nxt, cand])
+    df = df.with_columns((pl.col("sec") - nxt).alias("dt_clock"))
+
+    # Seconds until the next foul, however many dead-ball rows intervene.
+    nf = None
+    for k in range(1, 25):
+        s = pl.col("sec").shift(-k).over("game_id")
+        isf = pl.col("tid").shift(-k).over("game_id").is_in([FOUL, TECH])
+        cand = pl.when(isf & (s <= pl.col("sec"))).then(s).otherwise(None)
+        nf = cand if nf is None else pl.coalesce([nf, cand])
+    return df.with_columns((pl.col("sec") - nf).alias("dt_foul"))
+
+
+# --------------------------------------------------------------------------
+# counting
+# --------------------------------------------------------------------------
+def _nk(frame: pl.DataFrame, col: str = "scoring_play") -> dict:
+    return {"n": int(len(frame)), "k": int(frame[col].sum()) if len(frame) else 0}
+
+
+def trip_kind() -> pl.Expr:
+    return (
+        pl.when(pl.col("andone")).then(pl.lit("and_one"))
+        .when(pl.col("n_shots") >= 3).then(pl.lit("shooting_3"))
+        .when((pl.col("opp_fouls") >= BONUS_FOULS) & (pl.col("opp_fouls") < DOUBLE_BONUS_FOULS))
+        .then(pl.lit("one_and_one"))
+        .otherwise(pl.lit("two_shot"))
+    )
+
+
+def count_season(df: pl.DataFrame) -> dict:
+    out: dict = {}
+
+    # ---- free throws, by trip kind and shot index -------------------------
+    ft = df.filter(pl.col("isft")).with_columns(
+        pl.col("i").rank("ordinal").over(["game_id", "trip"]).alias("shot_no")
+    )
+    sizes = ft.group_by(["game_id", "trip"]).agg(pl.len().alias("n_shots"))
+    ft = ft.join(sizes, on=["game_id", "trip"], how="left").with_columns(trip_kind().alias("kind"))
+
+    windows = {
+        "all_game": pl.lit(True),
+        "last_180s": (pl.col("period_number") >= 2) & (pl.col("sec") <= WIDE_SECONDS),
+        "last_60s": (pl.col("period_number") >= 2) & (pl.col("sec") <= ENDGAME_SECONDS),
+    }
+    out["free_throws"] = {}
+    for wname, w in windows.items():
+        g = (
+            ft.filter(w)
+            .group_by(["kind", "shot_no"])
+            .agg([pl.len().alias("n"), pl.col("scoring_play").sum().alias("k")])
+        )
+        out["free_throws"][wname] = {
+            f"{r['kind']}_{r['shot_no']}": {"n": int(r["n"]), "k": int(r["k"])}
+            for r in g.iter_rows(named=True)
+        }
+
+    # ---- how often each kind of trip happens late -------------------------
+    trips = (
+        ft.group_by(["game_id", "trip"])
+        .agg([pl.first("kind").alias("kind"), pl.first("sec").alias("sec"),
+              pl.first("period_number").alias("period")])
+        .filter((pl.col("period") >= 2) & (pl.col("sec") <= ENDGAME_SECONDS))
+    )
+    out["late_trip_mix"] = {
+        r["kind"]: int(r["n"])
+        for r in trips.group_by("kind").agg(pl.len().alias("n")).iter_rows(named=True)
+    }
+
+    # ---- rebounding -------------------------------------------------------
+    reb = None
+    for k in range(1, 4):
+        t = pl.col("tid").shift(-k).over("game_id")
+        cand = pl.when(t.is_in([OREB, DREB])).then(t).otherwise(None)
+        reb = cand if reb is None else pl.coalesce([reb, cand])
+    d = df.with_columns(reb.alias("reb")).with_columns((pl.col("reb") == OREB).alias("is_oreb"))
+
+    last_ft = (
+        d.filter(pl.col("isft"))
+        .with_columns(pl.col("i").rank("ordinal").over(["game_id", "trip"]).alias("shot_no"))
+        .join(
+            d.filter(pl.col("isft"))
+            .group_by(["game_id", "trip"])
+            .agg(pl.len().alias("n_shots")),
+            on=["game_id", "trip"], how="left",
+        )
+        .filter(pl.col("shot_no") == pl.col("n_shots"))
+        .filter(~pl.col("scoring_play") & pl.col("reb").is_not_null())
+    )
+    miss_fg = d.filter(pl.col("tid").is_in(SHOT_TYPES) & ~pl.col("scoring_play") & pl.col("reb").is_not_null())
+    late = (pl.col("period_number") >= 2) & (pl.col("sec") <= ENDGAME_SECONDS)
+    out["rebounds"] = {
+        "oreb_after_missed_ft": _nk(last_ft, "is_oreb"),
+        "oreb_after_missed_ft_last60": _nk(last_ft.filter(late), "is_oreb"),
+        "oreb_after_missed_3": _nk(miss_fg.filter(pl.col("is3")), "is_oreb"),
+        "oreb_after_missed_2": _nk(miss_fg.filter(~pl.col("is3")), "is_oreb"),
+        "oreb_after_missed_3_last60": _nk(miss_fg.filter(pl.col("is3") & late), "is_oreb"),
+        "oreb_after_missed_2_last60": _nk(miss_fg.filter(~pl.col("is3") & late), "is_oreb"),
+    }
+
+    # ---- shot mix and accuracy late, by the shooter's own margin ----------
+    d = d.with_columns(
+        [
+            pl.when(pl.col("scoring_play") & (pl.col("team_id") == pl.col("home_team_id")))
+            .then(pl.col("score_value")).otherwise(0).alias("hs"),
+            pl.when(pl.col("scoring_play") & (pl.col("team_id") == pl.col("away_team_id")))
+            .then(pl.col("score_value")).otherwise(0).alias("as_"),
+        ]
+    )
+    d = d.with_columns(
+        [
+            (pl.col("hs").cum_sum().over("game_id") - pl.col("hs")).alias("h"),
+            (pl.col("as_").cum_sum().over("game_id") - pl.col("as_")).alias("a"),
+        ]
+    ).with_columns(
+        pl.when(pl.col("team_id") == pl.col("home_team_id"))
+        .then(pl.col("h") - pl.col("a"))
+        .otherwise(pl.col("a") - pl.col("h"))
+        .alias("actor_margin")
+    )
+    shots = d.filter(pl.col("tid").is_in(SHOT_TYPES) & late).with_columns(
+        pl.col("actor_margin").clip(-6, 6).alias("m")
+    )
+    g = shots.group_by("m").agg(
+        [
+            pl.len().alias("n"),
+            pl.col("is3").sum().alias("n3"),
+            (pl.col("scoring_play") & pl.col("is3")).sum().alias("k3"),
+            (pl.col("scoring_play") & ~pl.col("is3")).sum().alias("k2"),
+        ]
+    )
+    out["late_shots"] = {
+        str(r["m"]): {"n": int(r["n"]), "n3": int(r["n3"]), "k3": int(r["k3"]), "k2": int(r["k2"])}
+        for r in g.iter_rows(named=True)
+    }
+
+    # ---- clock ------------------------------------------------------------
+    ends = d.filter(late & pl.col("tid").is_in(SHOT_TYPES + TURNOVER_TYPES))
+    out["late_possession_ends"] = {
+        "n": int(len(ends)),
+        "k_turnover": int(ends["tid"].is_in(TURNOVER_TYPES).sum()) if len(ends) else 0,
+    }
+    made_ft = d.filter(pl.col("isft") & pl.col("scoring_play") & late)
+    dtf = made_ft.filter(pl.col("dt_foul").is_between(0, 20))["dt_foul"]
+    dtc = made_ft.filter(pl.col("dt_clock").is_between(0, 30))["dt_clock"]
+    out["clock"] = {
+        "sec_made_ft_to_next_foul": {
+            "n": int(len(dtf)),
+            "sum": float(dtf.sum()) if len(dtf) else 0.0,
+            "hist": {str(int(b)): int(c) for b, c in
+                     zip(*[x.to_list() for x in dtf.cast(pl.Int32).value_counts().sort("dt_foul")])}
+            if len(dtf) else {},
+        },
+        "sec_made_ft_to_clock_move": {
+            "n": int(len(dtc)),
+            "sum": float(dtc.sum()) if len(dtc) else 0.0,
+        },
+    }
+    return out
+
+
+# --------------------------------------------------------------------------
+# combining
+# --------------------------------------------------------------------------
+def _merge(a, b):
+    if isinstance(a, dict) and isinstance(b, dict):
+        return {k: _merge(a.get(k), b.get(k)) for k in set(a) | set(b)}
+    if a is None:
+        return b
+    if b is None:
+        return a
+    return a + b
+
+
+def combine(parts: list[dict]) -> dict:
+    tot: dict = {}
+    for p in parts:
+        body = {k: v for k, v in p.items() if k != "season"}
+        tot = body if not tot else _merge(tot, body)
+
+    def rate(d):
+        return {k: {"p": (v["k"] / v["n"]) if v["n"] else None, "n": v["n"]} for k, v in d.items()}
+
+    mix_total = sum(tot["late_trip_mix"].values()) or 1
+    late_shots = {
+        m: {
+            "n": v["n"],
+            "p3a": v["n3"] / v["n"] if v["n"] else None,
+            "p3": v["k3"] / v["n3"] if v["n3"] else None,
+            "p2": v["k2"] / (v["n"] - v["n3"]) if (v["n"] - v["n3"]) else None,
+        }
+        for m, v in sorted(tot["late_shots"].items(), key=lambda kv: int(kv[0]))
+    }
+    ends = tot["late_possession_ends"]
+    clk = tot["clock"]
+    return {
+        "seasons": sorted(p["season"] for p in parts),
+        "free_throws": {w: rate(d) for w, d in tot["free_throws"].items()},
+        "late_trip_mix": {k: v / mix_total for k, v in tot["late_trip_mix"].items()},
+        "late_trip_n": mix_total,
+        "rebounds": rate(tot["rebounds"]),
+        "late_shots_by_actor_margin": late_shots,
+        "late_turnover_share": ends["k_turnover"] / ends["n"] if ends["n"] else None,
+        "late_possession_ends_n": ends["n"],
+        "clock": {
+            "mean_sec_made_ft_to_next_foul": clk["sec_made_ft_to_next_foul"]["sum"]
+            / (clk["sec_made_ft_to_next_foul"]["n"] or 1),
+            "n_ft_to_foul": clk["sec_made_ft_to_next_foul"]["n"],
+            "hist_sec_ft_to_foul": dict(sorted(clk["sec_made_ft_to_next_foul"]["hist"].items(),
+                                               key=lambda kv: int(kv[0]))),
+            "mean_sec_made_ft_to_clock_move": clk["sec_made_ft_to_clock_move"]["sum"]
+            / (clk["sec_made_ft_to_clock_move"]["n"] or 1),
+        },
+    }
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--season", type=int)
+    ap.add_argument("--combine", action="store_true")
+    ap.add_argument("--out", default=None)
+    ap.add_argument("--only", nargs="*", type=int, default=None,
+                    help="combine just these seasons -- used to hold a season out for Phase 4")
+    a = ap.parse_args()
+    PART.mkdir(parents=True, exist_ok=True)
+
+    if a.season is not None:
+        if a.season in TEST_SEASONS:
+            raise SystemExit(f"refusing season {a.season}: 2025-2026 are held out for the single-shot test")
+        res = count_season(annotate(load(a.season)))
+        res["season"] = a.season
+        (PART / f"{a.season}.json").write_text(json.dumps(res))
+        print(f"wrote {PART / f'{a.season}.json'}")
+        return
+
+    if a.combine:
+        parts = [json.loads(p.read_text()) for p in sorted(PART.glob("*.json"))]
+        want = set(a.only) if a.only else set(TRAIN_SEASONS)
+        parts = [p for p in parts if p["season"] in want]
+        missing = want - {p["season"] for p in parts}
+        if missing:
+            raise SystemExit(f"missing seasons: {sorted(missing)}")
+        dest = Path(a.out) if a.out else OUT
+        dest.write_text(json.dumps(combine(parts), indent=2))
+        print(f"wrote {dest} from {len(parts)} seasons: {sorted(want)}")
+        return
+
+    ap.error("pass --season N or --combine")
+
+
+if __name__ == "__main__":
+    main()
+```
+
+## `scripts/estimate_endgame_possessions.py`
+
+```py
+"""Possession-level endgame behaviour: what ends a possession, and how long it takes.
+
+The free-throw and shooting parameters (estimate_endgame_params.py) say what
+happens when a possession resolves. This says HOW a possession resolves -- above
+all, whether the defence intentionally fouls, which is the single decision that
+makes an endgame an endgame.
+
+The simulator has to reproduce what teams ACTUALLY do, not what they should do,
+because it is predicting real games. So the fouling rule is measured, not
+optimised.
+
+Possession runs are taken from data/proc/states (the validated possession rules,
+including the 2026-09-01 made-three fix) joined back to the raw feed for the
+event type that ended each run. Training seasons only.
+
+Output: artifacts/endgame_possessions.json
+"""
+from __future__ import annotations
+
+import argparse
+import json
+from pathlib import Path
+
+import polars as pl
+
+ROOT = Path(__file__).resolve().parents[1]
+STATES = ROOT / "data" / "proc" / "states"
+RAW = ROOT / "data" / "raw" / "pbp"
+PART = ROOT / "artifacts" / "endgame_poss_parts"
+OUT = ROOT / "artifacts" / "endgame_possessions.json"
+
+TRAIN_SEASONS = [2016, 2017, 2018, 2019, 2021, 2022, 2023, 2024]
+TEST_SEASONS = {2025, 2026}
+
+FT, FOUL, TECH = 540, 519, 521
+SHOT_TYPES = [558, 572, 574, 437]
+TURNOVER_TYPES = [598, 601, 602]
+WINDOW = 90  # seconds; the simulator owns 60, the extra 30 is for the blend
+
+
+def runs_for_season(season: int) -> pl.DataFrame:
+    st = (
+        pl.scan_parquet(STATES / f"states_{season}.parquet")
+        .select(["game_id", "seq", "possession", "margin", "game_seconds_remaining", "period"])
+        .filter((pl.col("period") >= 2) & (pl.col("game_seconds_remaining") <= WINDOW))
+        .collect()
+    )
+    pbp = (
+        pl.scan_parquet(RAW / f"pbp_{season}.parquet")
+        .select(["game_id", "game_play_number", "type_id", "scoring_play", "text"])
+        .collect()
+        .rename({"game_play_number": "seq", "type_id": "tid"})
+        .with_columns(pl.col("tid").cast(pl.Int64))
+    )
+    d = st.join(pbp, on=["game_id", "seq"], how="inner").sort(["game_id", "seq"])
+
+    # A run is a maximal stretch with the same possession value. 0.5 (jump ball,
+    # genuinely unknown) is carried forward rather than treated as its own run.
+    d = d.with_columns(pl.col("possession").replace(0.5, None).forward_fill().over("game_id"))
+    d = d.with_columns(
+        (pl.col("possession") != pl.col("possession").shift(1).over("game_id"))
+        .fill_null(True).cast(pl.Int32).cum_sum().over("game_id").alias("run")
+    )
+    g = d.group_by(["game_id", "run"]).agg(
+        [
+            pl.first("possession").alias("off_is_home"),
+            pl.first("margin").alias("margin_start"),
+            pl.first("game_seconds_remaining").alias("t_start"),
+            pl.last("game_seconds_remaining").alias("t_end"),
+            pl.last("tid").alias("end_tid"),
+            pl.col("tid").is_in([FOUL, TECH]).any().alias("saw_foul"),
+            pl.col("tid").eq(FT).any().alias("saw_ft"),
+            pl.col("tid").is_in(TURNOVER_TYPES).any().alias("saw_to"),
+            (pl.col("scoring_play") & pl.col("tid").is_in(SHOT_TYPES)).any().alias("saw_made_fg"),
+            pl.len().alias("n_events"),
+        ]
+    )
+    # Margin and fouling are described from the OFFENSE's point of view: the
+    # simulator asks "the team with the ball leads by k -- do they get fouled?"
+    return g.with_columns(
+        [
+            pl.when(pl.col("off_is_home") == 1.0)
+            .then(pl.col("margin_start"))
+            .otherwise(-pl.col("margin_start"))
+            .alias("off_margin"),
+            (pl.col("t_start") - pl.col("t_end")).alias("dur"),
+        ]
+    ).filter(pl.col("dur").is_between(0, 45))
+
+
+def count_season(season: int) -> dict:
+    r = runs_for_season(season)
+    r = r.with_columns(
+        [
+            pl.col("off_margin").clip(-8, 8).cast(pl.Int32).alias("m"),
+            (pl.col("t_start") // 10 * 10).clip(0, 80).alias("tb"),
+            # An intentional foul: the possession reached the line without the
+            # offence taking a shot. That is what "they fouled to stop the clock"
+            # looks like in a feed that does not label intent.
+            (pl.col("saw_ft") & ~pl.col("saw_made_fg")).alias("fouled_to_line"),
+        ]
+    )
+    g = r.group_by(["m", "tb"]).agg(
+        [
+            pl.len().alias("n"),
+            pl.col("fouled_to_line").sum().alias("k_foul"),
+            pl.col("saw_to").sum().alias("k_to"),
+            pl.col("saw_made_fg").sum().alias("k_made_fg"),
+            pl.col("dur").sum().alias("dur_sum"),
+            pl.col("dur").filter(pl.col("fouled_to_line")).sum().alias("dur_foul_sum"),
+            pl.col("fouled_to_line").sum().alias("dur_foul_n"),
+        ]
+    )
+    return {
+        "season": season,
+        "cells": {
+            f"{r_['m']}|{r_['tb']}": {k: int(r_[k]) for k in
+                                      ("n", "k_foul", "k_to", "k_made_fg", "dur_sum",
+                                       "dur_foul_sum", "dur_foul_n")}
+            for r_ in g.iter_rows(named=True)
+        },
+    }
+
+
+def combine(parts: list[dict]) -> dict:
+    tot: dict = {}
+    for p in parts:
+        for key, v in p["cells"].items():
+            acc = tot.setdefault(key, {k: 0 for k in v})
+            for k, x in v.items():
+                acc[k] += x
+    cells = {}
+    for key, v in sorted(tot.items(), key=lambda kv: (float(kv[0].split("|")[0]), float(kv[0].split("|")[1]))):
+        if v["n"] < 30:
+            continue
+        cells[key] = {
+            "n": v["n"],
+            "p_fouled_to_line": v["k_foul"] / v["n"],
+            "p_turnover": v["k_to"] / v["n"],
+            "p_made_fg": v["k_made_fg"] / v["n"],
+            "mean_dur": v["dur_sum"] / v["n"],
+            "mean_dur_when_fouled": (v["dur_foul_sum"] / v["dur_foul_n"]) if v["dur_foul_n"] else None,
+        }
+    return {"seasons": sorted(p["season"] for p in parts), "cells": cells,
+            "key": "off_margin|seconds_remaining_bucket (offence's point of view)"}
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--season", type=int)
+    ap.add_argument("--combine", action="store_true")
+    ap.add_argument("--out", default=None)
+    ap.add_argument("--only", nargs="*", type=int, default=None,
+                    help="combine just these seasons -- used to hold a season out for Phase 4")
+    a = ap.parse_args()
+    PART.mkdir(parents=True, exist_ok=True)
+    if a.season is not None:
+        if a.season in TEST_SEASONS:
+            raise SystemExit(f"refusing season {a.season}: held out for the single-shot test")
+        (PART / f"{a.season}.json").write_text(json.dumps(count_season(a.season)))
+        print("wrote", a.season)
+        return
+    if a.combine:
+        parts = [json.loads(p.read_text()) for p in sorted(PART.glob("*.json"))]
+        want = set(a.only) if a.only else set(TRAIN_SEASONS)
+        parts = [p for p in parts if p["season"] in want]
+        missing = want - {p["season"] for p in parts}
+        if missing:
+            raise SystemExit(f"missing seasons: {sorted(missing)}")
+        dest = Path(a.out) if a.out else OUT
+        dest.write_text(json.dumps(combine(parts), indent=2))
+        print("wrote", dest)
+        return
+    ap.error("pass --season N or --combine")
+
+
+if __name__ == "__main__":
+    main()
+```
 
 ## `scripts/evaluate.py`
 
-```python
+```py
 import sys, pathlib, json
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "src"))
 import numpy as np
@@ -577,11 +3682,9 @@ for r in calibration_table(y, d["p_gbm"]):
     print(f"{r['bin']:<12}{r['n']:>10,}{r['pred']:>8.3f}{r['obs']:>8.3f}{r['obs']-r['pred']:>+8.3f}")
 ```
 
----
-
 ## `scripts/fetch_data.py`
 
-```python
+```py
 """Download the hoopR play-by-play and schedule parquet files.
 
 The only reachable source: raw.githubusercontent.com. Re-run is idempotent;
@@ -619,11 +3722,9 @@ if __name__ == "__main__":
         get(SCHED.format(y=y), ROOT / f"data/raw/sched/sched_{y}.parquet", a.force)
 ```
 
----
-
 ## `scripts/fit_models.py`
 
-```python
+```py
 """Fit the logistic baseline and the LightGBM model. Split by season, never randomly."""
 import sys, pathlib, json, pickle, time
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "src"))
@@ -722,11 +3823,9 @@ np.savez_compressed(art / "calib_preds.npz", y=yca,
 print("\nsaved artifacts")
 ```
 
----
-
 ## `scripts/live_poller.py`
 
-```python
+```py
 """Live win-probability poller.
 
 One asyncio task per in-progress game. Each task fetches that game's ESPN
@@ -1002,11 +4101,9 @@ if __name__ == "__main__":
     raise SystemExit(main())
 ```
 
----
-
 ## `scripts/publish_model.py`
 
-```python
+```py
 """Write an immutable, pinned model artifact into the registry."""
 import sys, pathlib, json, shutil, hashlib, datetime
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "src"))
@@ -1028,11 +4125,9 @@ digest = hashlib.sha256((dest / "model.txt").read_bytes()).hexdigest()[:16]
 print("published", dest, digest)
 ```
 
----
-
 ## `scripts/record_espn_fixtures.py`
 
-```python
+```py
 """Record real ESPN payloads to disk, so the adapter can be tested against them.
 
 Run this on a machine that can reach ESPN (the sandbox this package was built
@@ -1084,1594 +4179,129 @@ for gid in ids:
 print(f"\n{len(ids)} fixture(s) in {out}")
 ```
 
----
+## `scripts/validate_endgame_table.py`
 
-## `src/cbbwp/__init__.py`
+```py
+"""Phase 4: is the table HONEST about the states it describes?
 
-```python
-"""cbbwp - college basketball win probability.
+The endgame plan's gate for this phase is deliberately weak -- "beats nothing;
+just has to be honest". Phase 4 asks only whether a state the table calls a 20%
+state is won about 20% of the time. Whether that is worth shipping is Phase 5's
+question, and it is asked once, on 2025-2026.
 
-The state builder and feature builder in this package are imported by BOTH the
-offline training pipeline and the live serving path. That is deliberate: it is
-the single defence against train/serve skew.
-"""
-__version__ = "0.2.0"
-
-from .schemas import Event, GameState, PregameContext, FEATURE_NAMES  # noqa: F401
-from .state import build_states  # noqa: F401
-from .features import build_feature_matrix, feature_dict  # noqa: F401
-```
-
----
-
-## `src/cbbwp/calibration.py`
-
-```python
-"""Time-bucketed probability calibration.
-
-Miscalibration in these models is almost entirely time-dependent, so a single
-global calibrator averages two opposite errors and fixes neither (plan 9.3).
-We fit one isotonic curve per time bucket on a HELD-OUT season, then blend
-between adjacent buckets so the curve never visibly jumps.
+So this runs on 2024, against a table whose parameters were estimated from
+2016-2023 only. 2024 is genuinely out of sample for the table, and it is not one
+of the held-out test seasons, so using it here costs nothing later.
 """
 from __future__ import annotations
 
-import numpy as np
-from sklearn.isotonic import IsotonicRegression
-
-# (lower, upper) seconds remaining, and the anchor point used for blending.
-BUCKETS = [(1200, 2400), (600, 1200), (300, 600), (120, 300), (60, 120), (0, 60)]
-ANCHORS = np.array([np.sqrt((lo + hi) / 2) for lo, hi in BUCKETS])
-CLIP = (0.001, 0.999)
-
-
-class TimeBucketedCalibrator:
-    def __init__(self, buckets=BUCKETS, min_rows=20_000):
-        self.buckets = list(buckets)
-        self.min_rows = min_rows
-        self.models: list[IsotonicRegression | None] = []
-
-    def fit(self, p, y, seconds):
-        self.models = []
-        for lo, hi in self.buckets:
-            m = (seconds >= lo) & (seconds < hi)
-            if m.sum() < self.min_rows:
-                self.models.append(None)
-                continue
-            iso = IsotonicRegression(out_of_bounds="clip", y_min=0.0, y_max=1.0)
-            iso.fit(p[m], y[m])
-            self.models.append(iso)
-        return self
-
-    def _apply(self, i, p):
-        m = self.models[i]
-        return p if m is None else m.predict(p)
-
-    def transform(self, p, seconds):
-        """Blend the two nearest bucket calibrators, weighted in sqrt-time."""
-        p = np.asarray(p, dtype=np.float64)
-        s = np.sqrt(np.maximum(np.asarray(seconds, dtype=np.float64), 0.0))
-        # anchors run from long time remaining down to zero
-        order = np.argsort(ANCHORS)
-        a = ANCHORS[order]
-        cols = np.stack([self._apply(order[i], p) for i in range(len(a))], axis=1)
-        idx = np.clip(np.searchsorted(a, s), 1, len(a) - 1)
-        lo, hi = a[idx - 1], a[idx]
-        w = np.clip((s - lo) / np.maximum(hi - lo, 1e-9), 0.0, 1.0)
-        out = cols[np.arange(len(p)), idx - 1] * (1 - w) + cols[np.arange(len(p)), idx] * w
-        return np.clip(out, *CLIP)
-```
-
----
-
-## `src/cbbwp/endgame.py`
-
-```python
-"""Rule-based overrides the training data cannot teach efficiently (plan 10).
-
-The model does not know the rules; we do. These are constraints, not hacks.
-"""
-from __future__ import annotations
+import argparse
+import json
+import sys
+from pathlib import Path
 
 import numpy as np
+import polars as pl
 
-# A possession is worth at most 3 points (ignoring 4-point plays, which are rare
-# enough that treating them as impossible costs less than the states it saves).
-MAX_POINTS_PER_POSSESSION = 3
-# Seconds a trailing team needs to score and foul once more.
-SECONDS_PER_POSSESSION = 6.0
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "src"))
+from cbbwp import endgame_sim as E  # noqa: E402
 
-
-def max_points_remaining(seconds_remaining: np.ndarray) -> np.ndarray:
-    """Optimistic ceiling on what a trailing team can still score."""
-    poss = np.floor(np.asarray(seconds_remaining, dtype=np.float64) / SECONDS_PER_POSSESSION) + 1
-    return poss * MAX_POINTS_PER_POSSESSION
+EPS = 1e-15
 
 
-def apply(p, margin, seconds_remaining, is_ot=None):
-    """Clamp probabilities that the rules have already decided."""
-    p = np.array(p, dtype=np.float64, copy=True)
-    margin = np.asarray(margin)
-    t = np.asarray(seconds_remaining, dtype=np.float64)
-
-    # 1. Time expired in the final period: the result is known.
-    over = t <= 0
-    p[over & (margin > 0)] = 1.0
-    p[over & (margin < 0)] = 0.0
-    # A tie at 0:00 goes to overtime -> a coin flip, nudged by nothing else here.
-    p[over & (margin == 0)] = 0.5
-
-    # 2. Mathematically decided: the trailing team cannot catch up in the
-    #    possessions that remain, however well it plays.
-    ceiling = max_points_remaining(t)
-    decided_home = (~over) & (margin > ceiling)
-    decided_away = (~over) & (-margin > ceiling)
-    p[decided_home] = 1.0
-    p[decided_away] = 0.0
-    return p
-```
-
----
-
-## `src/cbbwp/evaluate.py`
-
-```python
-"""Probability metrics, always broken out by time remaining (plan 11.2)."""
-from __future__ import annotations
-
-import numpy as np
-
-EPS = 1e-6
-
-# (label, lower bound seconds, upper bound seconds)
-TIME_BUCKETS = [
-    ("40-20 min", 1200, 2400),
-    ("20-10 min", 600, 1200),
-    ("10-5 min", 300, 600),
-    ("5-2 min", 120, 300),
-    ("2-0 min", 0, 120),
-]
-
-
-def log_loss(y, p):
+def metrics(p: np.ndarray, y: np.ndarray) -> dict:
     p = np.clip(p, EPS, 1 - EPS)
-    return float(-np.mean(y * np.log(p) + (1 - y) * np.log(1 - p)))
+    ll = float(-(y * np.log(p) + (1 - y) * np.log(1 - p)).mean())
+    brier = float(((p - y) ** 2).mean())
+    acc = float((((p >= 0.5).astype(int)) == y).mean())
+    edges = np.linspace(0, 1, 21)
+    idx = np.clip(np.digitize(p, edges) - 1, 0, 19)
+    ece = 0.0
+    for b in range(20):
+        s = idx == b
+        if s.sum():
+            ece += s.mean() * abs(p[s].mean() - y[s].mean())
+    return {"log_loss": ll, "brier": brier, "accuracy": acc, "ece": float(ece), "n": int(len(p))}
 
 
-def brier(y, p):
-    return float(np.mean((p - y) ** 2))
-
-
-def accuracy(y, p):
-    return float(np.mean((p >= 0.5) == (y == 1)))
-
-
-def by_time_bucket(y, p, seconds, extra=None):
-    """Metrics per bucket. `extra` is an optional dict of other prediction sets."""
-    rows = []
-    for name, lo, hi in TIME_BUCKETS:
-        m = (seconds >= lo) & (seconds < hi) if lo > 0 else (seconds >= lo) & (seconds < hi)
-        if m.sum() == 0:
-            continue
-        row = {"bucket": name, "n": int(m.sum()),
-               "log_loss": log_loss(y[m], p[m]), "brier": brier(y[m], p[m]),
-               "acc": accuracy(y[m], p[m])}
-        if extra:
-            for k, v in extra.items():
-                ok = m & np.isfinite(v)
-                row[f"log_loss_{k}"] = log_loss(y[ok], v[ok]) if ok.sum() else float("nan")
-                row[f"n_{k}"] = int(ok.sum())
-        rows.append(row)
-    return rows
-
-
-def calibration_table(y, p, n_bins=10):
-    """Predicted vs observed, in equal-width probability bins."""
-    edges = np.linspace(0, 1, n_bins + 1)
-    idx = np.clip(np.digitize(p, edges[1:-1]), 0, n_bins - 1)
+def reliability(p: np.ndarray, y: np.ndarray, bins: int = 10) -> list[dict]:
+    edges = np.linspace(0, 1, bins + 1)
+    idx = np.clip(np.digitize(p, edges) - 1, 0, bins - 1)
     out = []
-    for b in range(n_bins):
-        m = idx == b
-        if m.sum() == 0:
+    for b in range(bins):
+        s = idx == b
+        if s.sum() < 50:
             continue
-        out.append({"bin": f"{edges[b]:.1f}-{edges[b+1]:.1f}", "n": int(m.sum()),
-                    "pred": float(p[m].mean()), "obs": float(y[m].mean())})
+        out.append({"bin": f"{edges[b]:.1f}-{edges[b+1]:.1f}", "n": int(s.sum()),
+                    "predicted": float(p[s].mean()), "observed": float(y[s].mean())})
     return out
 
 
-def ece(y, p, n_bins=20):
-    """Expected calibration error: mean |predicted - observed|, size-weighted."""
-    edges = np.linspace(0, 1, n_bins + 1)
-    idx = np.clip(np.digitize(p, edges[1:-1]), 0, n_bins - 1)
-    tot, n = 0.0, len(y)
-    for b in range(n_bins):
-        m = idx == b
-        if m.sum():
-            tot += m.sum() / n * abs(p[m].mean() - y[m].mean())
-    return float(tot)
-```
+def main() -> None:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--season", type=int, default=2024)
+    ap.add_argument("--table", default="registry/endgame/e1_no2024")
+    ap.add_argument("--seconds", type=int, default=60)
+    a = ap.parse_args()
 
----
-
-## `src/cbbwp/features.py`
-
-```python
-"""Feature builder. Imported by BOTH the training pipeline and the live server.
-
-If you change anything here you have changed the model's inputs: bump the model
-version and refit. `FEATURE_NAMES` in schemas.py fixes the column order.
-"""
-from __future__ import annotations
-
-import math
-from typing import Dict, Iterable, List, Sequence
-
-import numpy as np
-
-from .schemas import (GameState, FEATURE_NAMES, REGULATION_SECONDS,
-                      BONUS_FOULS, DOUBLE_BONUS_FOULS)
-
-_SQRT_REG = math.sqrt(REGULATION_SECONDS)
-
-
-def _bonus_level(opp_fouls: int) -> int:
-    """0 = no bonus, 1 = one-and-one, 2 = double bonus."""
-    if opp_fouls >= DOUBLE_BONUS_FOULS:
-        return 2
-    if opp_fouls >= BONUS_FOULS:
-        return 1
-    return 0
-
-
-def feature_dict(s: GameState) -> Dict[str, float]:
-    """Features for one state. The single source of truth for both pipelines."""
-    t = max(float(s.game_seconds_remaining), 1.0)
-    sqrt_t = math.sqrt(t)
-    # Pregame edge is the only information at tip-off and should fade to nothing
-    # by the buzzer, because by then the score has absorbed it.
-    decay = sqrt_t / _SQRT_REG
-    return {
-        "margin": float(s.margin),
-        "sqrt_time": sqrt_t,
-        "margin_per_sqrt_time": float(s.margin) / sqrt_t,
-        "possession": float(s.possession),
-        "pregame_exp_margin": float(s.pregame_exp_margin),
-        "pregame_exp_margin_decayed": float(s.pregame_exp_margin) * decay,
-        "is_ot": 1.0 if s.is_ot else 0.0,
-        "timeout_diff": float(s.home_timeouts - s.away_timeouts),
-        # Bonus level a team SHOOTS in is driven by its opponent's fouls.
-        "bonus_diff": float(_bonus_level(s.away_fouls) - _bonus_level(s.home_fouls)),
-        "ft_pct_diff": float(s.ft_pct_diff),
-        # Pace-aware twin of margin/sqrt(time): two slow teams have fewer
-        # chances left than two fast ones with the same clock.
-        "margin_per_sqrt_points_left": float(s.margin) / math.sqrt(
-            max(s.exp_points_per_min * t / 60.0, 1.0)),
-    }
-
-
-def build_feature_matrix(states: Sequence[GameState]) -> np.ndarray:
-    """(n_states, n_features) float64 array in FEATURE_NAMES order."""
-    out = np.empty((len(states), len(FEATURE_NAMES)), dtype=np.float64)
-    for i, s in enumerate(states):
-        d = feature_dict(s)
-        for j, name in enumerate(FEATURE_NAMES):
-            out[i, j] = d[name]
-    return out
-
-
-def mirror_features(X: np.ndarray, y: np.ndarray):
-    """Symmetry augmentation (plan 8.3): swap the two teams, flip the label.
-
-    Forces the model to treat the teams identically except through terms that
-    are genuinely home-specific. Free data, and it stabilises the fit.
-    """
-    idx = {n: i for i, n in enumerate(FEATURE_NAMES)}
-    Xm = X.copy()
-    for name in ("margin", "margin_per_sqrt_time", "pregame_exp_margin",
-                 "pregame_exp_margin_decayed", "timeout_diff", "bonus_diff",
-                 "ft_pct_diff", "margin_per_sqrt_points_left"):
-        Xm[:, idx[name]] *= -1.0
-    Xm[:, idx["possession"]] = 1.0 - Xm[:, idx["possession"]]
-    return np.vstack([X, Xm]), np.concatenate([y, 1 - y])
-
-
-# --------------------------------------------------------------------------
-# Vectorised twin of `feature_dict`, for building tens of millions of rows.
-# tests/test_parity.py asserts the two agree.
-# --------------------------------------------------------------------------
-def feature_exprs():
-    import polars as pl
-    t = pl.max_horizontal(pl.col("game_seconds_remaining").cast(pl.Float64), pl.lit(1.0))
-    sqrt_t = t.sqrt()
-    return [
-        pl.col("margin").cast(pl.Float64).alias("margin"),
-        sqrt_t.alias("sqrt_time"),
-        (pl.col("margin").cast(pl.Float64) / sqrt_t).alias("margin_per_sqrt_time"),
-        pl.col("possession").cast(pl.Float64).alias("possession"),
-        pl.col("pregame_exp_margin").cast(pl.Float64).alias("pregame_exp_margin"),
-        (pl.col("pregame_exp_margin").cast(pl.Float64) * sqrt_t / _SQRT_REG)
-        .alias("pregame_exp_margin_decayed"),
-        pl.col("is_ot").cast(pl.Float64).alias("is_ot"),
-        (pl.col("home_timeouts") - pl.col("away_timeouts")).cast(pl.Float64).alias("timeout_diff"),
-        (_bonus_expr(pl.col("away_fouls")) - _bonus_expr(pl.col("home_fouls")))
-        .cast(pl.Float64).alias("bonus_diff"),
-        pl.col("ft_pct_diff").cast(pl.Float64).alias("ft_pct_diff"),
-        (pl.col("margin").cast(pl.Float64) / pl.max_horizontal(
-            pl.col("exp_points_per_min").cast(pl.Float64) * t / 60.0, pl.lit(1.0)).sqrt())
-        .alias("margin_per_sqrt_points_left"),
-    ]
-
-
-def _bonus_expr(fouls):
-    import polars as pl
-    return (pl.when(fouls >= DOUBLE_BONUS_FOULS).then(pl.lit(2))
-              .when(fouls >= BONUS_FOULS).then(pl.lit(1))
-              .otherwise(pl.lit(0)))
-```
-
----
-
-## `src/cbbwp/live_context.py`
-
-```python
-"""Pregame context for games that have not been played yet.
-
-Offline, `PregameContext` fields come from `games.parquet` / `team_stats.parquet`,
-which are built AFTER the fact. A live game has no such row, so the same three
-quantities have to be produced from what is known this morning:
-
-    pregame_exp_margin  = rating(home) - rating(away) + (0 if neutral else hca)
-    ft_pct_diff         = season-to-date FT% home minus away
-    exp_points_per_min  = the two teams' combined scoring rate
-
-`scripts/build_live_context.py` writes the snapshot this class reads. Refresh it
-daily (and it is cheap enough to refresh hourly); a stale snapshot degrades
-gracefully - it just means yesterday's ratings.
-"""
-from __future__ import annotations
-
-import datetime as _dt
-import json
-import pathlib
-from dataclasses import dataclass
-from typing import Dict
-
-from .schemas import PregameContext
-
-DEFAULT_HCA = 3.4
-DEFAULT_FT = 0.700
-DEFAULT_PPM = 3.45
-STALE_AFTER_DAYS = 3
-
-
-@dataclass
-class LiveContextProvider:
-    season: int
-    hca: float
-    ratings: Dict[int, float]
-    ft_pct: Dict[int, float]
-    ppm: Dict[int, float]
-    generated: str = ""
-
-    @classmethod
-    def load(cls, path: str | pathlib.Path) -> "LiveContextProvider":
-        d = json.loads(pathlib.Path(path).read_text())
-        as_int = lambda m: {int(k): float(v) for k, v in (m or {}).items()}
-        return cls(
-            season=int(d.get("season", 0)),
-            hca=float(d.get("hca", DEFAULT_HCA)),
-            ratings=as_int(d.get("ratings")),
-            ft_pct=as_int(d.get("ft_pct")),
-            ppm=as_int(d.get("ppm")),
-            generated=str(d.get("generated", "")),
+    tdir = ROOT / a.table
+    table = np.load(tdir / "table.npz")["table"].astype(np.float64)
+    manifest = json.loads((tdir / "manifest.json").read_text())
+    if a.season in manifest["seasons_used"]:
+        raise SystemExit(
+            f"season {a.season} was used to fit {a.table}; validating on it would prove nothing"
         )
-
-    @property
-    def age_days(self) -> float:
-        if not self.generated:
-            return float("inf")
-        try:
-            t = _dt.datetime.fromisoformat(self.generated)
-        except ValueError:
-            return float("inf")
-        if t.tzinfo is None:
-            t = t.replace(tzinfo=_dt.timezone.utc)
-        return (_dt.datetime.now(_dt.timezone.utc) - t).total_seconds() / 86400.0
-
-    @property
-    def is_stale(self) -> bool:
-        return self.age_days > STALE_AFTER_DAYS
-
-    def context_for(self, game_id: int, home_team_id: int, away_team_id: int,
-                    neutral_site: bool = False) -> PregameContext:
-        """Best available pregame context. Unknown teams fall back to average.
-
-        An unknown team id is not an error: it is a first-time opponent, a
-        non-D1 side, or an id ESPN has just renumbered. Rating 0.0 means
-        'league average', which is the right prior for a team we know nothing
-        about, and the model's pregame term decays away within a few minutes.
-        """
-        r_h = self.ratings.get(home_team_id, 0.0)
-        r_a = self.ratings.get(away_team_id, 0.0)
-        margin = r_h - r_a + (0.0 if neutral_site else self.hca)
-        ft_h = self.ft_pct.get(home_team_id, DEFAULT_FT)
-        ft_a = self.ft_pct.get(away_team_id, DEFAULT_FT)
-        ppm_h = self.ppm.get(home_team_id, DEFAULT_PPM)
-        ppm_a = self.ppm.get(away_team_id, DEFAULT_PPM)
-        return PregameContext(
-            game_id=game_id,
-            home_team_id=home_team_id,
-            away_team_id=away_team_id,
-            neutral_site=neutral_site,
-            pregame_exp_margin=float(margin),
-            season=self.season,
-            ft_pct_diff=float(ft_h - ft_a),
-            exp_points_per_min=float((ppm_h + ppm_a) / 2.0),
-        )
-
-    def known(self, team_id: int) -> bool:
-        return team_id in self.ratings
-```
-
----
-
-## `src/cbbwp/monitor.py`
-
-```python
-"""Calibration drift monitoring (plan phase 5, item 16).
-
-A win probability model fails quietly. Log loss barely moves when the model
-starts saying 0.80 to situations that win 0.74, but that gap is the whole
-product. So the check that matters is not "is the loss still good" but
-"does what we SAY still match what HAPPENS", sliced by time remaining -
-because that is the axis along which this model's error actually varies.
-
-Two thresholds, deliberately both required to fire:
-  * statistical  - the gap is larger than sampling noise (|z| > Z_ALERT);
-  * practical    - the gap is larger than anyone would care about
-                   (|gap| > MIN_GAP).
-A million rows will make a 0.3-point gap "significant"; that is not drift,
-that is a large sample. Requiring both keeps the alert honest.
-
-THE CLUSTERING POINT, which is the difference between this being useful and
-being a weekly false alarm: the ~400 states in one game are NOT independent
-observations. They share one outcome. A game the home team won contributes 400
-rows all labelled 1, and if the model was 3 points low on that game it is 3
-points low on all 400 of them. So the standard error must be computed on the
-number of GAMES in a bin, not the number of states - the same principle the
-train/test split rests on ("effective sample size is games, not rows").
-
-Treating states as independent inflates z by roughly sqrt(states per game),
-which here is about 6x. The first version of this file did exactly that and
-reported z = -10.6 for a gap that is really about z = -1.7. Pass `game_ids`
-and the correction is automatic; omit them and the report says so, loudly,
-rather than quietly overstating its own confidence.
-"""
-from __future__ import annotations
-
-import math
-from dataclasses import dataclass, asdict, field
-from typing import Dict, List, Optional, Sequence
-
-import numpy as np
-
-# Time buckets, as everywhere else in this package.
-TIME_BUCKETS = [
-    ("40-20 min", 1200, 2400),
-    ("20-10 min", 600, 1200),
-    ("10-5 min", 300, 600),
-    ("5-2 min", 120, 300),
-    ("2-1 min", 60, 120),
-    ("1-0 min", 0, 60),
-]
-
-Z_ALERT = 3.0        # ~1 false positive per 370 independent checks
-MIN_GAP = 0.02       # 2 percentage points: below this nobody would notice
-MIN_ROWS = 500       # a decile thinner than this says nothing either way
-MIN_GAMES = 100      # ...and neither does one drawn from a handful of games
-N_DECILES = 10
-
-
-@dataclass
-class BinReport:
-    bucket: str
-    decile: int
-    n: int              # states
-    n_games: int        # independent observations behind those states
-    pred: float
-    obs: float
-    gap: float
-    z: float
-    alert: bool
-
-    def as_dict(self) -> dict:
-        return asdict(self)
-
-
-@dataclass
-class DriftReport:
-    generated: str = ""
-    window: str = ""
-    n_rows: int = 0
-    n_games: int = 0
-    clustered: bool = True
-    bins: List[BinReport] = field(default_factory=list)
-    bucket_ece: Dict[str, float] = field(default_factory=dict)
-    alerts: List[str] = field(default_factory=list)
-    notes: List[str] = field(default_factory=list)
-
-    @property
-    def ok(self) -> bool:
-        return not self.alerts
-
-    def as_dict(self) -> dict:
-        return {
-            "generated": self.generated,
-            "window": self.window,
-            "n_rows": self.n_rows,
-            "n_games": self.n_games,
-            "ok": self.ok,
-            "clustered": self.clustered,
-            "alerts": self.alerts,
-            "notes": self.notes,
-            "bucket_ece": self.bucket_ece,
-            "bins": [b.as_dict() for b in self.bins],
-        }
-
-
-def _z_score(pred: float, obs: float, n_independent: int) -> float:
-    """How many standard errors the observed rate sits from the predicted one.
-
-    `n_independent` must be the number of GAMES contributing to the bin, not the
-    number of states - see the module docstring. Uses the predicted probability
-    for the standard error (the null hypothesis is that the model is right),
-    which is the conservative choice near 0 and 1.
-    """
-    var = pred * (1.0 - pred)
-    if n_independent <= 0 or var <= 0:
-        return 0.0
-    return (obs - pred) / math.sqrt(var / n_independent)
-
-
-def decile_edges(p: np.ndarray, n_deciles: int = N_DECILES) -> np.ndarray:
-    """Equal-COUNT edges. Equal-width bins leave the interesting tails empty."""
-    qs = np.linspace(0, 1, n_deciles + 1)[1:-1]
-    return np.unique(np.quantile(p, qs))
-
-
-def check(y: Sequence[int], p: Sequence[float], seconds: Sequence[float],
-          game_ids: Optional[Sequence] = None, window: str = "",
-          z_alert: float = Z_ALERT, min_gap: float = MIN_GAP,
-          min_rows: int = MIN_ROWS, min_games: int = MIN_GAMES,
-          generated: str = "") -> DriftReport:
-    """Decile calibration check within each time bucket.
-
-    `game_ids` is not optional in spirit: without it every state is treated as
-    an independent observation and the z-scores are inflated by roughly the
-    square root of the number of states per game. Omitting it is supported for
-    synthetic data and unit tests, and the report says so.
-    """
-    y = np.asarray(y, dtype=np.float64)
-    p = np.asarray(p, dtype=np.float64)
-    s = np.asarray(seconds, dtype=np.float64)
-    if not (len(y) == len(p) == len(s)):
-        raise ValueError("y, p and seconds must be the same length")
-    if game_ids is None:
-        g = np.arange(len(y))          # every row its own "game": no clustering
-        clustered = False
-    else:
-        g = np.asarray(game_ids)
-        if len(g) != len(y):
-            raise ValueError("game_ids must be the same length as y")
-        clustered = True
-
-    rep = DriftReport(generated=generated, window=window, n_rows=int(len(y)),
-                      n_games=int(len(np.unique(g))) if clustered else 0,
-                      clustered=clustered)
-    if not clustered:
-        rep.notes.append(
-            "no game_ids supplied: states treated as independent, so z-scores "
-            "are optimistic. Fine for synthetic data, wrong for real games.")
-
-    for name, lo, hi in TIME_BUCKETS:
-        m = (s >= lo) & (s < hi)
-        if m.sum() < min_rows:
-            continue
-        pb, yb, gb = p[m], y[m], g[m]
-        edges = decile_edges(pb)
-        idx = np.digitize(pb, edges)
-        ece = 0.0
-        for d in range(len(edges) + 1):
-            dm = idx == d
-            n = int(dm.sum())
-            if n == 0:
-                continue
-            n_games = int(len(np.unique(gb[dm])))
-            pred = float(pb[dm].mean())
-            obs = float(yb[dm].mean())
-            gap = obs - pred
-            ece += n / len(pb) * abs(gap)
-            # The independent-observation count is the number of games.
-            z = _z_score(pred, obs, n_games)
-            alert = bool(n >= min_rows and n_games >= min_games
-                         and abs(z) > z_alert and abs(gap) > min_gap)
-            rep.bins.append(BinReport(name, d, n, n_games, pred, obs, gap, z, alert))
-            if alert:
-                rep.alerts.append(
-                    f"{name} decile {d}: model says {pred:.3f}, observed "
-                    f"{obs:.3f} over {n:,} states from {n_games:,} games "
-                    f"(gap {gap:+.3f}, z {z:+.1f})")
-        rep.bucket_ece[name] = float(ece)
-    return rep
-
-
-def format_report(rep: DriftReport) -> str:
-    """Human-readable table, for a terminal or an alert email."""
-    out = []
-    head = f"calibration check  {rep.window}".strip()
-    out.append(head)
-    out.append(f"{rep.n_rows:,} states"
-               + (f" from {rep.n_games:,} games" if rep.n_games else ""))
-    for n in rep.notes:
-        out.append(f"NOTE: {n}")
-    out.append("")
-    out.append(f"{'bucket':<12}{'dec':>4}{'states':>10}{'games':>8}"
-               f"{'pred':>8}{'obs':>8}{'gap':>8}{'z':>7}  ")
-    last = None
-    for b in rep.bins:
-        sep = "" if b.bucket == last else "\n"
-        last = b.bucket
-        flag = "  <-- ALERT" if b.alert else ""
-        out.append(f"{sep}{b.bucket if sep else '':<12}{b.decile:>4}{b.n:>10,}"
-                   f"{b.n_games:>8,}{b.pred:>8.3f}{b.obs:>8.3f}{b.gap:>+8.3f}"
-                   f"{b.z:>+7.1f}{flag}")
-    out.append("")
-    out.append("ECE by bucket: " + "  ".join(
-        f"{k} {v:.4f}" for k, v in rep.bucket_ece.items()))
-    out.append("")
-    if rep.ok:
-        out.append("OK - no bucket/decile is both statistically and practically off\n"
-                   "     (z computed on games, not states - see monitor.py).")
-    else:
-        out.append(f"{len(rep.alerts)} ALERT(S):")
-        out.extend("  " + a for a in rep.alerts)
-    return "\n".join(out)
-```
-
----
-
-## `src/cbbwp/ratings.py`
-
-```python
-"""As-of-date pregame team ratings - our stand-in for the closing spread.
-
-hoopR carries a betting spread only through ~2023, so we fit our own team
-strength model. The output, `pregame_exp_margin`, is on the same scale as a
-negated point spread: expected home margin in points.
-
-Leakage discipline (plan 8.2): a game's rating inputs are refit from games
-that finished STRICTLY BEFORE that game's date. Nothing a season later, and
-nothing from the game itself, can reach the model.
-
-Method: ridge regression of final margin on (home indicator - away indicator)
-plus a home-court term, shrunk toward a prior. The prior is last season's final
-rating regressed toward the mean, which is what carries a team through the
-first few November games when the in-season sample is empty.
-"""
-from __future__ import annotations
-
-from dataclasses import dataclass
-from typing import Dict
-
-import numpy as np
-import polars as pl
-
-CARRYOVER = 0.70     # how much of last season's rating survives into this one
-RIDGE_LAMBDA = 0.5   # tuned against 2016-23 closing spreads: corr 0.87, HCA 3.8
-REFIT_EVERY_DAYS = 7
-
-
-@dataclass
-class SeasonRatings:
-    season: int
-    ratings: Dict[int, float]   # team_id -> points above average
-    hca: float
-
-
-def _fit_ridge(games: pl.DataFrame, teams: list[int], prior: Dict[int, float],
-               lam: float | None = None) -> tuple[Dict[int, float], float]:
-    """Ridge fit of margin ~ home_team - away_team + hca, shrunk toward `prior`."""
-    lam = RIDGE_LAMBDA if lam is None else lam
-    idx = {t: i for i, t in enumerate(teams)}
-    n_t = len(teams)
-    if games.height == 0:
-        return dict(prior), 3.4
-
-    rows = games.height
-    X = np.zeros((rows, n_t + 1), dtype=np.float64)
-    h = games["home_id"].to_numpy()
-    a = games["away_id"].to_numpy()
-    X[np.arange(rows), [idx[t] for t in h]] = 1.0
-    X[np.arange(rows), [idx[t] for t in a]] = -1.0
-    X[:, n_t] = 1.0 - games["neutral_site"].cast(pl.Float64).to_numpy()
-    y = games["margin"].to_numpy().astype(np.float64)
-
-    b_prior = np.zeros(n_t + 1)
-    for t, v in prior.items():
-        if t in idx:
-            b_prior[idx[t]] = v
-    b_prior[n_t] = 3.4  # prior on home-court advantage, in points
-
-    resid = y - X @ b_prior
-    A = X.T @ X
-    pen = np.full(n_t + 1, lam)
-    pen[n_t] = 1.0          # barely shrink the home-court term
-    A[np.diag_indices_from(A)] += pen
-    d = np.linalg.solve(A, X.T @ resid)
-    b = b_prior + d
-    b[:n_t] -= b[:n_t].mean()   # ratings are relative; centre them
-    return {t: float(b[idx[t]]) for t in teams}, float(b[n_t])
-
-
-def season_pregame_margins(games: pl.DataFrame, prior: Dict[int, float], lam: float | None = None) -> tuple[pl.DataFrame, Dict[int, float], float]:
-    """For one season, attach `pregame_exp_margin` to every game.
-
-    `games` needs: game_id, date (datetime), home_id, away_id, margin, neutral_site.
-    Returns (games+column, end-of-season ratings, fitted home-court advantage).
-    """
-    games = games.sort("date")
-    teams = sorted(set(games["home_id"].to_list()) | set(games["away_id"].to_list()))
-    day = games["date"].dt.date()
-    games = games.with_columns(_day=day)
-    days = sorted(games["_day"].unique().to_list())
-
-    out_ids, out_vals = [], []
-    ratings, hca = dict(prior), 3.4
-    last_refit_i = -10_000
-    for i, d in enumerate(days):
-        if i - last_refit_i >= REFIT_EVERY_DAYS or i == 0:
-            past = games.filter(pl.col("_day") < d)
-            ratings, hca = _fit_ridge(past, teams, prior, lam)
-            last_refit_i = i
-        todays = games.filter(pl.col("_day") == d)
-        for gid, hid, aid, neu in zip(todays["game_id"], todays["home_id"],
-                                      todays["away_id"], todays["neutral_site"]):
-            out_ids.append(gid)
-            out_vals.append(ratings.get(hid, 0.0) - ratings.get(aid, 0.0)
-                            + (0.0 if neu else hca))
-
-    final_ratings, final_hca = _fit_ridge(games, teams, prior, lam)
-    joined = games.join(
-        pl.DataFrame({"game_id": out_ids, "pregame_exp_margin": out_vals}),
-        on="game_id", how="left",
-    ).drop("_day")
-    return joined, final_ratings, final_hca
-
-
-def build_all_seasons(games: pl.DataFrame, lam: float | None = None) -> pl.DataFrame:
-    """Walk seasons in order, carrying each season's ratings into the next."""
-    prior: Dict[int, float] = {}
-    frames = []
-    for season in sorted(games["season"].unique().to_list()):
-        sg = games.filter(pl.col("season") == season)
-        out, final, hca = season_pregame_margins(sg, prior, lam)
-        frames.append(out)
-        prior = {t: v * CARRYOVER for t, v in final.items()}
-        print(f"  season {season}: {out.height} games, hca={hca:.2f}, "
-              f"rating sd={np.std(list(final.values())):.2f}")
-    return pl.concat(frames, how="vertical_relaxed")
-```
-
----
-
-## `src/cbbwp/schemas.py`
-
-```python
-"""Canonical data contracts shared by the offline and live pipelines.
-
-Every adapter (historical parquet, live ESPN feed, a paid feed later) must emit
-`Event` objects. Nothing downstream of an adapter knows where the data came from.
-"""
-from __future__ import annotations
-
-from dataclasses import dataclass, field
-from typing import Optional
-
-# --- Rules constants (men's NCAA, 2015-16 rules onward) ----------------------
-HALF_SECONDS = 20 * 60          # 1200
-REGULATION_SECONDS = 2 * HALF_SECONDS  # 2400
-OT_SECONDS = 5 * 60             # 300
-TIMEOUTS_AT_TIP = 4             # approximation of the men's allotment
-
-
-@dataclass(frozen=True, slots=True)
-class Event:
-    """One play, normalised. `seq` orders events within a game."""
-    game_id: int
-    seq: int
-    period: int                  # 1,2 = halves; 3+ = overtime
-    clock_seconds: int           # seconds left IN THE PERIOD at the play
-    home_score: int
-    away_score: int
-    event_type: str              # e.g. "JumpShot", "Timeout", "DefensiveRebound"
-    team_id: Optional[int]       # team the event is attributed to
-    score_value: int = 0
-    scoring_play: bool = False
-    shooting_play: bool = False
-    text: str = ""
-
-
-@dataclass(frozen=True, slots=True)
-class PregameContext:
-    """Known before tip-off. Loaded once per game, never re-fetched mid-game."""
-    game_id: int
-    home_team_id: int
-    away_team_id: int
-    neutral_site: bool = False
-    # Expected home margin in points (positive = home favoured).
-    # Either the negated closing spread, or a model-derived rating differential.
-    pregame_exp_margin: float = 0.0
-    season: int = 0
-    ft_pct_diff: float = 0.0
-    exp_points_per_min: float = 3.4
-
-
-@dataclass(slots=True)
-class GameState:
-    """A snapshot AFTER one event. One event -> one state row."""
-    game_id: int
-    seq: int
-    period: int
-    is_ot: bool
-    clock_seconds: int            # left in the period
-    game_seconds_remaining: int   # left in regulation, or in the current OT
-    home_score: int
-    away_score: int
-    margin: int                   # home - away
-    possession: float             # 1.0 home, 0.0 away, 0.5 unknown
-    home_timeouts: int
-    away_timeouts: int
-    home_fouls: int = 0            # team fouls in the current half
-    away_fouls: int = 0
-    pregame_exp_margin: float = 0.0
-    neutral_site: bool = False
-    ft_pct_diff: float = 0.0       # home season-to-date FT% minus away's
-    exp_points_per_min: float = 3.4  # combined scoring rate of the two teams
-
-
-# Column order is part of the contract: the fitted model's coefficients are
-# positional. Changing this list requires a new model version.
-FEATURE_NAMES = [
-    "margin",
-    "sqrt_time",
-    "margin_per_sqrt_time",
-    "possession",
-    "pregame_exp_margin",
-    "pregame_exp_margin_decayed",
-    "is_ot",
-    "timeout_diff",
-    "bonus_diff",
-    "ft_pct_diff",
-    "margin_per_sqrt_points_left",
-]
-
-# Men's NCAA bonus thresholds, in team fouls per half.
-BONUS_FOULS = 7        # 1-and-1
-DOUBLE_BONUS_FOULS = 10
-
-# Version of the STATE RULES, as opposed to the feature list above.
-#
-# FEATURE_NAMES catches someone adding, removing or reordering a column. It does
-# NOT catch someone changing what an existing column MEANS - and that is the
-# more dangerous edit, because nothing downstream looks any different.
-#
-# This happened on 2026-09-01: the possession rule was corrected so that made
-# three-pointers in 2016-2019 flip possession (they had not, because ESPN typed
-# them "Three Point Jump Shot" and the rule keyed on play-type names). The
-# feature list was untouched, so the manifest check passed, and a model trained
-# on the old meaning would have been served states built with the new one.
-#
-# Bump this whenever the meaning of any GameState field changes, and refit.
-#   1 - original rules, shipped 2026-08-31 (registry/v1)
-#   2 - made field goals detected by scoring+shooting flags, not type names
-STATE_RULES_VERSION = 2
-```
-
----
-
-## `src/cbbwp/serve.py`
-
-```python
-"""The live scoring path. Deliberately thin: it calls the SAME state and
-feature builders the training pipeline used, then a pinned model artifact.
-"""
-from __future__ import annotations
-
-import json
-import pathlib
-import pickle
-from typing import Iterable, List
-
-import numpy as np
-
-from .schemas import (Event, PregameContext, FEATURE_NAMES,
-                      STATE_RULES_VERSION)
-from .state import build_states
-from .features import build_feature_matrix
-from . import endgame
-
-OVERRIDE_CLIP = 0.999   # never assert more certainty than the feed supports
-
-
-class WinProbabilityService:
-    def __init__(self, registry_dir: str | pathlib.Path, version: str):
-        self.dir = pathlib.Path(registry_dir) / version
-        self.version = version
-        self.manifest = json.loads((self.dir / "manifest.json").read_text())
-        if self.manifest["features"] != FEATURE_NAMES:
-            raise RuntimeError(
-                f"model {version} was fit on different features than this code builds; "
-                "the feature contract changed - refit or pin an older code version"
-            )
-        # The names can match while the MEANING has changed underneath them.
-        # A model fit before a state-rule change must not be served states built
-        # after it. An artifact with no stamp predates the check and is treated
-        # as version 1.
-        fit_rules = self.manifest.get("state_rules_version", 1)
-        if fit_rules != STATE_RULES_VERSION:
-            raise RuntimeError(
-                f"model {version} was fit with state rules v{fit_rules} but this "
-                f"code builds states with v{STATE_RULES_VERSION}. The feature NAMES "
-                "still match, so this would have been silent: the model would be "
-                "served inputs that mean something different from its training "
-                "data. Refit, or pin the code version that matches the artifact."
-            )
-        kind = self.manifest["kind"]
-        if kind == "lightgbm":
-            import lightgbm as lgb
-            self.model = lgb.Booster(model_file=str(self.dir / "model.txt"))
-            self._predict = lambda X: self.model.predict(X)
-        else:
-            with open(self.dir / "model.pkl", "rb") as f:
-                b = pickle.load(f)
-            self._predict = lambda X: b["model"].predict_proba(b["scaler"].transform(X))[:, 1]
-
-    def score_game(self, events: Iterable[Event], ctx: PregameContext) -> List[dict]:
-        """Replay a game from event zero and return one prediction per state.
-
-        Called on every poll. Replaying from scratch costs milliseconds and makes
-        retroactive feed corrections a non-event.
-        """
-        states = build_states(events, ctx)
-        if not states:
-            return []
-        X = build_feature_matrix(states)
-        p = np.asarray(self._predict(X), dtype=np.float64)
-
-        margin = np.array([s.margin for s in states])
-        secs = np.array([s.game_seconds_remaining for s in states], dtype=np.float64)
-        adj = endgame.apply(p, margin, secs)
-        touched = adj != p
-        p[touched] = np.clip(adj[touched], 1 - OVERRIDE_CLIP, OVERRIDE_CLIP)
-
-        return [
-            {"game_id": s.game_id, "seq": s.seq, "period": s.period,
-             "game_seconds_remaining": s.game_seconds_remaining, "margin": s.margin,
-             "home_win_prob": float(pi), "model_version": self.version}
-            for s, pi in zip(states, p)
-        ]
-```
-
----
-
-## `src/cbbwp/state.py`
-
-```python
-"""Replayable game-state builder.
-
-`build_states` is a PURE function of the full event list. Feed it the same
-events in any arrival order and it produces the same states, so a retroactive
-correction from a live feed is handled by simply replaying the game from
-event zero (milliseconds).
-"""
-from __future__ import annotations
-
-from typing import Iterable, List, Optional
-
-from .schemas import (
-    Event,
-    GameState,
-    PregameContext,
-    HALF_SECONDS,
-    OT_SECONDS,
-    TIMEOUTS_AT_TIP,
-)
-
-# Fouls that count toward the team-foul total for bonus purposes.
-FOUL_TYPES = {"PersonalFoul", "Technical Foul"}
-
-# --- possession rules -------------------------------------------------------
-# What the state's `possession` should be AFTER each kind of event.
-#   "actor"  -> the team the event is attributed to has the ball
-#   "other"  -> the other team has the ball
-#   "carry"  -> unchanged from the previous state
-#   "unknown"-> 0.5
-# NOTE: this list is NO LONGER used to decide possession - see _possession_after.
-# It is kept only for documentation of what the field-goal types look like.
-_MADE_SHOT_TYPES = {"JumpShot", "LayUpShot", "DunkShot", "TipShot"}
-_TURNOVER_MARKER = "Turnover"
-
-TEAM_TIMEOUT_TYPES = {"ShortTimeOut", "RegularTimeOut", "TeamTimeOut", "Timeout"}
-OFFICIAL_TIMEOUT_TYPES = {"OfficialTVTimeOut", "MediaTimeOut"}
-
-
-def clock_to_seconds(display: str) -> int:
-    """'19:48' -> 1188.  '0:23.4' -> 23.  Returns 0 on anything unparseable."""
-    if not display:
-        return 0
-    s = display.strip()
-    try:
-        if ":" in s:
-            mm, ss = s.split(":", 1)
-            return int(mm) * 60 + int(float(ss))
-        return int(float(s))
-    except (ValueError, TypeError):
-        return 0
-
-
-def period_length(period: int) -> int:
-    return HALF_SECONDS if period <= 2 else OT_SECONDS
-
-
-def game_seconds_remaining(period: int, clock_seconds: int) -> int:
-    """Seconds left in regulation; inside overtime, seconds left in that OT.
-
-    Each overtime is treated as its own clock reset (see plan section 8.2).
-    """
-    if period <= 1:
-        return HALF_SECONDS + clock_seconds
-    if period == 2:
-        return clock_seconds
-    return clock_seconds
-
-
-def _possession_after(ev: Event, home_id: int, away_id: int, prev: float) -> float:
-    """Return 1.0 (home has ball), 0.0 (away), or 0.5 (unknown)."""
-    t = ev.event_type or ""
-    tid = ev.team_id
-    actor: Optional[float]
-    if tid is None:
-        actor = None
-    elif tid == home_id:
-        actor = 1.0
-    elif tid == away_id:
-        actor = 0.0
-    else:
-        actor = None
-    other = None if actor is None else 1.0 - actor
-
-    if "FreeThrow" in t:
-        return other if (ev.scoring_play and other is not None) else prev
-    # A made field goal -> the other team inbounds. A miss leaves the ball live,
-    # so possession carries until a rebound resolves it.
-    #
-    # This is keyed on the feed's own scoring/shooting flags rather than on a
-    # list of play-type NAMES, and that is not a style preference. ESPN typed
-    # made three-pointers as "Three Point Jump Shot" through 2019 and as
-    # "JumpShot" from 2021 onward. A name whitelist therefore missed 324,043
-    # made threes - 89% of every made three in 2016-2019 - and left the ball
-    # with the team that had just scored. The flags are stable across that
-    # rename; the names are not.
-    if ev.scoring_play and ev.shooting_play:
-        return other if other is not None else prev
-    if t == "Defensive Rebound" or t == "Offensive Rebound":
-        return actor if actor is not None else prev
-    if t == "Dead Ball Rebound":
-        return prev
-    if _TURNOVER_MARKER in t:
-        return other if other is not None else prev
-    if t == "Steal":
-        return actor if actor is not None else prev
-    if t == "Jumpball":
-        return 0.5
-    return prev  # fouls, blocks, subs, timeouts, period markers
-
-
-def build_states(
-    events: Iterable[Event],
-    ctx: PregameContext,
-    timeouts_at_tip: int = TIMEOUTS_AT_TIP,
-) -> List[GameState]:
-    """Replay a game's events into one state per event.
-
-    Pure: no dependence on arrival order, no hidden state, no I/O.
-    """
-    evs = sorted(events, key=lambda e: e.seq)
-    home_id, away_id = ctx.home_team_id, ctx.away_team_id
-
-    states: List[GameState] = []
-    poss = 0.5
-    home_used = away_used = 0
-    home_fouls = away_fouls = 0
-    half_of = lambda p: 1 if p <= 1 else 2   # men's fouls reset once, at the break
-    cur_half = 1
-
-    for ev in evs:
-        period = max(1, ev.period or 1)
-        if half_of(period) != cur_half:
-            cur_half = half_of(period)
-            home_fouls = away_fouls = 0
-
-        if ev.event_type in FOUL_TYPES:
-            if ev.team_id == home_id:
-                home_fouls += 1
-            elif ev.team_id == away_id:
-                away_fouls += 1
-
-        if ev.event_type in TEAM_TIMEOUT_TYPES:
-            if ev.team_id == home_id:
-                home_used += 1
-            elif ev.team_id == away_id:
-                away_used += 1
-
-        # NCAA grants one extra timeout per overtime period.
-        allot = timeouts_at_tip + max(0, period - 2)
-
-        poss = _possession_after(ev, home_id, away_id, poss)
-        clock = max(0, min(int(ev.clock_seconds or 0), period_length(period)))
-
-        states.append(
-            GameState(
-                game_id=ev.game_id,
-                seq=ev.seq,
-                period=period,
-                is_ot=period >= 3,
-                clock_seconds=clock,
-                game_seconds_remaining=game_seconds_remaining(period, clock),
-                home_score=ev.home_score,
-                away_score=ev.away_score,
-                margin=ev.home_score - ev.away_score,
-                possession=poss,
-                home_timeouts=max(0, allot - home_used),
-                away_timeouts=max(0, allot - away_used),
-                home_fouls=home_fouls,
-                away_fouls=away_fouls,
-                pregame_exp_margin=ctx.pregame_exp_margin,
-                neutral_site=ctx.neutral_site,
-                ft_pct_diff=ctx.ft_pct_diff,
-                exp_points_per_min=ctx.exp_points_per_min,
-            )
-        )
-    return states
-```
-
----
-
-## `src/cbbwp/adapters/__init__.py`
-
-```python
-
-```
-
----
-
-## `src/cbbwp/adapters/espn.py`
-
-```python
-"""Adapter: ESPN's live men's college basketball feed -> canonical Events.
-
-This is the live twin of `adapters/hoopr.py`. hoopR is itself a scrape of this
-same ESPN feed, so the two adapters must agree exactly - that is what keeps the
-live path and the training path on the same definitions.
-
-The one subtlety is play *type*. hoopR stores ESPN's `type.text` verbatim, and
-the state builder's possession rules are written against those exact strings.
-ESPN occasionally reworks the display text of a play type but almost never its
-numeric `type.id`, so this adapter maps id -> the text the model was TRAINED on
-and only falls back to whatever text the feed sent when the id is unknown.
-
-`TYPE_ID_TO_TEXT` was extracted from the 2016-2026 hoopR files: every
-(type_id, type_text) pair that actually occurs.
-
-Note what this map is and is not for. Possession no longer depends on play-type
-NAMES at all - `state._possession_after` keys made field goals on the feed's
-scoring/shooting flags, precisely because ESPN renamed the made-three type
-between 2019 and 2021 and a name whitelist silently missed 324,043 made threes.
-The map survives because the type text is still what the model was trained on
-for every OTHER rule (fouls, timeouts, rebounds, turnovers), and because an id
-is a more stable key for those than a display string.
-"""
-from __future__ import annotations
-
-import json
-import urllib.error
-import urllib.request
-from dataclasses import dataclass
-from typing import Any, Iterable, List, Optional, Sequence
-
-from ..schemas import Event, PregameContext
-from ..state import clock_to_seconds
-
-SITE_API = "https://site.api.espn.com/apis/site/v2/sports/basketball/mens-college-basketball"
-SCOREBOARD_URL = SITE_API + "/scoreboard"
-SUMMARY_URL = SITE_API + "/summary"
-
-# Play type id -> the type_text the model was trained on. See module docstring.
-TYPE_ID_TO_TEXT = {
-    0: "Not Available",
-    91: "Shot",
-    215: "Coach's Challenge (Overturned)",
-    216: "Coach's Challenge (Stands)",
-    402: "End Game",
-    412: "End Period",
-    437: "TipShot",
-    449: "Dead Ball Rebound",
-    519: "PersonalFoul",
-    521: "Technical Foul",
-    540: "MadeFreeThrow",
-    558: "JumpShot",
-    572: "LayUpShot",
-    574: "DunkShot",
-    578: "RegularTimeOut",
-    579: "ShortTimeOut",
-    580: "OfficialTVTimeOut",
-    584: "Substitution",
-    586: "Offensive Rebound",
-    587: "Defensive Rebound",
-    598: "Lost Ball Turnover",
-    607: "Steal",
-    615: "Jumpball",
-    618: "Block Shot",
-    20437: "TipShot",
-    20558: "JumpShot",
-    20572: "LayUpShot",
-    20574: "DunkShot",
-    30558: "Three Point Jump Shot",
-}
-
-# Statuses ESPN reports. Only IN means the clock is (or may be) running.
-STATUS_PRE = "STATUS_SCHEDULED"
-STATUS_FINAL = "STATUS_FINAL"
-
-
-def _int(v, default=None) -> Optional[int]:
-    if v is None or v == "":
-        return default
-    try:
-        return int(v)
-    except (TypeError, ValueError):
-        try:
-            return int(float(v))
-        except (TypeError, ValueError):
-            return default
-
-
-def play_type_text(play: dict) -> str:
-    """Canonical type_text for one ESPN play."""
-    t = play.get("type") or {}
-    tid = _int(t.get("id"))
-    if tid is not None and tid in TYPE_ID_TO_TEXT:
-        return TYPE_ID_TO_TEXT[tid]
-    # Unknown id: fall back to the feed's own text. The state builder treats an
-    # unrecognised type as "carry possession", which is the safe default.
-    return (t.get("text") or "").strip()
-
-
-def _sequence_key(play: dict, fallback: int) -> int:
-    """ESPN's sequenceNumber, numeric, for ordering. Falls back to feed order."""
-    s = _int(play.get("sequenceNumber"))
-    return s if s is not None else fallback
-
-
-def events_from_plays(plays: Sequence[dict], game_id: int) -> List[Event]:
-    """ESPN `plays` array -> Events, numbered 1..N like hoopR's game_play_number.
-
-    ESPN's own sequenceNumber is used only for ORDERING; the emitted `seq` is a
-    dense 1-based ordinal, exactly as hoopR's game_play_number is, so a state
-    built live is directly comparable to the same state built offline.
-    """
-    ordered = sorted(
-        ((_sequence_key(p, i), i, p) for i, p in enumerate(plays)),
-        key=lambda x: (x[0], x[1]),
-    )
-    out: List[Event] = []
-    for n, (_key, _i, p) in enumerate(ordered, start=1):
-        period = _int((p.get("period") or {}).get("number"), 1) or 1
-        clock = (p.get("clock") or {}).get("displayValue") or ""
-        team = (p.get("team") or {}).get("id")
-        out.append(
-            Event(
-                game_id=game_id,
-                seq=n,
-                period=period,
-                clock_seconds=clock_to_seconds(clock),
-                home_score=_int(p.get("homeScore"), 0) or 0,
-                away_score=_int(p.get("awayScore"), 0) or 0,
-                event_type=play_type_text(p),
-                team_id=_int(team),
-                score_value=_int(p.get("scoreValue"), 0) or 0,
-                scoring_play=bool(p.get("scoringPlay")),
-                shooting_play=bool(p.get("shootingPlay")),
-                text=(p.get("text") or ""),
-            )
-        )
-    return out
-
-
-@dataclass(frozen=True)
-class GameHeader:
-    """The pregame facts the summary endpoint carries, before ratings."""
-    game_id: int
-    home_team_id: int
-    away_team_id: int
-    home_name: str
-    away_name: str
-    neutral_site: bool
-    status: str
-    period: int
-    clock_display: str
-    home_score: int
-    away_score: int
-
-    @property
-    def is_final(self) -> bool:
-        return self.status == STATUS_FINAL
-
-    @property
-    def is_live(self) -> bool:
-        return self.status not in (STATUS_PRE, STATUS_FINAL)
-
-
-def header_from_summary(summary: dict) -> GameHeader:
-    """Pull team ids, neutral-site flag and status out of a summary payload."""
-    header = summary.get("header") or {}
-    comps = header.get("competitions") or [{}]
-    comp = comps[0]
-    home = away = None
-    for c in comp.get("competitors") or []:
-        if c.get("homeAway") == "home":
-            home = c
-        elif c.get("homeAway") == "away":
-            away = c
-    if home is None or away is None:
-        raise ValueError("summary payload has no home/away competitors")
-
-    st = ((comp.get("status") or {}).get("type") or {})
-    return GameHeader(
-        game_id=_int(header.get("id") or comp.get("id")) or 0,
-        home_team_id=_int((home.get("team") or {}).get("id")) or 0,
-        away_team_id=_int((away.get("team") or {}).get("id")) or 0,
-        home_name=((home.get("team") or {}).get("displayName") or ""),
-        away_name=((away.get("team") or {}).get("displayName") or ""),
-        neutral_site=bool(comp.get("neutralSite")),
-        status=st.get("name") or "",
-        period=_int((comp.get("status") or {}).get("period"), 0) or 0,
-        clock_display=str((comp.get("status") or {}).get("displayClock") or ""),
-        home_score=_int(home.get("score"), 0) or 0,
-        away_score=_int(away.get("score"), 0) or 0,
-    )
-
-
-def parse_summary(summary: dict) -> tuple[List[Event], GameHeader]:
-    """One summary payload -> (events, header). No network, no state."""
-    h = header_from_summary(summary)
-    return events_from_plays(summary.get("plays") or [], h.game_id), h
-
-
-def scoreboard_games(scoreboard: dict) -> List[dict]:
-    """Flatten a scoreboard payload to one dict per game."""
-    out = []
-    for ev in scoreboard.get("events") or []:
-        comp = (ev.get("competitions") or [{}])[0]
-        st = ((comp.get("status") or {}).get("type") or {})
-        home = away = None
-        for c in comp.get("competitors") or []:
-            if c.get("homeAway") == "home":
-                home = c
-            elif c.get("homeAway") == "away":
-                away = c
-        out.append({
-            "game_id": _int(ev.get("id")) or 0,
-            "name": ev.get("shortName") or ev.get("name") or "",
-            "status": st.get("name") or "",
-            "state": st.get("state") or "",
-            "completed": bool(st.get("completed")),
-            "neutral_site": bool(comp.get("neutralSite")),
-            "home_team_id": _int((home or {}).get("team", {}).get("id")) or 0,
-            "away_team_id": _int((away or {}).get("team", {}).get("id")) or 0,
-            "start": ev.get("date") or "",
-        })
-    return out
-
-
-# --------------------------------------------------------------------------
-# Network. Kept in one small class so everything above stays testable offline.
-# --------------------------------------------------------------------------
-class EspnClient:
-    """Minimal, dependency-free ESPN reader.
-
-    Deliberately synchronous and tiny: the poller runs these in a thread pool,
-    which keeps the asyncio loop free of a third-party HTTP dependency.
-    """
-
-    def __init__(self, timeout: float = 10.0, user_agent: str = "cbbwp/0.2"):
-        self.timeout = timeout
-        self.user_agent = user_agent
-
-    def _get(self, url: str, params: dict | None = None) -> dict:
-        if params:
-            q = "&".join(f"{k}={v}" for k, v in params.items() if v is not None)
-            url = f"{url}?{q}"
-        req = urllib.request.Request(url, headers={"User-Agent": self.user_agent})
-        with urllib.request.urlopen(req, timeout=self.timeout) as r:
-            return json.loads(r.read().decode("utf-8"))
-
-    def scoreboard(self, date: str | None = None, groups: str = "50",
-                   limit: int = 500) -> dict:
-        """`date` is YYYYMMDD. groups=50 is Division I."""
-        return self._get(SCOREBOARD_URL,
-                         {"dates": date, "groups": groups, "limit": limit})
-
-    def summary(self, event_id: int | str) -> dict:
-        return self._get(SUMMARY_URL, {"event": event_id})
-```
-
----
-
-## `src/cbbwp/adapters/hoopr.py`
-
-```python
-"""Adapter: hoopR / sportsdataverse historical play-by-play parquet -> Events.
-
-Two paths, deliberately:
-  * `load_events` builds canonical Event objects for one or a few games. This is
-    the reference path and the one the live pipeline mirrors.
-  * `states_lazy` does the same transformation in Polars for tens of millions of
-    rows. It exists only for speed, and `tests/test_parity.py` asserts it agrees
-    with the reference path row-for-row on real games.
-"""
-from __future__ import annotations
-
-from typing import Iterable, List, Optional
-
-import polars as pl
-
-from ..schemas import Event, HALF_SECONDS, OT_SECONDS
-from ..state import TEAM_TIMEOUT_TYPES, FOUL_TYPES, clock_to_seconds
-
-# Columns present in every season 2016-2026 of the hoopR mbb pbp files.
-BASE_COLS = [
-    "game_id", "game_play_number", "period_number", "clock_display_value",
-    "home_score", "away_score", "type_text", "team_id", "score_value",
-    "scoring_play", "shooting_play", "home_team_id", "away_team_id",
-    "season", "season_type", "game_date",
-]
-
-MADE_SHOT_TYPES = ["JumpShot", "LayUpShot", "DunkShot", "TipShot"]
-
-
-def load_events(path: str, game_id: int) -> tuple[List[Event], int, int]:
-    """Reference path: one game's parquet rows -> canonical Events."""
-    df = (
-        pl.scan_parquet(path)
-        .filter(pl.col("game_id") == game_id)
-        .select(BASE_COLS)
-        .sort("game_play_number")
+    means = manifest["ft_bucket_means"]
+
+    st = (
+        pl.scan_parquet(ROOT / "data" / "proc" / "states" / f"states_{a.season}.parquet")
+        .filter((pl.col("period") >= 2) & (pl.col("game_seconds_remaining") <= a.seconds))
+        .select(["game_id", "game_seconds_remaining", "margin", "possession",
+                 "home_fouls", "away_fouls", "home_win", "espn_wp"])
         .collect()
     )
-    if df.is_empty():
-        raise KeyError(f"game {game_id} not in {path}")
-    home_id = int(df["home_team_id"][0])
-    away_id = int(df["away_team_id"][0])
-    events = [
-        Event(
-            game_id=int(r["game_id"]),
-            seq=int(r["game_play_number"]),
-            period=int(r["period_number"] or 1),
-            clock_seconds=clock_to_seconds(r["clock_display_value"] or ""),
-            home_score=int(r["home_score"] or 0),
-            away_score=int(r["away_score"] or 0),
-            event_type=r["type_text"] or "",
-            team_id=None if r["team_id"] is None else int(r["team_id"]),
-            score_value=int(r["score_value"] or 0),
-            scoring_play=bool(r["scoring_play"]),
-            shooting_play=bool(r["shooting_play"]),
-        )
-        for r in df.iter_rows(named=True)
-    ]
-    return events, home_id, away_id
-
-
-# --------------------------------------------------------------------------
-# Vectorised bulk path
-# --------------------------------------------------------------------------
-def _clock_seconds_expr(col: str = "clock_display_value") -> pl.Expr:
-    parts = pl.col(col).str.split_exact(":", 1)
-    mm = parts.struct.field("field_0").cast(pl.Float64, strict=False)
-    ss = parts.struct.field("field_1").cast(pl.Float64, strict=False)
-    return (
-        pl.when(pl.col(col).str.contains(":"))
-        .then(mm * 60 + ss.floor())
-        .otherwise(pl.col(col).cast(pl.Float64, strict=False).floor())
-        .fill_null(0)
-        .cast(pl.Int32)
+    ts = pl.read_parquet(ROOT / "data" / "proc" / "team_stats.parquet").select(
+        ["game_id", "home_ft_pct", "away_ft_pct"]
+    )
+    d = st.join(ts, on="game_id", how="left").with_columns(
+        [pl.col("home_ft_pct").fill_null(0.70), pl.col("away_ft_pct").fill_null(0.70)]
     )
 
-
-def states_lazy(lf: pl.LazyFrame, timeouts_at_tip: int = 4) -> pl.LazyFrame:
-    """Vectorised equivalent of state.build_states over many games at once."""
-    t = pl.col("type_text")
-    actor = (
-        pl.when(pl.col("team_id") == pl.col("home_team_id")).then(pl.lit(1.0))
-        .when(pl.col("team_id") == pl.col("away_team_id")).then(pl.lit(0.0))
-        .otherwise(pl.lit(None, dtype=pl.Float64))
+    p = E.lookup_home(
+        table,
+        d["game_seconds_remaining"].to_numpy(),
+        d["margin"].to_numpy(),
+        d["possession"].to_numpy(),
+        d["home_fouls"].to_numpy(),
+        d["away_fouls"].to_numpy(),
+        E.ft_bucket(d["home_ft_pct"].to_numpy(), means),
+        E.ft_bucket(d["away_ft_pct"].to_numpy(), means),
     )
-    other = 1.0 - actor
-    made = pl.col("scoring_play").fill_null(False)
-    shooting = pl.col("shooting_play").fill_null(False)
+    y = d["home_win"].to_numpy().astype(float)
 
-    poss_set = (
-        # Same rule, same order, as state._possession_after. Made field goals are
-        # detected by the scoring/shooting flags, not by play-type name - see the
-        # comment there for why the name whitelist was wrong for 2016-2019.
-        pl.when(t.str.contains("FreeThrow") & made).then(other)
-        .when(made & shooting).then(other)
-        .when(t.is_in(["Defensive Rebound", "Offensive Rebound"])).then(actor)
-        .when(t.str.contains("Turnover")).then(other)
-        .when(t == "Steal").then(actor)
-        .when(t == "Jumpball").then(pl.lit(0.5))
-        .otherwise(pl.lit(None, dtype=pl.Float64))
-    )
+    result = {
+        "season": a.season,
+        "table": a.table,
+        "table_seasons": manifest["seasons_used"],
+        "window_seconds": a.seconds,
+        "table_alone": metrics(p, y),
+        "espn_same_rows": metrics(np.clip(d["espn_wp"].to_numpy(), EPS, 1 - EPS), y),
+        "reliability": reliability(p, y),
+    }
+    print(json.dumps(result, indent=2))
+    outp = ROOT / "reports" / f"endgame_validation_{a.season}.json"
+    outp.parent.mkdir(exist_ok=True)
+    outp.write_text(json.dumps(result, indent=2))
 
-    is_team_to = t.is_in(list(TEAM_TIMEOUT_TYPES))
-    is_foul = t.is_in(list(FOUL_TYPES))
-    period = pl.col("period_number").fill_null(1).clip(lower_bound=1).cast(pl.Int32)
-    plen = pl.when(period <= 2).then(pl.lit(HALF_SECONDS)).otherwise(pl.lit(OT_SECONDS))
-    clock = _clock_seconds_expr().clip(0, None)
-    clock = pl.min_horizontal(clock, plen).cast(pl.Int32)
-    gsr = pl.when(period <= 1).then(pl.lit(HALF_SECONDS) + clock).otherwise(clock)
 
-    allot = pl.lit(timeouts_at_tip) + (period - 2).clip(lower_bound=0)
-
-    return (
-        lf.sort(["game_id", "game_play_number"])
-        .with_columns(
-            _period=period,
-            _clock=clock,
-            _gsr=gsr.cast(pl.Int32),
-            _poss_set=poss_set,
-            _to_home=(is_team_to & (pl.col("team_id") == pl.col("home_team_id"))).cast(pl.Int32),
-            _to_away=(is_team_to & (pl.col("team_id") == pl.col("away_team_id"))).cast(pl.Int32),
-            _allot=allot,
-            _half=pl.when(period <= 1).then(pl.lit(1)).otherwise(pl.lit(2)),
-            _foul_home=(is_foul & (pl.col("team_id") == pl.col("home_team_id"))).cast(pl.Int32),
-            _foul_away=(is_foul & (pl.col("team_id") == pl.col("away_team_id"))).cast(pl.Int32),
-        )
-        .with_columns(
-            possession=pl.col("_poss_set").forward_fill().over("game_id").fill_null(0.5),
-            home_used=pl.col("_to_home").cum_sum().over("game_id"),
-            away_used=pl.col("_to_away").cum_sum().over("game_id"),
-            home_fouls=pl.col("_foul_home").cum_sum().over(["game_id", "_half"]),
-            away_fouls=pl.col("_foul_away").cum_sum().over(["game_id", "_half"]),
-        )
-        .with_columns(
-            margin=(pl.col("home_score").fill_null(0) - pl.col("away_score").fill_null(0)).cast(pl.Int32),
-            home_timeouts=(pl.col("_allot") - pl.col("home_used")).clip(lower_bound=0).cast(pl.Int32),
-            away_timeouts=(pl.col("_allot") - pl.col("away_used")).clip(lower_bound=0).cast(pl.Int32),
-            is_ot=(pl.col("_period") >= 3),
-        )
-        .rename({"_period": "period", "_clock": "clock_seconds",
-                 "_gsr": "game_seconds_remaining", "game_play_number": "seq"})
-        .drop(["_poss_set", "_to_home", "_to_away", "_allot", "home_used", "away_used",
-               "_half", "_foul_home", "_foul_away"])
-    )
+if __name__ == "__main__":
+    main()
 ```
-
----
 
 ## `tests/espn_fixtures.py`
 
-```python
+```py
 """Build ESPN-shaped summary payloads out of hoopR rows.
 
 hoopR IS a scrape of the ESPN feed, so a payload rebuilt from hoopR columns has
@@ -2756,11 +4386,9 @@ def summary_from_hoopr(pbp_path: str, game_id: int, shuffle_seed: int | None = N
     }
 ```
 
----
-
 ## `tests/test_endgame.py`
 
-```python
+```py
 import sys, pathlib
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "src"))
 import numpy as np
@@ -2784,11 +4412,177 @@ def test_live_games_are_left_alone():
     assert p[0] == 0.73
 ```
 
----
+## `tests/test_endgame_sim.py`
+
+```py
+"""Tests for the endgame table.
+
+Two kinds. The first check that the solver's structure is what it claims -- the
+terminal condition, the symmetry, the monotonicity the plan pre-registered.
+
+The second kind is the one that matters. `test_possession_truth.py` exists
+because every check we had compared the code to itself, so a feature that meant
+two different things in one training set went unnoticed for four seasons. The
+free-throw tests below are written in the same spirit: they assert against the
+RULES OF BASKETBALL and against a known feed artifact, so that if ESPN changes
+how it labels a free-throw trip again, something fails loudly.
+"""
+from __future__ import annotations
+
+import json
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+
+import numpy as np
+import pytest
+
+from cbbwp import endgame_sim as E
+
+ROOT = Path(__file__).resolve().parents[1]
+TABLE = ROOT / "registry" / "endgame" / "e1"
+PBP26 = ROOT / "data" / "raw" / "pbp" / "pbp_2026.parquet"
+
+needs_table = pytest.mark.skipif(not (TABLE / "table.npz").exists(),
+                                 reason="run scripts/build_endgame_table.py first")
+needs_pbp = pytest.mark.skipif(not PBP26.exists(), reason="raw play-by-play not fetched")
+
+
+@pytest.fixture(scope="module")
+def table():
+    return np.load(TABLE / "table.npz")["table"].astype(np.float64)
+
+
+@pytest.fixture(scope="module")
+def manifest():
+    return json.loads((TABLE / "manifest.json").read_text())
+
+
+@needs_table
+def test_time_expired_is_decided_by_the_scoreboard(table):
+    for m in range(-6, 7):
+        v = table[0, E._mi(m), 6, 8, 1, 1]
+        if m > 0:
+            assert v == pytest.approx(1.0)
+        elif m < 0:
+            assert v == pytest.approx(0.0)
+        else:
+            assert v == pytest.approx(0.5)
+
+
+@needs_table
+def test_a_made_basket_never_lowers_your_win_probability(table):
+    """Criterion 3, exhaustively -- every state, not a sample."""
+    assert np.diff(table, axis=1).min() >= -1e-6
+
+
+@needs_table
+def test_having_the_ball_is_never_a_disadvantage(table):
+    """The same physical state, valued from both sides, must prefer possession."""
+    flipped = 1.0 - table[:, ::-1].transpose(0, 1, 3, 2, 5, 4)
+    assert (table - flipped).min() >= -1e-6
+
+
+@needs_table
+def test_the_table_is_symmetric_under_swapping_the_teams(table):
+    means = [0.667, 0.709, 0.749]
+    args = dict(seconds_remaining=np.array([12, 30, 5]), home_fouls=np.array([7, 9, 6]),
+                away_fouls=np.array([9, 6, 10]), home_bucket=np.array([0, 1, 2]),
+                away_bucket=np.array([2, 1, 0]))
+    home = E.lookup_home(table, margin_home=np.array([3.0, -2.0, 1.0]),
+                         possession=np.array([1.0, 0.0, 1.0]), **args)
+    swapped = E.lookup_home(
+        table, seconds_remaining=args["seconds_remaining"], margin_home=np.array([-3.0, 2.0, -1.0]),
+        possession=np.array([0.0, 1.0, 0.0]), home_fouls=args["away_fouls"],
+        away_fouls=args["home_fouls"], home_bucket=args["away_bucket"],
+        away_bucket=args["home_bucket"])
+    assert home == pytest.approx(1.0 - swapped, abs=1e-9)
+    del means
+
+
+@needs_table
+def test_trailing_by_three_late_is_worse_than_trailing_by_two(table):
+    """Two is one possession; three is not. The table has to know that."""
+    for t in (5, 10, 20):
+        down2 = table[t, E._mi(-2), 6, 8, 1, 1]
+        down3 = table[t, E._mi(-3), 6, 8, 1, 1]
+        assert down3 < down2 - 0.05, (t, down3, down2)
+
+
+@needs_table
+def test_shipped_table_declares_the_state_rules_it_was_built_under(manifest):
+    """Same guard as the model: a table built under different state rules must
+    not be served silently alongside code that means something else by them."""
+    from cbbwp.schemas import STATE_RULES_VERSION
+    assert manifest["state_rules_version"] == STATE_RULES_VERSION
+
+
+@needs_table
+def test_the_table_was_not_fitted_on_the_test_seasons(manifest):
+    assert not ({2025, 2026} & set(manifest["seasons_used"]))
+
+
+# --- the feed-artifact regression -------------------------------------------
+@needs_pbp
+def test_espn_labels_a_free_throw_trip_by_attempts_taken_not_attempts_awarded():
+    """The censoring that made "1 of 1" look like a 54% free-throw rate.
+
+    A MADE one-and-one front end earns a second shot, so ESPN writes the trip as
+    "1 of 2" / "2 of 2"; a MISSED one leaves the trip at a single attempt and is
+    written "1 of 1". Every made front end therefore leaves the "1 of 1" bucket
+    by construction, and reading `scoring_play` off that label conditions on the
+    outcome.
+
+    If this test ever fails, ESPN has changed the convention again and every
+    free-throw parameter has to be re-derived.
+    """
+    import polars as pl
+
+    df = (
+        pl.scan_parquet(PBP26)
+        .select(["game_id", "sequence_number", "type_id", "text", "scoring_play",
+                 "athlete_id_1", "clock_minutes", "clock_seconds"])
+        .collect()
+        .with_columns(pl.col("sequence_number").cast(pl.Int64))
+        .sort(["game_id", "sequence_number"])
+    )
+    df = df.with_columns([
+        (pl.col("type_id").cast(pl.Int64) == 540).alias("isft"),
+        (pl.col("clock_minutes").cast(pl.Float64).fill_null(0) * 60
+         + pl.col("clock_seconds").cast(pl.Float64).fill_null(0)).alias("sec"),
+    ])
+    df = df.with_columns((pl.col("scoring_play") & ~pl.col("isft")).alias("madefg"))
+    andone = None
+    for k in range(1, 13):
+        t = (pl.col("madefg").shift(k).over("game_id")
+             & (pl.col("athlete_id_1").shift(k).over("game_id") == pl.col("athlete_id_1"))
+             & ((pl.col("sec").shift(k).over("game_id") - pl.col("sec")).abs() <= 3))
+        andone = t if andone is None else (andone | t)
+    df = df.with_columns(andone.fill_null(False).alias("andone"))
+
+    ones = df.filter(pl.col("isft") & pl.col("text").str.contains("(?i)free throw 1 of 1"))
+    plain = ones.filter(~pl.col("andone"))
+    and_ones = ones.filter(pl.col("andone"))
+
+    # And-one free throws are ordinary single shots and convert like them.
+    assert len(and_ones) > 5_000
+    assert 0.60 < and_ones["scoring_play"].mean() < 0.80
+
+    # The rest are missed one-and-one front ends, and are therefore almost all
+    # misses. Anything near a plausible free-throw percentage here would mean
+    # the convention had changed.
+    assert len(plain) > 2_000
+    assert plain["scoring_play"].mean() < 0.20, (
+        "'1 of 1' free throws that are not and-ones now convert at a plausible "
+        "rate -- ESPN has changed how it labels free-throw trips, and every "
+        "free-throw parameter in artifacts/endgame_params.json must be re-derived"
+    )
+```
 
 ## `tests/test_espn_adapter.py`
 
-```python
+```py
 """The ESPN (live) adapter must produce exactly what the hoopR (offline) adapter
 produces for the same game. This is the train/serve-skew guard for the live path,
 and it is the live counterpart of tests/test_parity.py.
@@ -2994,11 +4788,9 @@ def test_the_current_model_loads():
     assert svc.manifest["state_rules_version"] == 2
 ```
 
----
-
 ## `tests/test_features.py`
 
-```python
+```py
 import sys, pathlib
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "src"))
 import numpy as np
@@ -3038,11 +4830,9 @@ def test_mirroring_flips_sign_and_label():
     assert list(ym) == [1, 0]
 ```
 
----
-
 ## `tests/test_monitor.py`
 
-```python
+```py
 import sys, pathlib
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "src"))
 import numpy as np
@@ -3163,11 +4953,9 @@ def test_report_flags_when_clustering_was_not_applied():
     assert "z-scores" in monitor.format_report(rep)
 ```
 
----
-
 ## `tests/test_parity.py`
 
-```python
+```py
 """The vectorised bulk path must agree with the canonical state builder.
 
 This is the same class of check as the replay harness (plan 13, phase 5):
@@ -3243,11 +5031,9 @@ def test_vectorised_features_match_reference(sample_game_ids):
     assert np.allclose(Xref, Xvec, atol=1e-9)
 ```
 
----
-
 ## `tests/test_possession_truth.py`
 
-```python
+```py
 """Possession rules checked against the RULES OF BASKETBALL, not against each other.
 
 `test_parity.py` asserts the bulk path agrees with the reference path. That is
@@ -3366,11 +5152,9 @@ def test_a_made_free_throw_still_flips():
     assert s[-1].possession == 0.0
 ```
 
----
-
 ## `tests/test_replay_harness.py`
 
-```python
+```py
 """Replay harness (plan 13, phase 5 item 15).
 
 Feed a completed game's events through the LIVE path one poll at a time, as if
@@ -3447,11 +5231,9 @@ def test_probabilities_are_bounded_and_finite(svc, game):
     assert np.all(np.isfinite(p)) and p.min() >= 0.0 and p.max() <= 1.0
 ```
 
----
-
 ## `tests/test_state.py`
 
-```python
+```py
 import sys, pathlib
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "src"))
 
@@ -3527,142 +5309,3 @@ def test_official_timeouts_do_not_consume_team_timeouts():
     s = build_states([ev(1, 1, 1200, 0, 0, "OfficialTVTimeOut", HOME)], ctx)
     assert s[0].home_timeouts == 4
 ```
-
----
-
-## `pyproject.toml`
-
-```toml
-[build-system]
-requires = ["setuptools>=68"]
-build-backend = "setuptools.build_meta"
-
-[project]
-name = "cbbwp"
-version = "0.2.0"
-description = "College basketball live win probability model"
-requires-python = ">=3.10"
-dependencies = ["numpy", "polars", "scikit-learn", "lightgbm"]
-
-[tool.setuptools.packages.find]
-where = ["src"]
-```
-
----
-
-## `README.md`
-
-```markdown
-# cbbwp — college basketball live win probability
-
-Live win probability for NCAA men's basketball. Trained on 2016–2023,
-calibrated on 2024, tested on 2025–2026 (2.23M states, 12,398 games).
-Beats ESPN's deployed model in every time bucket.
-
-| Model | Log loss | Brier | Accuracy | ECE |
-|---|---|---|---|---|
-| **LightGBM v1 (shipped)** | **0.3104** | 0.1008 | 85.17% | 0.0028 |
-| Logistic baseline | 0.3109 | 0.1009 | 85.19% | 0.0043 |
-| ESPN (deployed, same rows) | 0.3295 | 0.1061 | 84.58% | 0.0069 |
-
-Full explanation of the model, every design decision and its rejected
-alternative: **`docs/cbbwp-EXPLAIN.md`**. Read that first.
-
-## Setup
-
-```bash
-pip3 install --break-system-packages polars pyarrow lightgbm scikit-learn pytest numpy
-```
-
-## Rebuild everything from scratch
-
-```bash
-python3 scripts/fetch_data.py          # ~540 MB of hoopR parquet, ~1 min
-python3 scripts/build_games.py         # results + as-of pregame ratings
-python3 scripts/build_team_stats.py    # as-of FT% and pace
-python3 scripts/build_dataset.py       # replay -> 8.5M state rows + features
-python3 scripts/fit_models.py          # logistic + LightGBM  (needs ~6 GB RAM)
-python3 scripts/publish_model.py v1    # pinned registry artifact
-python3 scripts/evaluate.py            # metrics by time bucket vs ESPN
-pytest tests -q
-```
-
-Seeds are pinned (`seed=20260831`, `deterministic=True`), so a refit on the
-same machine reproduces `registry/v1` exactly.
-
-**Memory note:** `fit_models.py` peaks around 4–6 GB — the symmetry mirroring
-doubles 5.4M rows and briefly holds them as float64. It will be OOM-killed in a
-3 GB container.
-
-## Run it live
-
-```bash
-python3 scripts/build_live_context.py     # daily, before the slate
-python3 scripts/live_poller.py            # follow tonight's games
-python3 scripts/live_poller.py --date 20261115
-python3 scripts/live_poller.py --game 401585555 --once     # smoke test
-```
-
-Output goes to stdout and to `data/live/wp_YYYYMMDD.jsonl`.
-
-Before the first live night, on a machine that can reach ESPN:
-
-```bash
-python3 scripts/record_espn_fixtures.py --limit 5   # save real payloads
-python3 scripts/check_espn_fixtures.py              # flag unknown play types
-```
-
-`check_espn_fixtures.py` is the one check the offline suite cannot do: it
-reports play-type ids the model was never trained on. **A frequent unknown type
-means the ESPN feed has changed and the model needs a refit, not a patched
-adapter.**
-
-## Monitor it
-
-```bash
-python3 scripts/calibration_monitor.py --source backtest --days 7
-python3 scripts/calibration_monitor.py --source live --glob 'data/live/*.jsonl'
-```
-
-Exit code 1 means a decile is off both statistically (|z| > 3) *and*
-practically (gap > 2 points). Both are required — a million rows will make a
-0.3-point gap "significant", and that is a large sample, not drift.
-
-## Layout
-
-```
-src/cbbwp/
-  schemas.py       data contracts; FEATURE_NAMES is the model's input contract
-  state.py         replayable state builder — a pure function of the event list
-  features.py      the 11 features, one definition, used by training AND serving
-  ratings.py       in-house pregame ratings (our stand-in for the betting spread)
-  serve.py         WinProbabilityService; refuses to start on a contract mismatch
-  live_context.py  pregame context for a game that has not been played yet
-  endgame.py       rule-based clamps the data cannot teach efficiently
-  calibration.py   time-bucketed isotonic (diagnostic only — see EXPLAIN)
-  monitor.py       calibration drift statistics
-  adapters/
-    hoopr.py       historical parquet -> Events   (offline)
-    espn.py        live ESPN feed     -> Events   (live)
-scripts/           the pipeline, the poller, the monitor
-tests/             37 tests
-docs/              the project docs, kept alongside the code
-data/, artifacts/, registry/   built locally; not source
-```
-
-## The two parity tests that matter
-
-The whole design rests on training and serving sharing one definition of state
-and features. Two tests enforce it:
-
-- `tests/test_parity.py` — the fast vectorised Polars path must agree
-  row-for-row with the canonical state builder on real games.
-- `tests/test_espn_adapter.py` — the **live** ESPN adapter must produce
-  byte-identical states and win probabilities to the **offline** hoopR adapter
-  for the same game, including when the feed arrives shuffled.
-
-`tests/test_replay_harness.py` adds the third: a finished game fed through the
-live path in irregular chunks must match the offline answer exactly.
-```
-
----

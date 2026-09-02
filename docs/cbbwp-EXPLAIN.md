@@ -865,6 +865,51 @@ and it is easy to mistake one for the other.
 
 ---
 
+### 7.10 Build the endgame simulator, then decline to ship it
+
+The plan (§4.4 option 2) called for explicitly simulating the last 60 seconds and blending
+that with the model. It was built, in full, and it is **not in the serving path**.
+
+The bar was written first, in `cbbwp-endgame-plan.md`, before any code existed, because
+"we built it and did not ship it" is only a credible outcome if the threshold was set in
+advance. Five criteria; the first was a 1% relative log-loss improvement inside 60 seconds.
+Tested once on 2025-2026: **0.40%**. Criteria 2-5 all passed — calibration improved (ECE
+0.00485 to 0.00366, no new monitor alert), monotonicity is exact across all 1,660,725
+states, the 60-second handoff moves probabilities by at most 0.0007, and a lookup costs
+0.000068 ms. The plan's rule was that clearing 2-5 but not 1 means it does not ship, so it
+does not ship.
+
+Three things came out of it that are worth more than the blend would have been.
+
+**The table is a sharp measurement in its own right.** On 2024, out of sample, knowing the
+score, the clock, possession, both foul counts and how well the two teams shoot free
+throws — and *nothing at all* about how good either team is — it scores 0.1384 against
+ESPN's 0.1518 on the same rows. That is a statement about how much of endgame win
+probability is pure structure, and it is worth more as a diagnostic than as a 0.4% blend.
+
+**A free-throw statistic that looked like a rule change was a censoring artifact.** "1 of 1"
+free throws convert at 0.537, which was flagged as a possible second instance of the
+possession bug — a rule encoded as a constant while the sport moved. It was not. ESPN labels
+a free-throw trip by the attempts actually *taken*, so a **made** one-and-one front end earns
+a second shot and is written "1 of 2"/"2 of 2", while a **missed** one stays a single attempt
+and is written "1 of 1". Every made front end leaves the bucket by construction. Reading
+`scoring_play` off that label conditions on the outcome. Decensoring gives a true first-shot
+rate of 0.700 — confirmed independently by classifying trips on team foul count in a season
+whose feed has no such text at all. `tests/test_endgame_sim.py` now fails loudly if the
+convention changes again. Full working in `cbbwp-endgame-phase2.md`.
+
+**The plan's blend shape was wrong, and the data said so immediately.** The plan assumed the
+simulator's weight should rise to 1.0 by 0:00. The model is at its *best* at 0:00 — 0.0859 in
+the last five seconds against the table's 0.1368 — because by then the margin and the clock
+have decided nearly everything and there is nothing left for a possession model to add. The
+tuned ceiling was 0.20.
+
+The reason the blend cannot do better is structural rather than fixable by tuning: the model
+already has every feature the table has, **and** team strength, which the table deliberately
+lacks. Monotone-constrained LightGBM on 5.4M states has already learned most of the endgame's
+shape. Two changes might alter that — giving the table team strength, or feeding the table's
+output to the model as a feature and refitting — and both are new model versions, not tweaks.
+
 ## 8. Known weaknesses
 
 Be forthright about these. Knowing them is the difference between defending the model and
@@ -1097,7 +1142,9 @@ Beating a *broadcast* win probability model and beating a *market* are different
 | `src/cbbwp/monitor.py` | Calibration drift statistics. |
 | `src/cbbwp/serve.py` | The live scoring path and the version-pinning guard. |
 | `scripts/` | The pipeline, the live poller, the fixture tools, the monitor. |
-| `tests/` | 37 tests: state rules, feature contract, bulk parity, ESPN-adapter parity, endgame rules, replay harness, monitor statistics. |
+| `src/cbbwp/endgame_sim.py` | The endgame solver and lookup table. A documented diagnostic; **not** wired into `serve.py` — see §7.10. |
+| `registry/endgame/e1/` | The solved table, its manifest and a readable CSV of canonical states. |
+| `tests/` | 72 tests: state rules, feature contract, bulk parity, ESPN-adapter parity, endgame rules, replay harness, monitor statistics, endgame-table structure and the ESPN free-throw labelling convention. |
 | `registry/v2/` | The pinned model artifact and manifest, stamped with the state-rules version. |
 | `registry/v1/` | The pre-fix model, kept for provenance. Refused at load by current code. |
 | `registry/context_latest.json` | Today's team ratings and season-to-date stats, for live games. |
