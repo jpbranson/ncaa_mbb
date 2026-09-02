@@ -4,13 +4,24 @@
 This document is the operational one: what to run, in what order, and what to
 look at when something is wrong.*
 
-## The one thing that is still unvalidated
+## What is validated, and what is still not
 
-**The live path has never touched the real ESPN endpoint.** Neither the sandbox
-this was built in nor the Cowork device VM can reach `site.api.espn.com` — both
-fail with `Tunnel connection failed: 403 Forbidden`. Everything else is tested;
-this is the last link in the chain and it must be closed **before** a live
-night, not during one.
+**First real contact with ESPN: 2026-09-02.** Until then the live path had never
+touched `site.api.espn.com` — every environment this was built in was blocked
+from it. That run settled several things and left one open.
+
+Validated on 2026-09-02, on a machine with open egress:
+
+- ESPN is reachable and returns a real Division I slate (56 games).
+- The adapter parses real ESPN summary payloads: 539 plays → 539 states, with no
+  play type ids the model has not seen.
+- The offline suite, the model artifact, the ratings snapshot and the HTTP API
+  all pass.
+
+Still open: **nothing has been run against a game with a running clock.** The
+2026-09-02 run was in the offseason, so the parse checks used payloads recorded
+from finished games. Re-run the smoke test on a night with games before treating
+the live path as fully proven.
 
 ```bash
 python3 scripts/smoke_live.py
@@ -22,9 +33,71 @@ Eight steps, one verdict. Exit codes are meaningful:
 |---|---|
 | 0 | all eight passed — the live path is validated |
 | 1 | something is broken; do not go live |
-| 2 | the offline steps passed but ESPN was unreachable, so the live path is **still unvalidated** |
+| 2 | the offline steps passed, but something the network was needed for did not happen — either ESPN was unreachable, or no game was live or finished on the slate |
 
-Exit 2 is not a pass. It is the state the project is in today.
+Exit 2 is not a pass. It is the state the project is in out of season, and the
+verdict text says which of the two reasons applies.
+
+### ESPN blocks some user-agents — this is the trap that was hiding
+
+The earlier `Tunnel connection failed: 403 Forbidden` was read as blocked egress.
+It was not only that. ESPN's edge applies a user-agent rule, and the client's own
+default fell foul of it. Measured against the scoreboard endpoint:
+
+| `User-Agent` | result |
+|---|---|
+| *(no header at all)* | 200 |
+| `Python-urllib/3.14` | 200 |
+| `curl/8.7.1` | 200 |
+| `python-requests/2.32.3` | 200 |
+| `cbbwp/0.2 (+https://github.com/jpbranson/ncaa_mbb)` | 200 |
+| `cbbwp/0.2` | **403** |
+| `Mozilla/5.0 … Chrome/140.0.0.0 Safari/537.36` | **403** |
+
+Deterministic, not rate limiting: 15 sequential requests one second apart gave
+15/15 on each row, on both the scoreboard and the summary endpoint. Two things
+get refused — bare short tokens with no context, and strings claiming to be a
+browser without a browser's other headers. Adding the contact URL is what fixes
+`cbbwp/0.2`; removing the project name is not required.
+
+The adapter now defaults to the working string and reads `CBBWP_USER_AGENT` from
+the environment, so a future edge-rule change is a config edit plus a restart:
+
+```bash
+CBBWP_USER_AGENT='cbbwp/0.3 (+https://example.org/contact)' python3 scripts/smoke_live.py
+```
+
+A 403 is **not** retried. It is deterministic, so a retry only burns clock during
+a live game; the client raises immediately with the refused value named in the
+error. Step 4 of the smoke test prints the user-agent that worked, and reports a
+403 as a FAIL rather than as blocked egress — calling it "blocked" is exactly
+what hid this rule for a whole build cycle.
+
+## Machine setup — three things that bite on a fresh Mac
+
+1. **Use a virtualenv.** `lightgbm` and `pytest` are not on the system
+   interpreter, and `pip install --break-system-packages` is not a fix.
+
+   ```bash
+   python3 -m venv .venv
+   .venv/bin/pip install polars pyarrow lightgbm scikit-learn pytest numpy certifi
+   ```
+
+2. **Install CA certificates for a python.org build.** The framework Python
+   ships its own OpenSSL, does not read the macOS Keychain, and arrives with no
+   CA bundle — every HTTPS call fails `CERTIFICATE_VERIFY_FAILED`. Run the
+   installer's `Install Certificates.command` for your version, e.g.
+   `/Applications/Python 3.14/Install Certificates.command`.
+
+   Do **not** work around this by exporting `SSL_CERT_FILE` in a shell profile.
+   A LaunchAgent does not read shell profiles, so the poller would fail at
+   tip-off in exactly the way the smoke test did. Fix it at the interpreter.
+
+3. **Point the LaunchAgents at the venv interpreter.** For the same reason,
+   `deploy/install_macos.sh` now prefers `$ROOT/.venv/bin/python3` by absolute
+   path and refuses to install if that interpreter cannot import `lightgbm`,
+   `polars` and `numpy`. A missing dependency should stop the install, not the
+   first tip-off of the season.
 
 Step 6 is the one to read carefully: it reports **play type ids the model has
 never seen**. A frequent unknown id means ESPN changed the feed, and the honest

@@ -1,9 +1,12 @@
 """Record real ESPN payloads to disk, so the adapter can be tested against them.
 
-Run this on a machine that can reach ESPN (the sandbox this package was built
-in cannot - site.api.espn.com is blocked by egress policy). It saves the raw
-JSON exactly as returned; nothing is parsed or normalised, so the fixtures stay
-useful even if the adapter changes.
+Run this on a machine that can reach ESPN. It saves the raw JSON exactly as
+returned; nothing is parsed or normalised, so the fixtures stay useful even if
+the adapter changes.
+
+Games that have not started are skipped: they carry no plays, so recording one
+yields a fixture that proves nothing while looking just like a real one. Out of
+season that means nothing is recorded at all, which is the honest outcome.
 
     python3 scripts/record_espn_fixtures.py --date 20261115 --limit 5
     python3 scripts/record_espn_fixtures.py --game 401585555
@@ -36,10 +39,18 @@ else:
     sb = c.scoreboard(day)
     (out / "scoreboard.json").write_text(json.dumps(sb))
     games = scoreboard_games(sb)
-    print(f"scoreboard {day}: {len(games)} games")
-    # prefer games that are live or finished - a scheduled game has no plays
-    games.sort(key=lambda g: (g["status"] == "STATUS_SCHEDULED", g["game_id"]))
-    ids = [g["game_id"] for g in games[:a.limit]]
+    # A scheduled game carries no plays, so recording one produces a fixture
+    # that proves nothing while looking exactly like a real one. Drop them
+    # rather than sorting them to the back: out of season the whole slate is
+    # scheduled, and a directory of empty payloads is worse than none.
+    playable = [g for g in games if g["status"] != "STATUS_SCHEDULED"]
+    n_sched = len(games) - len(playable)
+    print(f"scoreboard {day}: {len(games)} games"
+          + (f" ({n_sched} not started yet, skipped)" if n_sched else ""))
+    if not playable:
+        print("no games with plays on this slate -- nothing to record")
+    playable.sort(key=lambda g: g["game_id"])
+    ids = [g["game_id"] for g in playable[:a.limit]]
 
 for gid in ids:
     s = c.summary(gid)

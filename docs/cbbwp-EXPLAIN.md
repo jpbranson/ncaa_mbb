@@ -504,8 +504,10 @@ corrections a non-event. Poll cadence tightens as the clock runs: 20s early, 10s
 minutes, 5s inside two. A scoreboard task rediscovers the slate every two minutes. Output is
 one JSONL line per changed state.
 
-**What is validated, and what is not.** Both this sandbox and the local VM are blocked from
-`site.api.espn.com` by egress policy, so the adapter has never seen a live payload. What *is*
+**What is validated, and what is not.** On 2026-09-02 the adapter reached the real endpoint
+for the first time and parsed real ESPN summary payloads correctly — 539 plays to 539 states,
+no unknown play-type ids. It has still not been run against a game with a *running clock*;
+that run was in the offseason. What *is*
 proven, offline and in CI, is that ESPN-shaped payloads rebuilt from hoopR rows produce
 byte-identical states and win probabilities to the offline path on real games. Since hoopR is
 itself a scrape of this same ESPN feed, that covers ordering, numbering, type mapping and
@@ -1028,12 +1030,18 @@ face, and it visibly hedges on blowouts — where it says 3.4% the true rate is 
 our edge is simply being willing to be more confident where the data supports it. That is a
 legitimate win, not a trick, but it is the honest characterisation.
 
-### 8.8 The live adapter has never seen a live payload
-Both sandboxes this was built in are blocked from `site.api.espn.com`. The adapter is proven
-against ESPN-shaped payloads rebuilt from hoopR — which is a scrape of the same feed, so the
-shape is right — but not against the live endpoint itself. Closing that gap is two commands
-on a machine with network access (§3.10), and it should be done before the first live night,
-not during it.
+### 8.8 The live adapter has not seen a game in progress
+Corrected 2026-09-02: the adapter has now read the real endpoint and parsed real payloads
+(§3.10), so the "never touched ESPN" caveat is retired. What remains is narrower — every real
+payload it has parsed came from a *finished* game, because the first run with open egress
+happened in September. A game in progress differs in ways worth checking once: a partial
+plays array that grows between polls, and a status that is neither scheduled nor final.
+
+That first run also found something the old caveat was hiding. The 403 everyone read as
+blocked egress was partly ESPN's edge refusing the client's own user-agent, which would have
+hit the Mac in November with no sandbox to blame. See `cbbwp-deployment.md`. The general
+lesson is the one worth keeping: an environmental excuse for a failure is a hypothesis, not
+a diagnosis, and it stops being tested the moment it sounds sufficient.
 
 ---
 
