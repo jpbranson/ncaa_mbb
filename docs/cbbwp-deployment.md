@@ -147,6 +147,31 @@ What a replay does **not** cover, so it is never mistaken for validation:
   cannot prove ESPN still sends that shape.
 - Rate limiting and real-world 403s, unless you ask for them with `--flaky`.
 
+### First dry run: 2026-09-03
+
+Six archived 2025-26 games, 2,764 plays, replayed at 5x through the unmodified
+`serve_live.py` over real HTTP. 172 states emitted, all tagged `"replay": true`.
+
+| game | states | periods | final margin | final WP |
+|---|---|---|---|---|
+| Arkansas at Missouri (OT) | 36 | 3 | −4 | 0.001 |
+| UNC at Duke | 30 | 2 | +15 | 0.999 |
+| Stanford at NC State | 25 | 2 | −1 | 0.001 |
+| UConn at Marquette | 25 | 2 | +6 | 0.999 |
+| Michigan vs Arizona | 27 | 2 | −18 | 0.001 |
+| UConn vs Michigan (final) | 29 | 2 | +6 | 0.999 |
+
+All six reproduced the real final score exactly, all six converged, and the
+overtime game crossed into a third period and was scored through it. The
+scoreboard task discovered games as they tipped rather than all at once.
+
+One thing the dry run surfaced and then explained: in two games the last state
+is *very slightly* less certain than the one before it (0.9997 → 0.9990) with
+the margin unchanged. That is `OVERRIDE_CLIP` in `serve.py` doing its job — the
+endgame override clips to 0.999, and the state a few seconds earlier was never
+touched by it. Intended, not a defect, and worth knowing before someone reads it
+as one at 11pm in February.
+
 Step 6 is the one to read carefully: it reports **play type ids the model has
 never seen**. A frequent unknown id means ESPN changed the feed, and the honest
 fix is to refit with the new type present rather than to map it to something
