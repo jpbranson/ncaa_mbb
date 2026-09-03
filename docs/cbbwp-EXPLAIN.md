@@ -468,7 +468,7 @@ Both clip at 0.999 rather than 1.000. §7.8 explains why that last detail matter
   identical states — and identical win probabilities — to the *offline* hoopR adapter for the
   same game, including when the feed arrives shuffled. See §3.10.
 
-Current status: 92 tests, all passing, none skipped, about 6 seconds.
+Current status: 101 tests, all passing, none skipped, about 6 seconds.
 
 ### 3.10 The live path (added 2026-09-01)
 
@@ -1242,10 +1242,11 @@ Beating a *broadcast* win probability model and beating a *market* are different
 | `scripts/smoke_live.py` | The eight-step pre-flight check for a live night. |
 | `scripts/replay_server.py` | Serves archived ESPN games back as a live feed, so the deployment can be rehearsed out of season. See §3.10. |
 | `scripts/archive_replay_games.py` | Archives the real ESPN payloads that the replay server serves. |
+| `scripts/serve_viz.py`, `web/index.html` | The viz app: live games and scrubable replays, standard library and one page. |
 | `deploy/` | macOS LaunchAgents, Dockerfile, compose. Same entry point either way. |
 | `src/cbbwp/endgame_sim.py` | The endgame solver and lookup table. A documented diagnostic; **not** wired into `serve.py` — see §7.10. |
 | `registry/endgame/e1/` | The solved table, its manifest and a readable CSV of canonical states. |
-| `tests/` | 92 tests: state rules, feature contract, bulk parity, ESPN-adapter parity, endgame rules, replay harness, the dry-run replay server, monitor statistics, endgame-table structure and the ESPN free-throw labelling convention. |
+| `tests/` | 101 tests: state rules, feature contract, bulk parity, ESPN-adapter parity and play ORDER, endgame rules, replay harness, the dry-run replay server, the viz app's play/probability join, monitor statistics, endgame-table structure and the ESPN free-throw labelling convention. |
 | `registry/v2/` | The pinned model artifact and manifest, stamped with the state-rules version. |
 | `registry/v1/` | The pre-fix model, kept for provenance. Refused at load by current code. |
 | `registry/context_latest.json` | Today's team ratings and season-to-date stats, for live games. |

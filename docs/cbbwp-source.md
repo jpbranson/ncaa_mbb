@@ -1,5 +1,5 @@
 # `cbbwp` source bundle
-Complete source. Regenerated 2026-09-03 14:18 from the `ncaa_mbb` working folder, at commit `571f5ab`.
+Complete source. Regenerated 2026-09-03 14:23 from the `ncaa_mbb` working folder, at commit `0437dbb`.
 
 State rules v2, model v2. This bundle is a mirror for disaster recovery; the folder is the source of truth (it also holds the data, the fitted model and the git history). Regenerate with `python3 scripts/build_source_bundle.py` whenever the source changes.
 
@@ -201,9 +201,10 @@ src/cbbwp/
     hoopr.py       historical parquet -> Events   (offline)
     espn.py        live ESPN feed     -> Events   (live)
 scripts/           the pipeline, the poller, the smoke test, the replay
-                   server, the monitor
+                   server, the viz app, the monitor
+web/               the viz app's single page (no build step, no CDN)
 deploy/            macOS LaunchAgents, Dockerfile, compose
-tests/             92 tests
+tests/             101 tests
 docs/              the project docs, kept alongside the code
 data/, artifacts/, registry/   built locally; not source
 ```

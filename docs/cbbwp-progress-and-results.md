@@ -1,9 +1,11 @@
 # CBB Win Probability — build log and re-entry point
 
-**Last worked: 2026-09-02 (session 5).** The model is **checkpointed at
+**Last worked: 2026-09-03 (session 6).** The model is **checkpointed at
 `registry/v2` and tagged `checkpoint-2026-09-02`** — see `cbbwp-CHECKPOINT.md`.
-Deployment scaffolding is built and tested: `cbbwp-deployment.md` is the run
-book. The **endgame simulator is finished, tested once, and does not ship**
+The model itself has not changed since; session 6 was all live path, and it
+found and fixed a real serving bug (play ordering — see below). Deployment
+scaffolding is built and tested: `cbbwp-deployment.md` is the run book. The
+**endgame simulator is finished, tested once, and does not ship**
 (`cbbwp-endgame-results.md`).
 
 **The live path has now reached ESPN** (2026-09-02) and been rehearsed against a
@@ -21,7 +23,7 @@ provenance where it exists and is deliberately refused at load by current code.
 **Two working copies exist and they have diverged.**
 
 - `~/Downloads/ncaa_mbb` on **cas-w7r21674vv** (this file's copy) — has
-  `registry/v1`, so all 92 tests run with none skipped. Sessions 4 and 5's work
+  `registry/v1`, so all 101 tests run with none skipped. Sessions 4 and 5's work
   was done here.
 - `%USERPROFILE%\Downloads\mbb_prob_claude` on **jpbranson-desk** — session 3's
   bit-identical rebuild. Lacks `registry/v1`, so one test skips there.
@@ -59,7 +61,7 @@ Beats ESPN in every time bucket; the gap is widest in the final minute
   src/cbbwp/             the package
     endgame.py           rule-based clamps applied on the live path
     endgame_sim.py       the endgame solver and lookup (NOT wired into serve.py)
-  scripts/               pipeline, live poller, fixture tools, monitor
+  scripts/               pipeline, live poller, fixture tools, viz app, monitor
     estimate_endgame_params.py       Phase 2, free throws / shots / rebounds
     estimate_endgame_possessions.py  Phase 2, possession outcomes and fouling
     build_endgame_table.py           Phase 3, backward induction + monotonicity
@@ -68,15 +70,18 @@ Beats ESPN in every time bucket; the gap is widest in the final minute
     smoke_live.py                    pre-flight check for a live night
     replay_server.py                 archived games served back as a live feed
     archive_replay_games.py          record the games the replay server serves
+    serve_viz.py                     the viz app (web/index.html is its page)
     serve_live.py                    deployment entry point: poller + API
     rebuild_test_preds.py            float64 predictions from the pinned model
     build_report_data.py             data behind the published artifact
     build_source_bundle.py           regenerates cbbwp-source.md
   deploy/                LaunchAgents, Dockerfile, compose
-  tests/                 92 tests, ~6s
+  tests/                 101 tests, ~6s
   data/raw/              527 MB of hoopR parquet, 10 seasons
   data/proc/             games, team stats, 8.56M state rows
   data/live/             poller output, one JSONL per day
+  data/replay/           dry-run output; replay rows never touch data/live/
+  web/                   the viz app's single page
   registry/v2/           the pinned model + manifest
   registry/endgame/e1/   the endgame table, manifest, readable.csv (unused in serving)
   registry/context_latest.json   ratings snapshot, for live games
@@ -292,9 +297,59 @@ returns 503. Scoped to November–15 April so it does not cry all summer.
 `build_live_context.py`. Rebuilding the snapshot alone only refreshes its
 timestamp.
 
-92 tests, none skipped. `tests/test_live_deployment.py` covers config, the API
+101 tests, none skipped. `tests/test_live_deployment.py` covers config, the API
 and the freshness signal; `tests/test_replay_server.py` covers the dry-run
 simulator.
+
+## Session 6 (2026-09-03) — first real contact with ESPN, and a serving bug
+
+The model is untouched. Everything here is the live path, and it only came to
+light because the path was finally pointed at the real endpoint and then drawn
+on a chart.
+
+**ESPN's edge refuses some user-agents.** `cbbwp/0.2` got 403 on 15/15 requests;
+`cbbwp/0.2 (+https://github.com/jpbranson/ncaa_mbb)` got 200 on 15/15. The 403
+that development read as blocked egress was partly this, and it would have hit
+the Mac in November. Now `CBBWP_USER_AGENT`, defaulted and overridable, with a
+403 raised loudly rather than retried.
+
+**The smoke test was passing on stale and synthetic fixtures.** Step 5 counted
+every payload in the output directory, so an empty offseason slate recorded
+nothing and still went green on the previous day's files. Worse, three of those
+files were payloads *rebuilt from hoopR*, and step 6's whole job — report a play
+type id the model never saw — cannot fail on those, because their type ids came
+from the files the model's type map was built from. Rebuilt payloads are now
+stamped and detected; step 6 reports BLOCKED rather than PASS on them.
+
+**A replay harness** (`scripts/replay_server.py`): archived ESPN games served
+back to the unmodified deployment as a growing live feed, so a live night can be
+rehearsed in September. Two dry runs, seven games, every final score reproduced,
+overtime carried through a third period, and replay rows tagged and diverted so
+they can never contaminate `data/live/`.
+
+**A viz app** (`scripts/serve_viz.py` + `web/index.html`): live games and
+scrubable replays, stepping by *moment* rather than by play, Bootstrap 3 / Shiny
+styling written by hand so it needs no network of its own.
+
+**The serving bug the app exposed.** `events_from_plays` sorted by ESPN's
+`sequenceNumber`. Measured on seven archived games: the raw `plays` array is
+already chronological and already matches hoopR's `game_play_number` — 7/7 —
+while `sequenceNumber` order is chronological 0/7, because the id is only nearly
+monotonic. The sort was taking correct data and shuffling it. Fixed by trusting
+the array; disorder is now reported (`chronological_inversions`) rather than
+repaired. Live states now match hoopR exactly on real payloads, possession
+included.
+
+**Three measurements that lied, and are worth remembering.** The first estimate
+of that bug's impact (26.7 points) compared the two curves by list position,
+where position *i* is a different play in each ordering; matched by identity it
+is 3.6 points, mean under 0.2, finals identical. Step 6's green tick came from
+fixtures cleaner than reality. And diffing the two dry runs suggested 0.239 of
+movement that was entirely poll-sampling noise, demonstrated by reproducing it
+with the ordering held fixed. In each case the easy measurement measured
+something other than what it appeared to.
+
+82 → 101 tests.
 
 ## Next up
 
@@ -308,12 +363,12 @@ simulator.
 3. **Refresh the ratings for the 2027 season** once games start — data first,
    then snapshot (see above), weekly in season. In the preseason it correctly
    falls back to 2026 ratings at 0.70 carryover.
-3. **Investigate the 40–20 minute over-confidence.** That bucket's ECE is 2–3x
+4. **Investigate the 40–20 minute over-confidence.** That bucket's ECE is 2–3x
    every other bucket's, consistently. Likely the shape of the pregame decay
    rather than its strength.
-4. **Fix the late-game home advantage** (EXPLAIN §8.1) — the largest single
+5. **Fix the late-game home advantage** (EXPLAIN §8.1) — the largest single
    accuracy gain available. Mirroring should flip a home-court term, not zero it.
-5. **Foul trouble / lineup state** — reachable from the same feed, unmodelled.
-6. **A licensed spread** would close a ~0.8 point RMSE gap on the pregame term.
-7. *(Optional, and only with a clear hypothesis)* the two routes that might make
+6. **Foul trouble / lineup state** — reachable from the same feed, unmodelled.
+7. **A licensed spread** would close a ~0.8 point RMSE gap on the pregame term.
+8. *(Optional, and only with a clear hypothesis)* the two routes that might make
    the endgame table earn its place, in `cbbwp-endgame-results.md`.

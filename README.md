@@ -171,9 +171,10 @@ src/cbbwp/
     hoopr.py       historical parquet -> Events   (offline)
     espn.py        live ESPN feed     -> Events   (live)
 scripts/           the pipeline, the poller, the smoke test, the replay
-                   server, the monitor
+                   server, the viz app, the monitor
+web/               the viz app's single page (no build step, no CDN)
 deploy/            macOS LaunchAgents, Dockerfile, compose
-tests/             92 tests
+tests/             101 tests
 docs/              the project docs, kept alongside the code
 data/, artifacts/, registry/   built locally; not source
 ```

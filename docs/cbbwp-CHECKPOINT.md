@@ -114,25 +114,28 @@ EXPLAIN §7.7–7.10.
 ## The state this leaves the project in
 
 Ready to deploy. The live path reached the real ESPN endpoint for the first
-time on 2026-09-02: it is reachable, and the adapter parses real payloads
-(539 plays → 539 states, no unknown play types). That run also found that
-ESPN's edge refuses the client's default user-agent with a 403 — fixed, and
-overridable via `CBBWP_USER_AGENT`.
+time on 2026-09-02: it is reachable, and the adapter parses real payloads. On
+seven recorded games — 3,180 plays — every play maps to a type the model was
+trained on, and every payload yields one state per play. (An earlier version of
+this section cited "no unknown play types" from a smoke run whose fixtures were
+rebuilt from hoopR, where that check cannot fail; the figure above is from real
+recordings.) That first run also found that ESPN's edge refuses the client's
+default user-agent with a 403 — fixed, and overridable via `CBBWP_USER_AGENT`.
 
 On 2026-09-03 the deployment was rehearsed against a running clock without
 waiting for the season: `scripts/replay_server.py` serves archived ESPN games
-back as a growing live feed, and an unmodified `serve_live.py` scored six of
-them over real HTTP — 172 states, every final score reproduced, an overtime
-game carried through a third period.
+back as a growing live feed, and an unmodified `serve_live.py` scored them over
+real HTTP. Two runs, six then seven games, every final score reproduced, an
+overtime game carried through a third period, and replay rows tagged and
+diverted so they cannot reach `data/live/`.
 
 **Fixed 2026-09-03**: the ESPN adapter was sorting plays by `sequenceNumber`,
 a nearly-but-not-quite monotonic key, and shuffling a feed that had arrived in
 the correct order. Measured properly (matching plays by identity, not by list
 position) the curve moved by at most 3.6 points and every final probability was
 unchanged; the states themselves, including possession, disagreed with hoopR.
-The feed's array order is now
-authoritative, and live states match hoopR exactly on real payloads. See
-EXPLAIN 8.8b.
+The feed's array order is now authoritative, and live states match hoopR exactly
+on real payloads. See EXPLAIN 8.8b.
 
 **One open item remains**: nothing has run against ESPN *while a real game was
 in progress*. A replay proves the code handles the archive; it cannot prove ESPN
