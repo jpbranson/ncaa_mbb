@@ -150,6 +150,12 @@ class Poller:
                         last["home_team_id"] = header.home_team_id
                         last["away_team_id"] = header.away_team_id
                         last["status"] = header.status
+                        # A simulated row must never be mistakable for a real
+                        # one. The JSONL is the record of truth, and it is
+                        # appended to, so an untagged dry run would leave fake
+                        # states in the durable record permanently.
+                        if self.client.is_replay:
+                            last["replay"] = True
                         self.emit(last, header)
                     secs = last["game_seconds_remaining"]
                 else:

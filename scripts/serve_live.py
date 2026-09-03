@@ -75,6 +75,17 @@ def main() -> int:
     day = a.date or datetime.datetime.now().strftime("%Y%m%d")
     out = cfg.live_dir / f"wp_{day}.jsonl"
 
+    # A dry run against scripts/replay_server.py is a rehearsal, not a night of
+    # basketball. Say so loudly, and default its output somewhere separate, so
+    # simulated states cannot silently accumulate in the real record.
+    client = EspnClient()
+    if client.is_replay:
+        if cfg.live_dir == pathlib.Path(cfg.root) / "data" / "live":
+            out = pathlib.Path(cfg.root) / "data" / "replay" / f"wp_{day}.jsonl"
+        print(f"\n*** REPLAY MODE -- reading {client.base_url}, NOT ESPN.\n"
+              f"*** Rows are tagged \"replay\": true and written to {out}\n",
+              flush=True)
+
     store = LiveStore(history=cfg.api_history)
     httpd = None
     if not a.no_api:
@@ -88,7 +99,7 @@ def main() -> int:
             lambda: ctx.data_is_stale)
         print(f"api listening on http://{cfg.api_host}:{cfg.api_port}", flush=True)
 
-    poller = Poller(svc, ctx, EspnClient(), out, quiet=a.quiet,
+    poller = Poller(svc, ctx, client, out, quiet=a.quiet,
                     fixture_dir=cfg.fixture_dir, sink=store.update)
 
     loop = asyncio.new_event_loop()

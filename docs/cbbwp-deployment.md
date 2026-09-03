@@ -18,10 +18,16 @@ Validated on 2026-09-02, on a machine with open egress:
 - The offline suite, the model artifact, the ratings snapshot and the HTTP API
   all pass.
 
-Still open: **nothing has been run against a game with a running clock.** The
-2026-09-02 run was in the offseason, so the parse checks used payloads recorded
-from finished games. Re-run the smoke test on a night with games before treating
-the live path as fully proven.
+Still open until the season starts: **nothing has been run against ESPN while a
+real game was in progress.** The 2026-09-02 run was in the offseason, so the
+parse checks used payloads from finished games.
+
+What *has* now been rehearsed, on 2026-09-03, is the running-clock behaviour
+itself — against archived games replayed back through the real network path.
+See "Dry run" below. That covers the growing plays array, the status
+transitions and the endgame cadence; it cannot tell you ESPN has not changed
+the feed since the archive was taken. Re-run `smoke_live.py` on a night with
+games before treating the live path as fully proven.
 
 ```bash
 python3 scripts/smoke_live.py
@@ -98,6 +104,48 @@ what hid this rule for a whole build cycle.
    path and refuses to install if that interpreter cannot import `lightgbm`,
    `polars` and `numpy`. A missing dependency should stop the install, not the
    first tip-off of the season.
+
+## Dry run: replay real games as if they were live
+
+The live path spent its whole life being fed *finished* games — a complete
+`plays` array arriving at once with `STATUS_FINAL` on it. A real night looks
+nothing like that: the array grows between polls, the status starts scheduled,
+and the clock runs. `scripts/replay_server.py` closes that gap without waiting
+for November.
+
+It speaks ESPN's protocol — the same two endpoints, the same JSON — and serves
+archived games truncated to the plays that would have happened by now. Point the
+real deployment at it and nothing in the stack knows the difference:
+
+```bash
+python3 scripts/archive_replay_games.py       # once; needs network
+python3 scripts/replay_server.py --speed 5    # terminal 1
+CBBWP_ESPN_BASE=http://127.0.0.1:8899 CBBWP_API_PORT=8810 \
+    python3 scripts/serve_live.py             # terminal 2
+```
+
+`CBBWP_ESPN_BASE` is the only hook this needs, and it is the reason to prefer
+this over `--fixture-dir`: the poller uses its real `EspnClient`, over real
+HTTP, with its real error backoff. A fixture directory skips all of that.
+
+Useful flags: `--speed` (game seconds per real second; 5 puts a 40-minute game
+in 8 minutes), `--stagger` (tip games apart, to exercise discovery mid-slate),
+`--flaky 0.1` (fail one request in ten, deterministically, to exercise backoff),
+`--game` (replay one game).
+
+**Replay output is tagged and diverted.** Every emitted row carries
+`"replay": true`, and output goes to `data/replay/` rather than `data/live/`.
+The JSONL is the record of truth and it is *appended* to, so an untagged dry run
+would leave simulated states in the durable record permanently.
+
+What a replay does **not** cover, so it is never mistaken for validation:
+
+- ESPN's retroactive corrections — a play inserted, rescored or deleted minutes
+  later. The poller is immune by design (it replays the whole game each poll),
+  and this does not exercise that.
+- Anything about today's feed. A replay proves the code handles the archive; it
+  cannot prove ESPN still sends that shape.
+- Rate limiting and real-world 403s, unless you ask for them with `--flaky`.
 
 Step 6 is the one to read carefully: it reports **play type ids the model has
 never seen**. A frequent unknown id means ESPN changed the feed, and the honest

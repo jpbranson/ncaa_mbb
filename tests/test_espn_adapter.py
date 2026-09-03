@@ -226,3 +226,22 @@ def test_user_agent_is_overridable_by_environment(monkeypatch):
     assert EspnClient(user_agent="explicit/1").user_agent == "explicit/1"
     monkeypatch.delenv("CBBWP_USER_AGENT")
     assert EspnClient().user_agent == DEFAULT_USER_AGENT
+
+
+def test_the_client_points_at_espn_unless_told_otherwise(monkeypatch):
+    """The replay hook must never become the default.
+
+    `CBBWP_ESPN_BASE` exists so scripts/replay_server.py can stand in for ESPN
+    during a dry run. A default pointing anywhere else would mean a live night
+    silently scoring simulated games.
+    """
+    from cbbwp.adapters.espn import SITE_API, EspnClient
+    monkeypatch.delenv("CBBWP_ESPN_BASE", raising=False)
+    c = EspnClient()
+    assert c.base_url == SITE_API
+    assert c.is_replay is False
+
+    monkeypatch.setenv("CBBWP_ESPN_BASE", "http://127.0.0.1:8899/")
+    r = EspnClient()
+    assert r.base_url == "http://127.0.0.1:8899"      # trailing slash trimmed
+    assert r.is_replay is True

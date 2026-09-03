@@ -37,6 +37,12 @@ SITE_API = "https://site.api.espn.com/apis/site/v2/sports/basketball/mens-colleg
 SCOREBOARD_URL = SITE_API + "/scoreboard"
 SUMMARY_URL = SITE_API + "/summary"
 
+# Point the client somewhere other than ESPN. The only intended use is
+# scripts/replay_server.py, which speaks ESPN's protocol back to the unmodified
+# deployed stack so a dry run exercises the real network path rather than a
+# fixture shortcut. Unset in production; there is no default but ESPN.
+ESPN_BASE_ENV = "CBBWP_ESPN_BASE"
+
 # ESPN's edge rejects bare short user-agents ("cbbwp/0.2") and browser-claiming
 # ones sent without a browser's other headers -- both return 403, deterministically
 # (15/15 on 2026-09-02, on both the scoreboard and summary endpoints). A client
@@ -243,10 +249,24 @@ class EspnClient:
     which keeps the asyncio loop free of a third-party HTTP dependency.
     """
 
-    def __init__(self, timeout: float = 10.0, user_agent: str | None = None):
+    def __init__(self, timeout: float = 10.0, user_agent: str | None = None,
+                 base_url: str | None = None):
         self.timeout = timeout
         self.user_agent = user_agent or os.environ.get(
             "CBBWP_USER_AGENT", DEFAULT_USER_AGENT)
+        # Read per instance, not at import, so a replay run is one env var and
+        # needs no reload of an already-imported module.
+        self.base_url = (base_url or os.environ.get(ESPN_BASE_ENV)
+                         or SITE_API).rstrip("/")
+
+    @property
+    def is_replay(self) -> bool:
+        """True when pointed at something other than ESPN itself.
+
+        Anything that reports a dry run should say so with this, so a replay is
+        never mistaken for a night of real games in a log or a smoke result.
+        """
+        return self.base_url != SITE_API
 
     def _get(self, url: str, params: dict | None = None) -> dict:
         if params:
@@ -269,8 +289,8 @@ class EspnClient:
     def scoreboard(self, date: str | None = None, groups: str = "50",
                    limit: int = 500) -> dict:
         """`date` is YYYYMMDD. groups=50 is Division I."""
-        return self._get(SCOREBOARD_URL,
+        return self._get(self.base_url + "/scoreboard",
                          {"dates": date, "groups": groups, "limit": limit})
 
     def summary(self, event_id: int | str) -> dict:
-        return self._get(SUMMARY_URL, {"event": event_id})
+        return self._get(self.base_url + "/summary", {"event": event_id})
