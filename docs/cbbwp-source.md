@@ -1,5 +1,5 @@
 # `cbbwp` source bundle
-Complete source. Regenerated 2026-09-03 13:39 from the `ncaa_mbb` working folder, at commit `76eacc1`.
+Complete source. Regenerated 2026-09-03 13:51 from the `ncaa_mbb` working folder, at commit `423f8cf`.
 
 State rules v2, model v2. This bundle is a mirror for disaster recovery; the folder is the source of truth (it also holds the data, the fitted model and the git history). Regenerate with `python3 scripts/build_source_bundle.py` whenever the source changes.
 
@@ -111,10 +111,16 @@ growing feed, a running clock, real status transitions. Replay rows are tagged
 python3 scripts/serve_viz.py              # then open http://127.0.0.1:8811
 ```
 
-A small web app, standard library and one HTML file — no build step, no CDN. Two
-tabs: **Live** draws whatever `serve_live.py` is tracking; **Replay** loads any
-past game and gives you play/pause, speed, step forward and back, and a
-scrubber. Any ESPN game id can be fetched and archived from the app itself.
+A small web app, standard library and one HTML file — no build step, no CDN,
+Bootstrap 3 / Shiny styling written by hand. Two tabs: **Live** draws whatever
+`serve_live.py` is tracking; **Replay** loads any past game and gives you
+play/pause, speed, step forward and back, and a scrubber. Any ESPN game id can
+be fetched and archived from the app itself.
+
+Stepping moves by *moment* rather than by play: the clock stops, so fouls, free
+throws and substitutions share a timestamp, and one game's 482 plays are only
+255 moments. Plays at the same clock are shown together, each keeping its own
+probability.
 
 Replay is precomputed rather than streamed: `score_game` replays a whole game in
 milliseconds, so the browser scrubs an array and stepping backward is exact —

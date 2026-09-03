@@ -162,6 +162,19 @@ look at the live feed.
 | **Live** | whatever `serve_live.py` is tracking, polled every 5s. Click a game for its win-probability curve so far, built from the poller's own history — one point per poll, which is the honest picture of what was known at each moment. |
 | **Replay** | any archived game, with play/pause, speed (1× to 240×), step forward and back, and a scrubber. Type any ESPN game id to fetch and archive it. |
 
+Stepping moves by **moment**, not by play. The clock stops, and ESPN emits
+every foul, free throw and substitution at the same displayed time — one
+archived game is 482 plays but only 255 distinct moments, with clusters as
+long as 14. Plays sharing a period and clock are shown together, each keeping
+its own probability, so a free-throw trip shows which shot moved the number
+and which substitutions did not. Only *consecutive* plays are merged: the feed
+is not always chronological (EXPLAIN 8.8b), and merging non-adjacent plays
+that happen to share a clock would silently reorder the game.
+
+The look is Bootstrap 3 / Shiny default, hand-written rather than pulled from a
+CDN, for the same reason as everything else here: it has to work on a laptop
+with no network.
+
 Replay is precomputed, not streamed. `replay_server.py` runs a wall clock
 forwards for the *poller*; this runs `score_game` once and lets the browser
 scrub the result, so stepping backward is exact rather than re-derived. Nothing
