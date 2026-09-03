@@ -13,8 +13,8 @@ count as an improvement. If you come back to this in a year, start here.*
 | Features | 11, order is part of the contract |
 | Trained on | 2016–2023 · calibrated 2024 · tested 2025–2026 |
 | Endgame table | `registry/endgame/e1`, sha `5ee6ed660768e3ba` — **built, not served** |
-| Tests | 82 passing, none skipped, ~6s |
-| Python | ≥ 3.10 (built and tested on 3.10.12) |
+| Tests | 82 at the tag; 110 now, after session 6 and 7's live-path and viz tests. None skipped, ~6s |
+| Python | ≥ 3.10 (checkpoint built on 3.10.12; the suite also passes on 3.14) |
 | Prior model | `registry/v1`, sha `aaddca0d81606bc0`, state rules v1, deliberately refused at load |
 
 ## What it scores
@@ -70,7 +70,8 @@ changing only the weighting moves the headline by 17%.
 `scripts/build_source_bundle.py`. With it plus the public data:
 
 ```bash
-pip3 install --break-system-packages polars pyarrow lightgbm scikit-learn pytest numpy
+python3 -m venv .venv && source .venv/bin/activate
+pip install polars pyarrow lightgbm scikit-learn pytest numpy certifi
 python3 scripts/fetch_data.py        # ~527 MB
 python3 scripts/build_games.py
 python3 scripts/build_team_stats.py
@@ -105,11 +106,11 @@ each was declined against a bar set **before** the result was known.
 |---|---|
 | Post-hoc calibrator | Cost 0.0008 log loss and raised ECE. Residual bias is smaller than season-to-season noise. Diagnostic kept in `scripts/calibrate_and_eval.py`. |
 | Endgame overrides beyond the rule clamps | ~0.2% of feeds contradict themselves; overrides lose ~0.0002 to it. The mathematical clamps *are* live, at 0.999. |
-| Endgame simulator and lookup table | 0.40% log-loss gain against a pre-registered 1% bar. Passed the other four criteria. `registry/endgame/e1`, EXPLAIN §7.10. |
+| Endgame simulator and lookup table | 0.40% log-loss gain against a pre-registered 1% bar. Passed the other four criteria. `registry/endgame/e1`, EXPLAIN §7.14. |
 
 Do not rebuild any of these expecting a different answer without changing
 something structural first — the reasons are in `cbbwp-endgame-results.md` and
-EXPLAIN §7.7–7.10.
+EXPLAIN §7.7–7.9 and §7.14.
 
 ## The state this leaves the project in
 

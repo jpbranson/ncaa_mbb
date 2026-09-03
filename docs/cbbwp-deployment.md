@@ -164,12 +164,22 @@ look at the live feed.
 
 Stepping moves by **moment**, not by play. The clock stops, and ESPN emits
 every foul, free throw and substitution at the same displayed time — one
-archived game is 482 plays but only 255 distinct moments, with clusters as
+archived game is 482 plays but only 247 distinct moments, with clusters as
 long as 14. Plays sharing a period and clock are shown together, each keeping
 its own probability, so a free-throw trip shows which shot moved the number
-and which substitutions did not. Only *consecutive* plays are merged: the feed
-is not always chronological (EXPLAIN 8.8b), and merging non-adjacent plays
-that happen to share a clock would silently reorder the game.
+and which substitutions did not. Only *consecutive* plays are merged, so
+merging never hides that something else happened in between.
+
+Moments are then stepped in **game-clock order**, whatever order the feed
+supplied them in. Every real payload measured has been chronological (EXPLAIN
+8.8b), but this page is where a disordered one would show, as a playhead that
+jumps forward and then back — and the clock is the axis the reader is
+watching. The numbers do not change: each probability is still the one the
+model produced walking the feed in the feed's own order, each play's change is
+measured against the play the model saw just before it, and a moment the feed
+delivered out of clock order carries a warning saying where it actually sat.
+`tests/test_viz.py` runs the page's own moment builder under node on a
+deliberately disordered feed to hold this.
 
 The look is Bootstrap 3 / Shiny default, hand-written rather than pulled from a
 CDN, for the same reason as everything else here: it has to work on a laptop
@@ -397,6 +407,8 @@ Every setting is an environment variable with a working default, so a bare
 | `CBBWP_API_HISTORY` | `240` | states kept per game in memory |
 | `CBBWP_RATINGS_MAX_AGE` | `3` | days before the snapshot file is called stale |
 | `CBBWP_FIXTURE_DIR` | unset | replay from disk instead of the network |
+| `CBBWP_ESPN_BASE` | ESPN's own host | point the poller at `replay_server.py` instead |
+| `CBBWP_USER_AGENT` | `cbbwp/0.2 (+https://github.com/jpbranson/ncaa_mbb)` | see the 403 note above |
 
 Every entry point prints its resolved settings at startup, and names which came
 from the environment. A service quietly reading the wrong directory is the
@@ -440,6 +452,6 @@ back on its own; the JSONL will show the gap.
   the shape of the pregame decay rather than its strength.
 - **Late-game home advantage** is zeroed by the symmetry mirroring rather than
   flipped (EXPLAIN §8.1) — the largest single accuracy gain available.
-- **The endgame table is built, tested and not wired in** (EXPLAIN §7.10). It
+- **The endgame table is built, tested and not wired in** (EXPLAIN §7.14). It
   missed its pre-registered bar at 0.40% against 1%.
 - **No auth on the API**, by design. Do not expose it without a proxy.

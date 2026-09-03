@@ -1,7 +1,7 @@
 # EXPLAIN.md — how the win probability model works, and why every choice was made
 
 *Written for someone who has to stand up and explain this, and answer questions about it.*
-Last updated: 2026-09-01 (evening) · Model version `v2` (`registry/v2`, sha `2d4bf58134fa2e64`)
+Last updated: 2026-09-03 · Model version `v2` (`registry/v2`, sha `2d4bf58134fa2e64`)
 
 ---
 
@@ -154,7 +154,7 @@ about all of them.
 
 **Expected calibration error (ECE)** — calibration as a single number. Sort predictions into
 20 buckets, compare each bucket's average prediction to what actually happened, average the
-gaps (weighted by bucket size). Ours: 0.0028, i.e. about a quarter of a percentage point off
+gaps (weighted by bucket size). Ours: 0.0026, i.e. about a quarter of a percentage point off
 on average. ESPN's: 0.0069.
 
 **Isotonic regression** — a way to *fix* calibration after the fact. It fits a flexible,
@@ -187,9 +187,9 @@ show it. This is the single most common way sports models break. Our defence is 
 same output, every time, with no hidden memory of what it did before. The state builder is
 written as one, deliberately (§3.2).
 
-**Monte Carlo simulation** — simulate a random process thousands of times and count how
-often each outcome happens. Not currently used; it is the proposed approach for the last 60
-seconds (§10).
+**Backward induction** — solve a game from its end backwards: the value of each state is
+the best of what the states it leads to are worth. Used to build the endgame table (§7.14),
+which was measured and not shipped.
 
 ---
 
@@ -215,7 +215,7 @@ seconds (§10).
      logistic baseline + LightGBM, split by season
                     │
             publish_model.py
-        pinned artifact in registry/v1
+        pinned artifact in registry/v2
                     │
                 serve.py
        SAME state + feature builders, live
@@ -278,7 +278,7 @@ a duplicate event arrives. Rather than write code that tries to patch a running 
 made the builder stateless: hand it every event, get every snapshot. Handling a correction is
 then just *re-run the game from event zero*, which takes milliseconds.
 
-This is tested directly: `test_replay_is_order_independent` shuffles the events and requires
+This is tested directly: `test_replay_is_order_independent` reverses the events and requires
 identical output, and the replay harness (§3.9) feeds a game in irregular chunks and requires
 bit-identical agreement.
 
@@ -418,9 +418,9 @@ Trained on log loss. **No class rebalancing and no sample weighting** — those 
 probabilities, and honest probabilities are the entire product.
 
 All random seeds are pinned (`seed=20260831`, `deterministic=True`), so refitting reproduces
-the shipped artifact exactly rather than approximately. The fitted model itself is not stored
-in the project docs — it is 2.7 MB of text — so the seed pinning is what makes `registry/v1`
-recoverable. It now also lives on disk in this folder.
+the shipped artifact exactly rather than approximately. The fitted model is 2.6 MB of text and
+is not in the project docs, so the seed pinning is what makes `registry/v2` reproducible. A
+rebuild on a second machine matched it byte for byte.
 
 ### 3.7 Calibration — and why there isn't any
 
@@ -447,7 +447,7 @@ Both clip at 0.999 rather than 1.000. §7.8 explains why that last detail matter
 
 `src/cbbwp/serve.py` is deliberately thin. It:
 
-- loads a **pinned** model artifact from `registry/v1` — an immutable directory with a
+- loads a **pinned** model artifact from `registry/v2` — an immutable directory with a
   manifest recording the version, the exact feature list, a content hash, and the seasons it
   was trained on;
 - **refuses to start** if the feature list in the manifest doesn't match the feature list the
@@ -466,9 +466,9 @@ Both clip at 0.999 rather than 1.000. §7.8 explains why that last detail matter
   row-for-row with the canonical state builder.
 - **Adapter parity**, `tests/test_espn_adapter.py`. The *live* ESPN adapter must produce
   identical states — and identical win probabilities — to the *offline* hoopR adapter for the
-  same game, including when the feed arrives shuffled. See §3.10.
+  same game, in the feed's own array order. See §3.10.
 
-Current status: 101 tests, all passing, none skipped, about 6 seconds.
+Current status: 110 tests, all passing, none skipped, about 6 seconds.
 
 ### 3.10 The live path (added 2026-09-01)
 
@@ -486,9 +486,10 @@ objects the historical adapter emits. Three details carry the weight:
   removed entirely — possession now keys on the feed's scoring/shooting flags (§8.2), so a
   future ESPN rename cannot reintroduce the failure. The map survives for every *other*
   rule, where the trained-on text is still what matters.
-- **Plays are ordered by `sequenceNumber` and renumbered 1..N**, exactly as hoopR's
-  `game_play_number` is dense and 1-based. The live feed does not promise ordered plays; the
-  adapter sorts, and the parity test shuffles the payload on purpose to prove it.
+- **Plays are taken in the feed's array order and renumbered 1..N**, exactly as hoopR's
+  `game_play_number` is dense and 1-based. The adapter used to sort by `sequenceNumber`, which
+  is only nearly monotonic; that shuffled correctly ordered feeds and was fixed on 2026-09-03
+  (§8.8b). Disorder in the feed is now reported, not repaired.
 
 **`src/cbbwp/live_context.py`** solves the problem that a game which has not been played has
 no row in `games.parquet`. `scripts/build_live_context.py` snapshots today's team ratings
@@ -607,9 +608,9 @@ two minutes, which is a small slice of the rows. Possession is worth 2.8 percent
 a tied game with 20 minutes left and **12 points with 10 seconds left** (§5.1). That is a
 large effect confined to a small region, which is exactly what a whole-dataset average hides.
 
-They stay in for three reasons: they cost nothing, they are needed for the endgame simulator
-that comes next, and removing them would make the final-minute numbers worse in precisely the
-place people scrutinise hardest.
+They stay in for three reasons: they cost nothing, the endgame table (§7.14) runs on them, and
+removing them would make the final-minute numbers worse in precisely the place people
+scrutinise hardest.
 
 ---
 
@@ -876,7 +877,7 @@ and it is easy to mistake one for the other.
 
 ---
 
-### 7.10 Build the endgame simulator, then decline to ship it
+### 7.14 Build the endgame simulator, then decline to ship it
 
 The plan (§4.4 option 2) called for explicitly simulating the last 60 seconds and blending
 that with the model. It was built, in full, and it is **not in the serving path**.
@@ -945,7 +946,7 @@ advantage. But one exists: home teams shoot free throws better in front of their
 and foul calls skew slightly.
 
 **Scale of the problem:** it is confined to close, late states. Global calibration error is
-still 0.0028. But it is precisely the situation people watch most closely, and the direction is
+still 0.0026. But it is precisely the situation people watch most closely, and the direction is
 consistent across every slice we checked.
 
 **Fix:** add a non-decaying home-court term that mirroring leaves alone (mirroring should flip
@@ -1034,6 +1035,27 @@ face, and it visibly hedges on blowouts — where it says 3.4% the true rate is 
 our edge is simply being willing to be more confident where the data supports it. That is a
 legitimate win, not a trick, but it is the honest characterisation.
 
+### 8.8 The live adapter has not seen ESPN during a real game
+Corrected twice, and the caveat is now much narrower than it started.
+
+2026-09-02: the adapter read the real endpoint and parsed real payloads (§3.10), retiring
+"never touched ESPN". 2026-09-03: the growing-feed case — a partial plays array between polls,
+a status that is neither scheduled nor final — was rehearsed by replaying archived games back
+to the unmodified deployment over real HTTP (`scripts/replay_server.py`). Six games, 172
+states, every final score reproduced, one of them through overtime.
+
+What is left is the part a rehearsal cannot reach: **ESPN itself, tonight.** A replay proves
+the code handles the archive. It cannot prove ESPN has not changed the feed since, and it does
+not exercise ESPN's retroactive corrections — a play inserted, rescored or deleted minutes
+later. The poller is immune to those by construction (it re-scores the whole game every poll),
+which is the argument for why that gap is small, not evidence that it is closed.
+
+That first run also found something the old caveat was hiding. The 403 everyone read as
+blocked egress was partly ESPN's edge refusing the client's own user-agent, which would have
+hit the Mac in November with no sandbox to blame. See `cbbwp-deployment.md`. The general
+lesson is the one worth keeping: an environmental excuse for a failure is a hypothesis, not
+a diagnosis, and it stops being tested the moment it sounds sufficient.
+
 ### 8.8b The adapter was re-sorting a correctly ordered feed (found and fixed 2026-09-03)
 
 Found while building `scripts/serve_viz.py`: a chart makes an ordering problem
@@ -1102,27 +1124,6 @@ ESPN payloads are now identical to states built from hoopR — seq, period,
 inversions. That is the train/serve invariant this project rests on, holding on
 real feed data rather than on reconstructions of it.
 
-### 8.8 The live adapter has not seen ESPN during a real game
-Corrected twice, and the caveat is now much narrower than it started.
-
-2026-09-02: the adapter read the real endpoint and parsed real payloads (§3.10), retiring
-"never touched ESPN". 2026-09-03: the growing-feed case — a partial plays array between polls,
-a status that is neither scheduled nor final — was rehearsed by replaying archived games back
-to the unmodified deployment over real HTTP (`scripts/replay_server.py`). Six games, 172
-states, every final score reproduced, one of them through overtime.
-
-What is left is the part a rehearsal cannot reach: **ESPN itself, tonight.** A replay proves
-the code handles the archive. It cannot prove ESPN has not changed the feed since, and it does
-not exercise ESPN's retroactive corrections — a play inserted, rescored or deleted minutes
-later. The poller is immune to those by construction (it re-scores the whole game every poll),
-which is the argument for why that gap is small, not evidence that it is closed.
-
-That first run also found something the old caveat was hiding. The 403 everyone read as
-blocked egress was partly ESPN's edge refusing the client's own user-agent, which would have
-hit the Mac in November with no sandbox to blame. See `cbbwp-deployment.md`. The general
-lesson is the one worth keeping: an environmental excuse for a failure is a hypothesis, not
-a diagnosis, and it stops being tested the moment it sounds sufficient.
-
 ---
 
 ## 9. Questions you will get, and answers
@@ -1190,8 +1191,8 @@ The weekly monitor (§3.11), which checks whether stated probabilities still mat
 outcomes by decile within each time bucket. Log loss would not tell you — that is the point.
 
 **"What would make it meaningfully better?"**
-In order: fixing the late-game home advantage (§8.1), a possession-level endgame simulator for
-the last 60 seconds, foul trouble and lineup state, and a licensed betting line.
+In order: fixing the late-game home advantage (§8.1), foul trouble and lineup state, and a
+licensed betting line. An endgame simulator was built and did not clear its bar (§7.14).
 
 **"Can this be used for betting?"**
 Nothing here was built or validated for that. It is not benchmarked against closing lines for
@@ -1202,20 +1203,18 @@ Beating a *broadcast* win probability model and beating a *market* are different
 
 ## 10. What is not built yet
 
-1. **A live smoke test against the real ESPN endpoint.** The adapter, the poller and the
-   context provider are written and tested offline; nothing has touched the live feed,
-   because both sandboxes are blocked from it. Two commands on a networked machine close
-   this (§3.10).
-2. **Possession-level endgame simulator.** For the final 60 seconds, explicitly simulate the
-   remaining possessions — intentional fouling, free-throw percentages, three-point attempts
-   — thousands of times and count how often each team wins. Encoding the rules beats learning
-   them from sparse data. Blend it with the model output, weighting the simulator to 100% by
-   0:00.
-3. **The late-game home advantage fix** (§8.1). The largest single accuracy gain available.
-4. **Foul trouble and lineup state.** Whether a team's best player is on the bench with four
+1. **A live night.** The adapter reaches ESPN and parses real payloads, and the deployment
+   has been rehearsed against archived games on a running clock (§8.8). Nothing has run
+   against ESPN while a game was in progress. `scripts/smoke_live.py` must exit 0 on a night
+   with games.
+2. **The late-game home advantage fix** (§8.1). The largest single accuracy gain available.
+3. **Foul trouble and lineup state.** Whether a team's best player is on the bench with four
    fouls. Reachable from the same feed.
-5. **A graceful fallback** for games with no play-by-play — score and clock only.
-6. **A licensed feed**, if this ever leaves internal use (§8.6).
+4. **A graceful fallback** for games with no play-by-play — score and clock only.
+5. **A licensed feed**, if this ever leaves internal use (§8.6).
+
+The endgame simulator is not on this list: it was built, measured against a bar set in
+advance, and declined (§7.14).
 
 ---
 
@@ -1242,11 +1241,11 @@ Beating a *broadcast* win probability model and beating a *market* are different
 | `scripts/smoke_live.py` | The eight-step pre-flight check for a live night. |
 | `scripts/replay_server.py` | Serves archived ESPN games back as a live feed, so the deployment can be rehearsed out of season. See §3.10. |
 | `scripts/archive_replay_games.py` | Archives the real ESPN payloads that the replay server serves. |
-| `scripts/serve_viz.py`, `web/index.html` | The viz app: live games and scrubable replays, standard library and one page. |
+| `scripts/serve_viz.py`, `web/index.html` | The viz app: live games and scrubable replays, standard library and one page. Steps in game-clock order. |
 | `deploy/` | macOS LaunchAgents, Dockerfile, compose. Same entry point either way. |
-| `src/cbbwp/endgame_sim.py` | The endgame solver and lookup table. A documented diagnostic; **not** wired into `serve.py` — see §7.10. |
+| `src/cbbwp/endgame_sim.py` | The endgame solver and lookup table. A documented diagnostic; **not** wired into `serve.py` — see §7.14. |
 | `registry/endgame/e1/` | The solved table, its manifest and a readable CSV of canonical states. |
-| `tests/` | 101 tests: state rules, feature contract, bulk parity, ESPN-adapter parity and play ORDER, endgame rules, replay harness, the dry-run replay server, the viz app's play/probability join, monitor statistics, endgame-table structure and the ESPN free-throw labelling convention. |
+| `tests/` | 110 tests: state rules, feature contract, bulk parity, ESPN-adapter parity and play order, endgame rules, replay harness, the dry-run replay server, the viz app's play/probability join and stepping order, monitor statistics, endgame-table structure and the ESPN free-throw labelling convention. |
 | `registry/v2/` | The pinned model artifact and manifest, stamped with the state-rules version. |
 | `registry/v1/` | The pre-fix model, kept for provenance. Refused at load by current code. |
 | `registry/context_latest.json` | Today's team ratings and season-to-date stats, for live games. |

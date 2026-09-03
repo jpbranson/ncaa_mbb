@@ -21,17 +21,20 @@ Repository: https://github.com/jpbranson/ncaa_mbb
 
 ## Setup
 
+Use a virtualenv; `lightgbm` and `pytest` are not on the system interpreter.
+
 ```bash
-pip3 install --break-system-packages polars pyarrow lightgbm scikit-learn pytest numpy
+python3 -m venv .venv && source .venv/bin/activate
+pip install polars pyarrow lightgbm scikit-learn pytest numpy certifi
 ```
 
 ## Rebuild everything from scratch
 
 ```bash
-python3 scripts/fetch_data.py          # ~540 MB of hoopR parquet, ~1 min
+python3 scripts/fetch_data.py          # ~527 MB of hoopR parquet, ~1 min
 python3 scripts/build_games.py         # results + as-of pregame ratings
 python3 scripts/build_team_stats.py    # as-of FT% and pace
-python3 scripts/build_dataset.py       # replay -> 8.5M state rows + features
+python3 scripts/build_dataset.py       # replay -> 8.6M state rows + features
 python3 scripts/fit_models.py          # logistic + LightGBM  (needs ~6 GB RAM)
 python3 scripts/publish_model.py v2    # pinned registry artifact
 python3 scripts/evaluate.py            # metrics by time bucket vs ESPN
@@ -89,8 +92,9 @@ be fetched and archived from the app itself.
 
 Stepping moves by *moment* rather than by play: the clock stops, so fouls, free
 throws and substitutions share a timestamp, and one game's 482 plays are only
-255 moments. Plays at the same clock are shown together, each keeping its own
-probability.
+247 moments. Plays at the same clock are shown together, each keeping its own
+probability. Moments are stepped in game-clock order, so the playhead never
+runs backwards even if a feed arrives disordered.
 
 Replay is precomputed rather than streamed: `score_game` replays a whole game in
 milliseconds, so the browser scrubs an array and stepping backward is exact —
@@ -162,7 +166,7 @@ src/cbbwp/
   serve.py         WinProbabilityService; refuses to start on a contract mismatch
   live_context.py  pregame context for a game that has not been played yet
   endgame.py       rule-based clamps the data cannot teach efficiently (live)
-  endgame_sim.py   the endgame lookup table (diagnostic only — see EXPLAIN 7.10)
+  endgame_sim.py   the endgame lookup table (diagnostic only — see EXPLAIN 7.14)
   calibration.py   time-bucketed isotonic (diagnostic only — see EXPLAIN 7.7)
   monitor.py       calibration drift statistics
   config.py        deployment settings, from the environment
@@ -174,7 +178,7 @@ scripts/           the pipeline, the poller, the smoke test, the replay
                    server, the viz app, the monitor
 web/               the viz app's single page (no build step, no CDN)
 deploy/            macOS LaunchAgents, Dockerfile, compose
-tests/             101 tests
+tests/             110 tests
 docs/              the project docs, kept alongside the code
 data/, artifacts/, registry/   built locally; not source
 ```
@@ -188,7 +192,7 @@ and features. Two tests enforce it:
   row-for-row with the canonical state builder on real games.
 - `tests/test_espn_adapter.py` — the **live** ESPN adapter must produce
   byte-identical states and win probabilities to the **offline** hoopR adapter
-  for the same game, including when the feed arrives shuffled.
+  for the same game, in the feed's own array order (EXPLAIN 8.8b).
 
 `tests/test_replay_harness.py` adds the third: a finished game fed through the
 live path in irregular chunks must match the offline answer exactly.

@@ -1,6 +1,6 @@
 # CBB Win Probability — build log and re-entry point
 
-**Last worked: 2026-09-03 (session 6).** The model is **checkpointed at
+**Last worked: 2026-09-03 (session 7).** The model is **checkpointed at
 `registry/v2` and tagged `checkpoint-2026-09-02`** — see `cbbwp-CHECKPOINT.md`.
 The model itself has not changed since; session 6 was all live path, and it
 found and fixed a real serving bug (play ordering — see below). Deployment
@@ -23,7 +23,7 @@ provenance where it exists and is deliberately refused at load by current code.
 **Two working copies exist and they have diverged.**
 
 - `~/Downloads/ncaa_mbb` on **cas-w7r21674vv** (this file's copy) — has
-  `registry/v1`, so all 101 tests run with none skipped. Sessions 4 and 5's work
+  `registry/v1`, so all 110 tests run with none skipped. Sessions 4 and 5's work
   was done here.
 - `%USERPROFILE%\Downloads\mbb_prob_claude` on **jpbranson-desk** — session 3's
   bit-identical rebuild. Lacks `registry/v1`, so one test skips there.
@@ -57,7 +57,7 @@ Beats ESPN in every time bucket; the gap is widest in the final minute
 
 ```
   README.md              setup, run order, layout, the parity tests
-  docs/                  README-docs.md points at the project docs
+  docs/                  README.md says which doc to read for what
   src/cbbwp/             the package
     endgame.py           rule-based clamps applied on the live path
     endgame_sim.py       the endgame solver and lookup (NOT wired into serve.py)
@@ -76,7 +76,7 @@ Beats ESPN in every time bucket; the gap is widest in the final minute
     build_report_data.py             data behind the published artifact
     build_source_bundle.py           regenerates cbbwp-source.md
   deploy/                LaunchAgents, Dockerfile, compose
-  tests/                 101 tests, ~6s
+  tests/                 110 tests, ~6s
   data/raw/              527 MB of hoopR parquet, 10 seasons
   data/proc/             games, team stats, 8.56M state rows
   data/live/             poller output, one JSONL per day
@@ -98,7 +98,8 @@ not working files. `scripts/evaluate.py` regenerates every number in them.
 The folder is rebuilt from `cbbwp-source.md` (the full source bundle) plus:
 
 ```bash
-pip3 install --break-system-packages polars pyarrow lightgbm scikit-learn pytest numpy
+python3 -m venv .venv && source .venv/bin/activate
+pip install polars pyarrow lightgbm scikit-learn pytest numpy certifi
 python3 scripts/fetch_data.py     # ~527 MB, about a minute
 python3 scripts/build_games.py
 python3 scripts/build_team_stats.py
@@ -350,6 +351,25 @@ with the ordering held fixed. In each case the easy measurement measured
 something other than what it appeared to.
 
 82 → 101 tests.
+
+## Session 7 (2026-09-03) — the viz steps in clock order, and a docs audit
+
+**The viz app steps moments in game-clock order.** The page had stepped in feed
+order, so a disordered feed would have moved the playhead forward and then back.
+Moments are now built in feed order, then stable-sorted by clock. Every
+probability is still the model's, each play's change is measured against the
+play the model saw before it, and a moment the feed delivered out of clock order
+carries a warning saying where it sat. `tests/test_viz.py` runs the page's own
+moment builder under node on a deliberately disordered feed, and checks
+chronological order on every archived game rather than only the first. The
+championship game is 482 plays in 247 moments (the 255 quoted earlier was
+counted under the old sort). 101 → 110 tests.
+
+**Docs audit.** EXPLAIN still described the adapter as sorting by
+`sequenceNumber`, listed the endgame simulator and a first ESPN contact as not
+yet built, pointed at `registry/v1`, and had two sections numbered 7.10. All
+fixed; the endgame section is now §7.14. Install instructions everywhere now use
+a virtualenv, as the run book already required.
 
 ## Next up
 
