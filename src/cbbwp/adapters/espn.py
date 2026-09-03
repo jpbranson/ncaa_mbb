@@ -84,6 +84,30 @@ TYPE_ID_TO_TEXT = {
     30558: "Three Point Jump Shot",
 }
 
+# Marker stamped into payloads that were REBUILT from hoopR rather than recorded
+# from ESPN (tests/espn_fixtures.py). Tooling that claims to tell you something
+# about the real feed has to be able to tell the two apart: a rebuilt payload
+# carries hoopR's own type ids, so a check for "an id the model never saw"
+# cannot fail on one, and a green tick from it means nothing.
+SYNTHETIC_KEY = "_cbbwp_synthetic"
+
+
+def is_synthetic_payload(payload: dict) -> bool:
+    """True if this summary was rebuilt from hoopR rather than recorded.
+
+    Prefers the explicit stamp. The name fallback exists because payloads
+    written before the stamp are still sitting in `tmp/fixtures` on real
+    machines, and silently counting those as evidence is the exact failure this
+    function is here to prevent.
+    """
+    if payload.get(SYNTHETIC_KEY):
+        return True
+    comps = (payload.get("header") or {}).get("competitions") or [{}]
+    names = {((c.get("team") or {}).get("displayName") or "")
+             for c in (comps[0].get("competitors") or [])}
+    return names == {"Home Team", "Away Team"}
+
+
 # Statuses ESPN reports. Only IN means the clock is (or may be) running.
 STATUS_PRE = "STATUS_SCHEDULED"
 STATUS_FINAL = "STATUS_FINAL"

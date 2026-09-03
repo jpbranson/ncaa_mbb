@@ -24,8 +24,11 @@ if not files:
 
 unknown = collections.Counter()
 problems = 0
+n_synth = 0
 for f in files:
     payload = json.loads(f.read_text())
+    synthetic = espn.is_synthetic_payload(payload)
+    n_synth += synthetic
     raw_plays = payload.get("plays") or []
     events, h = espn.parse_summary(payload)
     ctx = PregameContext(h.game_id, h.home_team_id, h.away_team_id, h.neutral_site)
@@ -54,7 +57,19 @@ for f in files:
         ok = False
     problems += 0 if ok else 1
     print(f"{'ok  ' if ok else 'BAD '}{f.name:<28} {h.away_name} @ {h.home_name}  "
-          f"{h.status}  {len(events):,} plays, {len(states):,} states")
+          f"{h.status}  {len(events):,} plays, {len(states):,} states"
+          + ("   [REBUILT FROM hoopR - not evidence about ESPN]" if synthetic else ""))
+
+# A payload rebuilt from hoopR carries hoopR's own type ids, and the model's type
+# map was built from those same files - so "no unknown types" is guaranteed and
+# says nothing about the live feed. Saying so is the whole value of this script.
+if n_synth:
+    print(f"\n{n_synth} of {len(files)} payload(s) were REBUILT FROM hoopR, not "
+          "recorded from ESPN.")
+    if n_synth == len(files):
+        print("Every payload here is a rebuild, so the unknown-play-type check below\n"
+              "CANNOT FAIL and proves nothing about what ESPN is sending. Record real\n"
+              "payloads with scripts/record_espn_fixtures.py on a night with games.")
 
 if unknown:
     print("\nPLAY TYPES THE MODEL HAS NEVER SEEN "

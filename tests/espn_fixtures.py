@@ -18,6 +18,7 @@ from typing import List
 
 import polars as pl
 
+from cbbwp.adapters.espn import SYNTHETIC_KEY
 from cbbwp.adapters.hoopr import BASE_COLS
 
 EXTRA_COLS = ["type_id"]
@@ -61,6 +62,12 @@ def summary_from_hoopr(pbp_path: str, game_id: int, shuffle_seed: int | None = N
 
     last = df.tail(1)
     return {
+        # Provenance, so a rebuilt payload can never be mistaken for a recording
+        # of the real feed. scripts/check_espn_fixtures.py refuses to treat a
+        # stamped payload as evidence about what ESPN sends today, because every
+        # type id in here came from hoopR - the same source the model's type map
+        # was built from - so the check could not fail on one if it tried.
+        SYNTHETIC_KEY: "rebuilt from hoopR rows by tests/espn_fixtures.py",
         "header": {
             "id": str(game_id),
             "competitions": [{

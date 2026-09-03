@@ -372,7 +372,8 @@ async function loadGame(gid) {
     $("awayname").textContent = j.away_name;
     $("scrub").max = j.plays.length - 1;
     $("modelmeta").textContent =
-      `model ${j.model_version} · state rules v${j.state_rules_version} · ${j.plays.length} plays`;
+      `model ${j.model_version} · state rules v${j.state_rules_version} · ${j.plays.length} plays`
+      + (j.synthetic ? " · REBUILT FROM hoopR, not an ESPN recording" : "");
     $("stage-empty").hidden = true;
     $("stage-game").hidden = false;
     document.querySelectorAll(".game").forEach(el =>
@@ -397,7 +398,8 @@ async function loadList() {
     : `<div class="game" data-gid="${g.game_id}">
          <div class="t">${g.away_name} @ ${g.home_name}</div>
          <div class="s">${g.away_score}–${g.home_score} · ${g.plays} plays${
-           g.periods > 2 ? " · OT" : ""}</div>
+           g.periods > 2 ? " · OT" : ""}${
+           g.synthetic ? ' · <span style="color:var(--accent)">rebuilt from hoopR</span>' : ""}</div>
        </div>`).join("");
   box.querySelectorAll(".game[data-gid]").forEach(el =>
     el.onclick = () => loadGame(el.dataset.gid));

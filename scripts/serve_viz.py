@@ -48,7 +48,8 @@ from urllib.parse import urlparse
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from cbbwp.adapters.espn import EspnClient, parse_summary   # noqa: E402
+from cbbwp.adapters.espn import (EspnClient, is_synthetic_payload,  # noqa: E402
+                                 parse_summary)
 from cbbwp.config import Settings                           # noqa: E402
 from cbbwp.live_context import LiveContextProvider          # noqa: E402
 from cbbwp.serve import WinProbabilityService               # noqa: E402
@@ -128,6 +129,7 @@ class Scorer:
             "periods": max((p["period"] for p in plays), default=2),
             "model_version": self.svc.version,
             "state_rules_version": self.svc.manifest.get("state_rules_version"),
+            "synthetic": is_synthetic_payload(payload),
             "plays": plays,
         }
         with self.lock:
@@ -148,6 +150,10 @@ class Scorer:
             "home_score": last.home_score if last else 0,
             "away_score": last.away_score if last else 0,
             "source": path.parent.name,
+            # Surfaced in the list: a payload rebuilt from hoopR is a legitimate
+            # shape test but not a recording of a real game, and the two should
+            # not sit in one list looking identical.
+            "synthetic": is_synthetic_payload(payload),
         }
 
 

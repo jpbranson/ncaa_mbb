@@ -193,6 +193,20 @@ endgame override clips to 0.999, and the state a few seconds earlier was never
 touched by it. Intended, not a defect, and worth knowing before someone reads it
 as one at 11pm in February.
 
+### Step 6 can be vacuous, and now says so
+
+`tmp/fixtures/` may contain payloads **rebuilt from hoopR** by
+`tests/espn_fixtures.py` rather than recorded from ESPN. Those are a legitimate
+shape test, but they carry hoopR's own play-type ids — and the model's type map
+was built from those same files. So the unknown-play-type check, the entire
+point of step 6, **cannot fail on them**.
+
+Found 2026-09-03, when three such payloads in `tmp/fixtures/` were quietly
+producing a green step 6 in an offseason run. Rebuilt payloads are now stamped
+(`_cbbwp_synthetic`), detected by `espn.is_synthetic_payload` (with a fallback
+for files written before the stamp), labelled by `check_espn_fixtures.py`, and
+step 6 reports BLOCKED rather than PASS when every payload is a rebuild.
+
 Step 6 is the one to read carefully: it reports **play type ids the model has
 never seen**. A frequent unknown id means ESPN changed the feed, and the honest
 fix is to refit with the new type present rather than to map it to something

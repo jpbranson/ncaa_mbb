@@ -1,5 +1,5 @@
 # `cbbwp` source bundle
-Complete source. Regenerated 2026-09-03 13:30 from the `ncaa_mbb` working folder, at commit `da6989b`.
+Complete source. Regenerated 2026-09-03 13:39 from the `ncaa_mbb` working folder, at commit `76eacc1`.
 
 State rules v2, model v2. This bundle is a mirror for disaster recovery; the folder is the source of truth (it also holds the data, the fitted model and the git history). Regenerate with `python3 scripts/build_source_bundle.py` whenever the source changes.
 
@@ -332,6 +332,30 @@ TYPE_ID_TO_TEXT = {
     20574: "DunkShot",
     30558: "Three Point Jump Shot",
 }
+
+# Marker stamped into payloads that were REBUILT from hoopR rather than recorded
+# from ESPN (tests/espn_fixtures.py). Tooling that claims to tell you something
+# about the real feed has to be able to tell the two apart: a rebuilt payload
+# carries hoopR's own type ids, so a check for "an id the model never saw"
+# cannot fail on one, and a green tick from it means nothing.
+SYNTHETIC_KEY = "_cbbwp_synthetic"
+
+
+def is_synthetic_payload(payload: dict) -> bool:
+    """True if this summary was rebuilt from hoopR rather than recorded.
+
+    Prefers the explicit stamp. The name fallback exists because payloads
+    written before the stamp are still sitting in `tmp/fixtures` on real
+    machines, and silently counting those as evidence is the exact failure this
+    function is here to prevent.
+    """
+    if payload.get(SYNTHETIC_KEY):
+        return True
+    comps = (payload.get("header") or {}).get("competitions") or [{}]
+    names = {((c.get("team") or {}).get("displayName") or "")
+             for c in (comps[0].get("competitors") or [])}
+    return names == {"Home Team", "Away Team"}
+
 
 # Statuses ESPN reports. Only IN means the clock is (or may be) running.
 STATUS_PRE = "STATUS_SCHEDULED"
@@ -3760,8 +3784,11 @@ if not files:
 
 unknown = collections.Counter()
 problems = 0
+n_synth = 0
 for f in files:
     payload = json.loads(f.read_text())
+    synthetic = espn.is_synthetic_payload(payload)
+    n_synth += synthetic
     raw_plays = payload.get("plays") or []
     events, h = espn.parse_summary(payload)
     ctx = PregameContext(h.game_id, h.home_team_id, h.away_team_id, h.neutral_site)
@@ -3790,7 +3817,19 @@ for f in files:
         ok = False
     problems += 0 if ok else 1
     print(f"{'ok  ' if ok else 'BAD '}{f.name:<28} {h.away_name} @ {h.home_name}  "
-          f"{h.status}  {len(events):,} plays, {len(states):,} states")
+          f"{h.status}  {len(events):,} plays, {len(states):,} states"
+          + ("   [REBUILT FROM hoopR - not evidence about ESPN]" if synthetic else ""))
+
+# A payload rebuilt from hoopR carries hoopR's own type ids, and the model's type
+# map was built from those same files - so "no unknown types" is guaranteed and
+# says nothing about the live feed. Saying so is the whole value of this script.
+if n_synth:
+    print(f"\n{n_synth} of {len(files)} payload(s) were REBUILT FROM hoopR, not "
+          "recorded from ESPN.")
+    if n_synth == len(files):
+        print("Every payload here is a rebuild, so the unknown-play-type check below\n"
+              "CANNOT FAIL and proves nothing about what ESPN is sending. Record real\n"
+              "payloads with scripts/record_espn_fixtures.py on a night with games.")
 
 if unknown:
     print("\nPLAY TYPES THE MODEL HAS NEVER SEEN "
@@ -5599,7 +5638,8 @@ from urllib.parse import urlparse
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from cbbwp.adapters.espn import EspnClient, parse_summary   # noqa: E402
+from cbbwp.adapters.espn import (EspnClient, is_synthetic_payload,  # noqa: E402
+                                 parse_summary)
 from cbbwp.config import Settings                           # noqa: E402
 from cbbwp.live_context import LiveContextProvider          # noqa: E402
 from cbbwp.serve import WinProbabilityService               # noqa: E402
@@ -5679,6 +5719,7 @@ class Scorer:
             "periods": max((p["period"] for p in plays), default=2),
             "model_version": self.svc.version,
             "state_rules_version": self.svc.manifest.get("state_rules_version"),
+            "synthetic": is_synthetic_payload(payload),
             "plays": plays,
         }
         with self.lock:
@@ -5699,6 +5740,10 @@ class Scorer:
             "home_score": last.home_score if last else 0,
             "away_score": last.away_score if last else 0,
             "source": path.parent.name,
+            # Surfaced in the list: a payload rebuilt from hoopR is a legitimate
+            # shape test but not a recording of a real game, and the two should
+            # not sit in one list looking identical.
+            "synthetic": is_synthetic_payload(payload),
         }
 
 
@@ -6047,9 +6092,20 @@ def main() -> int:
             r = run(["scripts/check_espn_fixtures.py", "--dir", str(fixtures)])
             out = r.stdout
             unknown = "PLAY TYPES THE MODEL HAS NEVER SEEN" in out
-            record("6 fixture sanity", PASS if r.returncode == 0 else FAIL,
-                   ("unknown play types present -- see below" if unknown
-                    else "no unknown play types") + age)
+            # If every payload was rebuilt from hoopR, this step's headline check
+            # cannot fail -- the type ids came from the same files the model's
+            # type map did. A green tick there would be worse than no tick.
+            all_rebuilt = "Every payload here is a rebuild" in out
+            if r.returncode != 0:
+                detail, status = "checker failed -- see below", FAIL
+            elif all_rebuilt:
+                detail, status = ("payloads are REBUILDS from hoopR, not ESPN "
+                                  "recordings -- this check cannot fail on them"), BLOCKED
+            else:
+                detail = ("unknown play types present -- see below" if unknown
+                          else "no unknown play types") + age
+                status = PASS
+            record("6 fixture sanity", status, detail)
             if unknown:
                 print(out[out.index("PLAY TYPES THE MODEL"):][:1200], flush=True)
 
@@ -6060,8 +6116,13 @@ def main() -> int:
             else:
                 r = run(["scripts/live_poller.py", "--game", ids[0], "--once"])
                 good = r.returncode == 0 and "states" in r.stdout
+                # Step 7 polls the NETWORK -- only the game id came from the
+                # fixture list -- so the "old payload" caveat that steps 5 and 6
+                # carry does not apply here, and attaching it said the opposite
+                # of the truth.
+                note = "" if fresh else "  [game id from an older fixture; the poll itself is live]"
                 record("7 one live poll", PASS if good else FAIL,
-                       ((r.stdout.strip().splitlines() or [""])[0][:160] + age)
+                       ((r.stdout.strip().splitlines() or [""])[0][:160] + note)
                        if good else r.stderr.strip()[:200])
 
     # 8 --- the API serves; no network needed ------------------------------
@@ -6266,6 +6327,7 @@ from typing import List
 
 import polars as pl
 
+from cbbwp.adapters.espn import SYNTHETIC_KEY
 from cbbwp.adapters.hoopr import BASE_COLS
 
 EXTRA_COLS = ["type_id"]
@@ -6309,6 +6371,12 @@ def summary_from_hoopr(pbp_path: str, game_id: int, shuffle_seed: int | None = N
 
     last = df.tail(1)
     return {
+        # Provenance, so a rebuilt payload can never be mistaken for a recording
+        # of the real feed. scripts/check_espn_fixtures.py refuses to treat a
+        # stamped payload as evidence about what ESPN sends today, because every
+        # type id in here came from hoopR - the same source the model's type map
+        # was built from - so the check could not fail on one if it tried.
+        SYNTHETIC_KEY: "rebuilt from hoopR rows by tests/espn_fixtures.py",
         "header": {
             "id": str(game_id),
             "competitions": [{

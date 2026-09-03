@@ -193,9 +193,20 @@ def main() -> int:
             r = run(["scripts/check_espn_fixtures.py", "--dir", str(fixtures)])
             out = r.stdout
             unknown = "PLAY TYPES THE MODEL HAS NEVER SEEN" in out
-            record("6 fixture sanity", PASS if r.returncode == 0 else FAIL,
-                   ("unknown play types present -- see below" if unknown
-                    else "no unknown play types") + age)
+            # If every payload was rebuilt from hoopR, this step's headline check
+            # cannot fail -- the type ids came from the same files the model's
+            # type map did. A green tick there would be worse than no tick.
+            all_rebuilt = "Every payload here is a rebuild" in out
+            if r.returncode != 0:
+                detail, status = "checker failed -- see below", FAIL
+            elif all_rebuilt:
+                detail, status = ("payloads are REBUILDS from hoopR, not ESPN "
+                                  "recordings -- this check cannot fail on them"), BLOCKED
+            else:
+                detail = ("unknown play types present -- see below" if unknown
+                          else "no unknown play types") + age
+                status = PASS
+            record("6 fixture sanity", status, detail)
             if unknown:
                 print(out[out.index("PLAY TYPES THE MODEL"):][:1200], flush=True)
 
@@ -206,8 +217,13 @@ def main() -> int:
             else:
                 r = run(["scripts/live_poller.py", "--game", ids[0], "--once"])
                 good = r.returncode == 0 and "states" in r.stdout
+                # Step 7 polls the NETWORK -- only the game id came from the
+                # fixture list -- so the "old payload" caveat that steps 5 and 6
+                # carry does not apply here, and attaching it said the opposite
+                # of the truth.
+                note = "" if fresh else "  [game id from an older fixture; the poll itself is live]"
                 record("7 one live poll", PASS if good else FAIL,
-                       ((r.stdout.strip().splitlines() or [""])[0][:160] + age)
+                       ((r.stdout.strip().splitlines() or [""])[0][:160] + note)
                        if good else r.stderr.strip()[:200])
 
     # 8 --- the API serves; no network needed ------------------------------
