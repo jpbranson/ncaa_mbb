@@ -348,7 +348,10 @@ back on its own; the JSONL will show the gap.
 
 ## Known limits, carried into production deliberately
 
-- **The live path is unvalidated against the real endpoint** (top of this file).
+- **The live path has never run against ESPN during a real game** (top of this
+  file). It reaches the endpoint, parses real payloads, and has been rehearsed
+  against a running clock via the replay server — but a replay cannot prove
+  ESPN still sends that shape tonight.
 - **No licensed spread.** The pregame term uses ratings built from scratch;
   a closing spread would close roughly 0.8 points of RMSE and is the single
   largest available gain.

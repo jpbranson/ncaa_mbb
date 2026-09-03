@@ -20,6 +20,10 @@ Out of season, step 5 reports BLOCKED: the slate is all scheduled games, which
 carry no plays, so there is nothing to record. Steps 6 and 7 then run against
 whatever payloads are already on disk and say so in their detail line.
 
+What this cannot rehearse -- a feed that GROWS between polls -- is covered by
+scripts/replay_server.py, which serves archived games back to the unmodified
+deployment as a live feed. That is a rehearsal, not a substitute for this.
+
 Exit code 0 only if nothing FAILED. Blocked steps exit 2, so a scheduled run can
 tell "not validated yet" from "validated and broken".
 """
@@ -243,8 +247,9 @@ def main() -> int:
         if espn_ok:
             print("ESPN is reachable and the adapter parses real payloads, but no\n"
                   "game was live or finished on this slate, so nothing was recorded\n"
-                  "from today's feed. The live path is UNVALIDATED against a running\n"
-                  "clock -- re-run this on a night with games.")
+                  "from today's feed. What is untested is ESPN DURING A REAL GAME --\n"
+                  "re-run this on a night with games. To rehearse the running clock\n"
+                  "now, see scripts/replay_server.py.")
         else:
             print("Everything testable without the network passed. The live path is\n"
                   "still UNVALIDATED -- re-run this where egress is open.")

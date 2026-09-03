@@ -119,6 +119,13 @@ time on 2026-09-02: it is reachable, and the adapter parses real payloads
 ESPN's edge refuses the client's default user-agent with a 403 — fixed, and
 overridable via `CBBWP_USER_AGENT`.
 
-**One open item remains**: nothing has run against a game with a running clock,
-because September has no games. `scripts/smoke_live.py` exits 2 — not 0 — until
-a run on a night with games. See `cbbwp-deployment.md`.
+On 2026-09-03 the deployment was rehearsed against a running clock without
+waiting for the season: `scripts/replay_server.py` serves archived ESPN games
+back as a growing live feed, and an unmodified `serve_live.py` scored six of
+them over real HTTP — 172 states, every final score reproduced, an overtime
+game carried through a third period.
+
+**One open item remains**: nothing has run against ESPN *while a real game was
+in progress*. A replay proves the code handles the archive; it cannot prove ESPN
+still sends that shape. `scripts/smoke_live.py` exits 2 — not 0 — until a run on
+a night with games. See `cbbwp-deployment.md`.
