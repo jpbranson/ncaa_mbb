@@ -400,10 +400,10 @@ back on its own; the JSONL will show the gap.
   file). It reaches the endpoint, parses real payloads, and has been rehearsed
   against a running clock via the replay server — but a replay cannot prove
   ESPN still sends that shape tonight.
-- **ESPN's play order differs from the training data's** (EXPLAIN 8.8b, found
-  2026-09-03, unresolved). Same plays, different order; hoopR's is
-  chronological and ESPN's `sequenceNumber` is not. Effect on served
-  probabilities is unmeasured.
+- ~~ESPN's play order differs from the training data's~~ — **fixed 2026-09-03**
+  (EXPLAIN 8.8b). The adapter was sorting by `sequenceNumber`, which is only
+  nearly monotonic, and shuffling a feed that arrived correctly ordered. Live
+  states now match hoopR exactly on real payloads.
 - **No licensed spread.** The pregame term uses ratings built from scratch;
   a closing spread would close roughly 0.8 points of RMSE and is the single
   largest available gain.

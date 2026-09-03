@@ -12,7 +12,7 @@ import pytest
 from cbbwp.adapters import espn
 from cbbwp.adapters.hoopr import load_events
 from cbbwp.schemas import PregameContext
-from cbbwp.state import build_states
+from cbbwp.state import build_states, clock_to_seconds
 from cbbwp.live_context import LiveContextProvider
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -36,19 +36,44 @@ def test_unknown_type_id_falls_back_to_feed_text():
     assert espn.play_type_text({"type": {}}) == ""
 
 
-def test_plays_are_ordered_by_sequence_and_renumbered_densely():
-    plays = [
-        {"sequenceNumber": "300", "type": {"id": "615"}, "period": {"number": 1},
-         "clock": {"displayValue": "18:00"}, "homeScore": 2, "awayScore": 0},
-        {"sequenceNumber": "100", "type": {"id": "615"}, "period": {"number": 1},
-         "clock": {"displayValue": "20:00"}, "homeScore": 0, "awayScore": 0},
-        {"sequenceNumber": "200", "type": {"id": "558"}, "period": {"number": 1},
-         "clock": {"displayValue": "19:00"}, "homeScore": 2, "awayScore": 0},
-    ]
+def _play(seq, clock, home=0, away=0, tid="615", period=1):
+    return {"sequenceNumber": seq, "type": {"id": tid}, "period": {"number": period},
+            "clock": {"displayValue": clock}, "homeScore": home, "awayScore": away}
+
+
+def test_the_feeds_array_order_is_authoritative_and_renumbered_densely():
+    """The adapter must NOT re-sort by sequenceNumber.
+
+    Changed 2026-09-03. Measured on seven archived games, ESPN's `plays` array is
+    chronological and matches hoopR's game_play_number exactly, while
+    `sequenceNumber` is only nearly monotonic. Sorting by it took correct data
+    and shuffled it. These plays are in the right order with an inverted
+    sequenceNumber in the middle, exactly as the real feed does it.
+    """
+    plays = [_play("120416950", "20:00"),
+             _play("120416904", "19:00", home=2, tid="558"),   # id goes BACKWARDS
+             _play("120416951", "18:00", home=2)]
     evs = espn.events_from_plays(plays, game_id=7)
     assert [e.seq for e in evs] == [1, 2, 3]
-    assert [e.clock_seconds for e in evs] == [1200, 1140, 1080]
+    assert [e.clock_seconds for e in evs] == [1200, 1140, 1080], \
+        "the adapter re-sorted a correctly ordered feed"
     assert all(e.game_id == 7 for e in evs)
+    assert espn.chronological_inversions(evs) == 0
+
+
+def test_a_disordered_feed_is_reported_not_silently_repaired():
+    """An unreliable key cannot fix a bad feed; it can only corrupt a good one.
+
+    So the adapter preserves what it was sent and counts the inversions. If ESPN
+    ever does start sending plays out of order, that becomes a number somebody
+    can see rather than a rearrangement nobody notices.
+    """
+    scrambled = [_play("100", "18:00", home=2),
+                 _play("200", "20:00"),
+                 _play("300", "19:00", home=2)]
+    evs = espn.events_from_plays(scrambled, game_id=7)
+    assert [e.clock_seconds for e in evs] == [1080, 1200, 1140], "order was changed"
+    assert espn.chronological_inversions(evs) == 1
 
 
 def test_missing_and_null_fields_do_not_raise():
@@ -118,8 +143,12 @@ def test_espn_adapter_matches_hoopr_states(game_ids):
 
     for gid in game_ids:
         ref_events, home_id, away_id = load_events(PBP, gid)
-        # shuffled on purpose: the live feed does not promise ordered plays
-        payload = summary_from_hoopr(PBP, gid, shuffle_seed=gid % 97)
+        # In the feed's own array order, which is what ESPN actually sends and
+        # what hoopR's game_play_number preserves. This used to shuffle, on the
+        # belief that the array promised nothing and sequenceNumber was
+        # authoritative; measurement on real payloads showed the reverse
+        # (adapters/espn.py: events_from_plays).
+        payload = summary_from_hoopr(PBP, gid)
         live_events, header = espn.parse_summary(payload)
 
         assert header.home_team_id == home_id
@@ -151,8 +180,7 @@ def test_espn_path_gives_identical_win_probabilities(game_ids):
         ref_events, home_id, away_id = load_events(PBP, gid)
         ctx = PregameContext(gid, home_id, away_id, pregame_exp_margin=2.5,
                              ft_pct_diff=0.02, exp_points_per_min=3.5)
-        live_events, _ = espn.parse_summary(
-            summary_from_hoopr(PBP, gid, shuffle_seed=1))
+        live_events, _ = espn.parse_summary(summary_from_hoopr(PBP, gid))
         assert svc.score_game(live_events, ctx) == svc.score_game(ref_events, ctx)
 
 
@@ -245,3 +273,29 @@ def test_the_client_points_at_espn_unless_told_otherwise(monkeypatch):
     r = EspnClient()
     assert r.base_url == "http://127.0.0.1:8899"      # trailing slash trimmed
     assert r.is_replay is True
+
+
+@pytestmark_data
+def test_sorting_by_sequence_number_would_corrupt_a_correct_feed(game_ids):
+    """The regression guard for the 2026-09-03 fix, stated as a measurement.
+
+    If someone reintroduces `sorted(..., key=sequenceNumber)` in
+    `events_from_plays`, the parity tests above go red. This test says why, so
+    the fix is not silently undone by someone who reads the old docstring: on a
+    feed that is already in the right order, sorting by that key MOVES plays.
+    """
+    from espn_fixtures import summary_from_hoopr
+
+    payload = summary_from_hoopr(PBP, game_ids[0])
+    plays = payload["plays"]
+    as_sent = [(p["period"]["number"], p["clock"]["displayValue"]) for p in plays]
+    by_id = [(p["period"]["number"], p["clock"]["displayValue"]) for p in
+             sorted(plays, key=lambda q: int(q["sequenceNumber"]))]
+    assert as_sent != by_id, (
+        "the fixture's sequenceNumber is perfectly sorted again -- that is the "
+        "property real ESPN does NOT have, and it is what hid the bug")
+
+    events, _ = espn.parse_summary(payload)
+    assert espn.chronological_inversions(events) == 0
+    assert [e.clock_seconds for e in events] == \
+           [clock_to_seconds(c) for _, c in as_sent]

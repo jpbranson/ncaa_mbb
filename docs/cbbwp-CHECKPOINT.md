@@ -125,10 +125,12 @@ back as a growing live feed, and an unmodified `serve_live.py` scored six of
 them over real HTTP — 172 states, every final score reproduced, an overtime
 game carried through a third period.
 
-**A new open question, found 2026-09-03**: ESPN's live play order and hoopR's
-`game_play_number` disagree for the same game — same plays, different order,
-and only hoopR's is chronological. Unmeasured effect on served probabilities.
-See EXPLAIN 8.8b. Measure before changing the adapter.
+**Fixed 2026-09-03**: the ESPN adapter was sorting plays by `sequenceNumber`,
+a nearly-but-not-quite monotonic key, and shuffling a feed that had arrived in
+the correct order — moving mid-game win probability by up to 26.7 points while
+leaving every final probability unchanged. The feed's array order is now
+authoritative, and live states match hoopR exactly on real payloads. See
+EXPLAIN 8.8b.
 
 **One open item remains**: nothing has run against ESPN *while a real game was
 in progress*. A replay proves the code handles the archive; it cannot prove ESPN

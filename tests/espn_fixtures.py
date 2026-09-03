@@ -41,9 +41,15 @@ def summary_from_hoopr(pbp_path: str, game_id: int, shuffle_seed: int | None = N
     for r in df.iter_rows(named=True):
         team = r["team_id"]
         plays.append({
-            # ESPN's sequenceNumber is a big opaque string; only its numeric
-            # order matters, and it is not dense.
-            "sequenceNumber": str(int(r["game_play_number"]) * 10),
+            # ESPN's sequenceNumber is a big opaque string, and -- measured on
+            # real payloads 2026-09-03 -- only NEARLY monotonic: roughly one play
+            # in forty carries an id lower than its predecessor while the clock
+            # runs correctly forwards. This rebuild reproduces that, because a
+            # fixture with a perfectly sorted key is what let a sort-by-id bug
+            # survive every parity test for months. Anyone who reintroduces that
+            # sort will now fail the parity tests immediately.
+            "sequenceNumber": str(int(r["game_play_number"]) * 10
+                                  - (15 if int(r["game_play_number"]) % 40 == 0 else 0)),
             "type": {"id": str(r["type_id"]) if r["type_id"] is not None else None,
                      "text": r["type_text"]},
             "period": {"number": int(r["period_number"] or 1)},
@@ -57,6 +63,9 @@ def summary_from_hoopr(pbp_path: str, game_id: int, shuffle_seed: int | None = N
             "text": "",
         })
 
+    # Shuffling now produces a genuinely disordered feed: the adapter preserves
+    # array order, so this no longer round-trips. Used to test that disorder is
+    # REPORTED (espn.chronological_inversions), not silently repaired.
     if shuffle_seed is not None:
         random.Random(shuffle_seed).shuffle(plays)
 

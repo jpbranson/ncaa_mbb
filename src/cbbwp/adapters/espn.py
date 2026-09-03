@@ -31,7 +31,8 @@ from dataclasses import dataclass
 from typing import Any, Iterable, List, Optional, Sequence
 
 from ..schemas import Event, PregameContext
-from ..state import clock_to_seconds
+from ..schemas import HALF_SECONDS, OT_SECONDS
+from ..state import clock_to_seconds, game_seconds_remaining
 
 SITE_API = "https://site.api.espn.com/apis/site/v2/sports/basketball/mens-college-basketball"
 SCOREBOARD_URL = SITE_API + "/scoreboard"
@@ -136,25 +137,54 @@ def play_type_text(play: dict) -> str:
     return (t.get("text") or "").strip()
 
 
-def _sequence_key(play: dict, fallback: int) -> int:
-    """ESPN's sequenceNumber, numeric, for ordering. Falls back to feed order."""
-    s = _int(play.get("sequenceNumber"))
-    return s if s is not None else fallback
+def chronological_inversions(events: Sequence[Event]) -> int:
+    """How many events sit earlier in game time than the event before them.
+
+    Zero on every real ESPN payload measured so far. A non-zero count means the
+    feed itself arrived out of order, which the adapter deliberately does NOT
+    repair - see `events_from_plays`. Surfaced so a disordered feed is a thing
+    somebody is told about rather than something silently rearranged.
+    """
+    def elapsed(e: Event) -> int:
+        if e.period <= 2:
+            return 2 * HALF_SECONDS - game_seconds_remaining(e.period,
+                                                             e.clock_seconds)
+        return (2 * HALF_SECONDS + (e.period - 3) * OT_SECONDS
+                + (OT_SECONDS - e.clock_seconds))
+    t = [elapsed(e) for e in events]
+    return sum(1 for i in range(1, len(t)) if t[i] < t[i - 1])
 
 
 def events_from_plays(plays: Sequence[dict], game_id: int) -> List[Event]:
     """ESPN `plays` array -> Events, numbered 1..N like hoopR's game_play_number.
 
-    ESPN's own sequenceNumber is used only for ORDERING; the emitted `seq` is a
-    dense 1-based ordinal, exactly as hoopR's game_play_number is, so a state
-    built live is directly comparable to the same state built offline.
+    **The feed's own array order is authoritative.** The emitted `seq` is a dense
+    1-based ordinal over that order, exactly as hoopR's game_play_number is, so a
+    state built live is directly comparable to the same state built offline.
+
+    This used to sort by ESPN's `sequenceNumber`, on the assumption that the
+    array made no promise about order and the id did. Measured 2026-09-03 on
+    seven archived games, the opposite is true on all seven:
+
+      * the raw `plays` array IS chronological, and matches hoopR's
+        game_play_number order exactly;
+      * `sequenceNumber` is only NEARLY monotonic - the 2026 championship game
+        has 12 inversions in 482 plays, e.g. 120416951 followed by 120416904
+        while the clock runs correctly forwards.
+
+    So the sort was taking correctly ordered data and shuffling it, displacing
+    plays by as much as 986 seconds and moving mid-game win probability by up to
+    27 points. Final probabilities were unaffected, which is why nothing ever
+    complained. The parity tests could not catch it either: they run on payloads
+    rebuilt from hoopR, where sequenceNumber is synthesised monotonic and so has
+    a property the real feed does not.
+
+    Disorder is now REPORTED rather than repaired (`chronological_inversions`):
+    an unreliable key cannot fix an out-of-order feed, it can only corrupt an
+    ordered one.
     """
-    ordered = sorted(
-        ((_sequence_key(p, i), i, p) for i, p in enumerate(plays)),
-        key=lambda x: (x[0], x[1]),
-    )
     out: List[Event] = []
-    for n, (_key, _i, p) in enumerate(ordered, start=1):
+    for n, p in enumerate(plays, start=1):
         period = _int((p.get("period") or {}).get("number"), 1) or 1
         clock = (p.get("clock") or {}).get("displayValue") or ""
         team = (p.get("team") or {}).get("id")

@@ -1034,49 +1034,53 @@ face, and it visibly hedges on blowouts — where it says 3.4% the true rate is 
 our edge is simply being willing to be more confident where the data supports it. That is a
 legitimate win, not a trick, but it is the honest characterisation.
 
-### 8.8b ESPN's play ORDER and hoopR's disagree (found 2026-09-03, unresolved)
+### 8.8b The adapter was re-sorting a correctly ordered feed (found and fixed 2026-09-03)
 
-Found while building `scripts/serve_viz.py`, because a chart makes an ordering
-problem visible in a way a test of final scores does not.
+Found while building `scripts/serve_viz.py`: a chart makes an ordering problem
+visible in a way a test of final scores does not.
 
-The live adapter orders plays by ESPN's `sequenceNumber` (`_sequence_key`).
-hoopR's `game_play_number` — what the model was trained on — turns out to be a
-**different order for the same game**.
+**The bug.** `events_from_plays` sorted ESPN's plays by `sequenceNumber`, on the
+stated assumption that the array promised nothing about order and the id was
+authoritative. Measured on seven archived games, the reverse is true on all
+seven:
 
-Measured on three archived 2025-26 games where both sources are available, the
-plays themselves are identical (same multiset of period/clock/type, same count),
-so nothing is missing or duplicated. Only the order differs:
-
-| game | positions where the two orders agree |
+| | result |
 |---|---|
-| UNC at Duke | 397 / 401 (99%) |
-| Arkansas at Missouri | 434 / 453 (96%) |
-| UConn vs Michigan (championship) | **64 / 482 (13%)** |
+| raw `plays` array is chronological | **7 / 7** |
+| raw array order equals hoopR's `game_play_number` order | **7 / 7** |
+| `sequenceNumber` order is chronological | 0 / 7 |
 
-And the two are not equally defensible: **hoopR's order is chronological in all
-three games; ESPN's `sequenceNumber` order is not.** Across ten archived games,
-31 of 4,782 plays (0.65%) sit earlier in game time than the play before them,
-with single displacements as large as 986 seconds — and one case where the feed
-order steps from period 2 back into period 1.
+`sequenceNumber` is *nearly* monotonic and not reliably so — the 2026
+championship payload has 12 inversions in 482 plays, e.g. `120416951` followed
+by `120416904` while the clock runs correctly forwards. Sorting on it took
+correct data and shuffled it.
 
-**What this does and does not establish.** It establishes that the live path
-feeds the state builder a different play order than training used, sometimes
-drastically, and that possession tracking and `game_seconds_remaining` are both
-order-dependent. It does **not** establish that served win probabilities are
-materially wrong: the dry run still reproduced every final score, and the last
-state of a game is the one the API serves. Nobody has yet measured the effect on
-mid-game probabilities, which is the number that would settle it.
+**What it cost.** Displacements as large as 986 seconds, one of them stepping
+from period 2 back into period 1, and mid-game win probability moving by up to
+**26.7 points**. Final probabilities were identical in every game, which is
+exactly why nothing ever complained: a displaced play perturbs the path and
+washes out by the buzzer.
 
-Why the existing parity tests did not catch it: `tests/test_espn_adapter.py`
-compares the ESPN adapter against the hoopR adapter on payloads **rebuilt from
-hoopR rows**, so the two share an order by construction. The test is sound for
-what it checks — field coercion, type mapping, numbering — and structurally
-blind to this.
+**Why every existing test missed it.** The parity tests run on payloads rebuilt
+from hoopR by `tests/espn_fixtures.py`, which synthesised `sequenceNumber` as
+`game_play_number * 10` — perfectly monotonic. The fixture handed the key a
+property the real feed does not have, so sorting by it was harmless there and
+destructive in production. This is the second time a rebuilt fixture has quietly
+guaranteed a green tick (see the run book on step 6); the pattern is worth
+remembering — **a fixture that is cleaner than reality tests the fixture.**
 
-The honest next step is to measure it before changing anything: score a set of
-games both ways and compare the probability paths. Re-ordering the adapter by
-clock would be a change to the serving path of a frozen model, and it should not
-be made on the strength of a chart looking wrong.
+**The fix.** The feed's array order is authoritative; the sort is gone.
+Disorder is now *reported* rather than repaired, via
+`espn.chronological_inversions()`: an unreliable key cannot fix an out-of-order
+feed, it can only corrupt an ordered one. The rebuilt fixtures now carry an
+occasional inverted `sequenceNumber` of their own, so reintroducing the sort
+fails four tests immediately.
+
+**Verified after the fix.** On the seven archived games, states built from real
+ESPN payloads are now identical to states built from hoopR — seq, period,
+`game_seconds_remaining`, margin *and possession* — with zero chronological
+inversions. That is the train/serve invariant this project rests on, holding on
+real feed data rather than on reconstructions of it.
 
 ### 8.8 The live adapter has not seen ESPN during a real game
 Corrected twice, and the caveat is now much narrower than it started.

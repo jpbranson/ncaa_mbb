@@ -79,25 +79,22 @@ def test_game_time_conversion_spans_the_whole_game(scored):
     assert max(times) > (2 * REG if per > 2 else REG), "second half never reached"
 
 
-def test_the_feed_is_not_always_in_chronological_order(scored):
-    """A documented property of ESPN's feed, pinned so it is not mistaken for a bug.
+def test_the_scored_game_is_in_chronological_order(scored):
+    """What the app is handed must already be in game order.
 
-    ESPN orders plays by `sequenceNumber`, and on a minority of plays that
-    disagrees with the clock those same plays carry - measured 2026-09-03 at 31
-    of 4,782 plays (0.65%) across ten archived games, but with single jumps as
-    large as 986 seconds.
-
-    The adapter deliberately keeps sequenceNumber order (see adapters/espn.py),
-    so the app must not assume monotonic game time. It draws the curve in
-    game-time order and captions the out-of-order plays rather than hiding them.
-    This test exists so that if the adapter's ordering ever changes, somebody has
-    to come and read this comment.
+    History: on 2026-09-03 this test was written the other way round, asserting
+    that a *small* fraction of plays ran backwards in time and treating that as a
+    property of ESPN's feed. It was not. The adapter was sorting by
+    `sequenceNumber`, a nearly-but-not-quite monotonic key, and shuffling a feed
+    that had arrived correctly ordered. With the sort removed the count is zero,
+    and anything above zero now means ESPN really did send a disordered payload -
+    which the adapter reports rather than repairs.
     """
     times = [elapsed(p) for p in scored["plays"]]
-    backwards = sum(1 for i in range(1, len(times)) if times[i] < times[i - 1])
-    assert backwards < len(times) * 0.05, (
-        f"{backwards} of {len(times)} plays out of order -- far more than the "
-        "0.65% measured; the feed or the adapter's ordering has changed")
+    backwards = [i for i in range(1, len(times)) if times[i] < times[i - 1]]
+    assert not backwards, (
+        f"{len(backwards)} plays out of order (first at index {backwards[:1]}); "
+        "either the feed arrived disordered or something re-sorted it")
 
 
 def test_a_finished_game_ends_where_the_score_says_it_should(scored):
