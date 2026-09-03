@@ -10,7 +10,15 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-PY="$(command -v python3)"
+# A LaunchAgent does not run a shell profile, so it never sees an activated
+# virtualenv -- it would find the system python3 and die on a missing lightgbm
+# at tip-off. Prefer the repo's own venv interpreter by absolute path, and fall
+# back to whatever python3 is on PATH only if there is no venv.
+if [[ -x "$ROOT/.venv/bin/python3" ]]; then
+  PY="$ROOT/.venv/bin/python3"
+else
+  PY="$(command -v python3)"
+fi
 AGENTS="$HOME/Library/LaunchAgents"
 LIVE="$AGENTS/com.cbbwp.live.plist"
 RATINGS="$AGENTS/com.cbbwp.ratings.plist"
@@ -27,6 +35,15 @@ fi
 mkdir -p "$AGENTS" "$LOGS"
 echo "root:   $ROOT"
 echo "python: $PY"
+
+# Check the interpreter launchd will actually use, not the one in this shell.
+if ! "$PY" -c 'import lightgbm, polars, numpy' 2>/dev/null; then
+  echo "error: $PY cannot import lightgbm/polars/numpy." >&2
+  echo "       create the venv first:" >&2
+  echo "         python3 -m venv $ROOT/.venv" >&2
+  echo "         $ROOT/.venv/bin/pip install polars pyarrow lightgbm scikit-learn pytest numpy certifi" >&2
+  exit 1
+fi
 
 cat > "$LIVE" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>

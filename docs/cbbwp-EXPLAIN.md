@@ -468,7 +468,7 @@ Both clip at 0.999 rather than 1.000. §7.8 explains why that last detail matter
   identical states — and identical win probabilities — to the *offline* hoopR adapter for the
   same game, including when the feed arrives shuffled. See §3.10.
 
-Current status: 82 tests, all passing, none skipped, about 6 seconds.
+Current status: 92 tests, all passing, none skipped, about 6 seconds.
 
 ### 3.10 The live path (added 2026-09-01)
 
@@ -504,8 +504,14 @@ corrections a non-event. Poll cadence tightens as the clock runs: 20s early, 10s
 minutes, 5s inside two. A scoreboard task rediscovers the slate every two minutes. Output is
 one JSONL line per changed state.
 
-**What is validated, and what is not.** Both this sandbox and the local VM are blocked from
-`site.api.espn.com` by egress policy, so the adapter has never seen a live payload. What *is*
+**What is validated, and what is not.** On 2026-09-02 the adapter reached the real endpoint
+for the first time and parsed real ESPN summary payloads correctly — 539 plays to 539 states,
+no unknown play-type ids. On 2026-09-03 the whole deployment was rehearsed against a *running
+clock*: six archived games replayed through `scripts/replay_server.py`, which speaks ESPN's
+protocol back to an unmodified `serve_live.py` over real HTTP. 172 states, all six reproducing
+the real final score, an overtime game scored through a third period. That covers the growing
+plays array, the status transitions and the endgame cadence — everything except ESPN itself,
+which only a real night can supply. What *is*
 proven, offline and in CI, is that ESPN-shaped payloads rebuilt from hoopR rows produce
 byte-identical states and win probabilities to the offline path on real games. Since hoopR is
 itself a scrape of this same ESPN feed, that covers ordering, numbering, type mapping and
@@ -1028,12 +1034,26 @@ face, and it visibly hedges on blowouts — where it says 3.4% the true rate is 
 our edge is simply being willing to be more confident where the data supports it. That is a
 legitimate win, not a trick, but it is the honest characterisation.
 
-### 8.8 The live adapter has never seen a live payload
-Both sandboxes this was built in are blocked from `site.api.espn.com`. The adapter is proven
-against ESPN-shaped payloads rebuilt from hoopR — which is a scrape of the same feed, so the
-shape is right — but not against the live endpoint itself. Closing that gap is two commands
-on a machine with network access (§3.10), and it should be done before the first live night,
-not during it.
+### 8.8 The live adapter has not seen ESPN during a real game
+Corrected twice, and the caveat is now much narrower than it started.
+
+2026-09-02: the adapter read the real endpoint and parsed real payloads (§3.10), retiring
+"never touched ESPN". 2026-09-03: the growing-feed case — a partial plays array between polls,
+a status that is neither scheduled nor final — was rehearsed by replaying archived games back
+to the unmodified deployment over real HTTP (`scripts/replay_server.py`). Six games, 172
+states, every final score reproduced, one of them through overtime.
+
+What is left is the part a rehearsal cannot reach: **ESPN itself, tonight.** A replay proves
+the code handles the archive. It cannot prove ESPN has not changed the feed since, and it does
+not exercise ESPN's retroactive corrections — a play inserted, rescored or deleted minutes
+later. The poller is immune to those by construction (it re-scores the whole game every poll),
+which is the argument for why that gap is small, not evidence that it is closed.
+
+That first run also found something the old caveat was hiding. The 403 everyone read as
+blocked egress was partly ESPN's edge refusing the client's own user-agent, which would have
+hit the Mac in November with no sandbox to blame. See `cbbwp-deployment.md`. The general
+lesson is the one worth keeping: an environmental excuse for a failure is a hypothesis, not
+a diagnosis, and it stops being tested the moment it sounds sufficient.
 
 ---
 
@@ -1147,15 +1167,17 @@ Beating a *broadcast* win probability model and beating a *market* are different
 | `src/cbbwp/evaluate.py` | Metrics, always broken out by time bucket. |
 | `src/cbbwp/monitor.py` | Calibration drift statistics. |
 | `src/cbbwp/serve.py` | The live scoring path and the version-pinning guard. |
-| `scripts/` | The pipeline, the live poller, the fixture tools, the monitor. |
+| `scripts/` | The pipeline, the live poller, the fixture tools, the replay server, the monitor. |
 | `src/cbbwp/config.py` | Every deployment setting, from the environment, with working defaults. |
 | `src/cbbwp/api.py` | The read-only HTTP view of the live feed. Standard library only. |
 | `scripts/serve_live.py` | The deployment entry point: poller plus API, one process. |
 | `scripts/smoke_live.py` | The eight-step pre-flight check for a live night. |
+| `scripts/replay_server.py` | Serves archived ESPN games back as a live feed, so the deployment can be rehearsed out of season. See §3.10. |
+| `scripts/archive_replay_games.py` | Archives the real ESPN payloads that the replay server serves. |
 | `deploy/` | macOS LaunchAgents, Dockerfile, compose. Same entry point either way. |
 | `src/cbbwp/endgame_sim.py` | The endgame solver and lookup table. A documented diagnostic; **not** wired into `serve.py` — see §7.10. |
 | `registry/endgame/e1/` | The solved table, its manifest and a readable CSV of canonical states. |
-| `tests/` | 82 tests: state rules, feature contract, bulk parity, ESPN-adapter parity, endgame rules, replay harness, monitor statistics, endgame-table structure and the ESPN free-throw labelling convention. |
+| `tests/` | 92 tests: state rules, feature contract, bulk parity, ESPN-adapter parity, endgame rules, replay harness, the dry-run replay server, monitor statistics, endgame-table structure and the ESPN free-throw labelling convention. |
 | `registry/v2/` | The pinned model artifact and manifest, stamped with the state-rules version. |
 | `registry/v1/` | The pre-fix model, kept for provenance. Refused at load by current code. |
 | `registry/context_latest.json` | Today's team ratings and season-to-date stats, for live games. |

@@ -1,10 +1,9 @@
 """The pre-flight check for a live night. One command, clear pass or fail.
 
 This is the only part of the system the offline test suite cannot cover, because
-it needs the real ESPN endpoint. It has never been run: neither the sandbox this
-was built in nor the Cowork device VM can reach `site.api.espn.com`. Run it on a
-machine with open network access, and run it BEFORE the first live night rather
-than during it.
+it needs the real ESPN endpoint. First run with open egress: 2026-09-02, which
+found that ESPN 403s the client's default user-agent (see cbbwp-deployment.md).
+Run it BEFORE a live night rather than during one.
 
     python3 scripts/smoke_live.py                 # full check, records fixtures
     python3 scripts/smoke_live.py --offline       # everything needing no network
@@ -12,7 +11,18 @@ than during it.
 
 Steps 1-3 and 8 work offline. Steps 4-7 need the network; if step 4 fails, the
 network steps are reported BLOCKED rather than FAILED, because "we could not
-reach ESPN from here" is a different fact from "the adapter is broken".
+reach ESPN from here" is a different fact from "the adapter is broken". The one
+exception is a 403/429 from ESPN: that is ESPN refusing US, not the network
+refusing to route, so it is a FAIL. Reporting it as blocked egress is what hid a
+real user-agent rule for an entire build cycle.
+
+Out of season, step 5 reports BLOCKED: the slate is all scheduled games, which
+carry no plays, so there is nothing to record. Steps 6 and 7 then run against
+whatever payloads are already on disk and say so in their detail line.
+
+What this cannot rehearse -- a feed that GROWS between polls -- is covered by
+scripts/replay_server.py, which serves archived games back to the unmodified
+deployment as a live feed. That is a rehearsal, not a substitute for this.
 
 Exit code 0 only if nothing FAILED. Blocked steps exit 2, so a scheduled run can
 tell "not validated yet" from "validated and broken".
@@ -121,7 +131,14 @@ def main() -> int:
             games = scoreboard_games(sb)
             reachable = True
             record("4 ESPN reachable", PASS,
-                   f"{len(games)} games on the slate, {time.time()-t0:.1f}s")
+                   f"{len(games)} games on the slate, {time.time()-t0:.1f}s, "
+                   f"ua={EspnClient().user_agent!r}")
+        except urllib.error.HTTPError as e:
+            # A 403/429 is ESPN refusing US, not the network refusing to route.
+            # Calling that "blocked egress" is what hid the user-agent rule for
+            # a whole build cycle, so name it as a real failure.
+            record("4 ESPN reachable", FAIL if e.code in (403, 429) else BLOCKED,
+                   f"HTTP {e.code}: {e.reason} -- ua={EspnClient().user_agent!r}")
         except (urllib.error.URLError, OSError, TimeoutError) as e:
             record("4 ESPN reachable", BLOCKED,
                    f"{type(e).__name__}: {e} -- run where egress is open")
@@ -133,23 +150,52 @@ def main() -> int:
                 record(n, BLOCKED, "no route to ESPN")
         else:
             # 5 --- record what ESPN is sending today ----------------------
+            # Count only payloads THIS run wrote. Counting whatever is already
+            # in the directory turns a day-old fixture into a green tick: on
+            # 2026-09-02 an empty offseason slate recorded nothing and step 5
+            # still passed, on files from the day before.
+            t_start = time.time()
             cmd = ["scripts/record_espn_fixtures.py", "--limit", str(a.limit),
                    "--out", str(fixtures)]
             if a.date:
                 cmd += ["--date", a.date]
             r = run(cmd)
-            n_fix = len(list(fixtures.glob("summary_*.json")))
-            record("5 record fixtures", PASS if r.returncode == 0 and n_fix else FAIL,
-                   f"{n_fix} payloads in {fixtures}"
-                   + ("" if r.returncode == 0 else f" -- {r.stderr.strip()[:200]}"))
+
+            def _fresh() -> list[pathlib.Path]:
+                return [q for q in fixtures.glob("summary_*.json")
+                        if q.stat().st_mtime >= t_start]
+
+            fresh, stale = _fresh(), list(fixtures.glob("summary_*.json"))
+            n_stale = len(stale) - len(fresh)
+            if r.returncode != 0:
+                record("5 record fixtures", FAIL,
+                       f"recorder exited {r.returncode} -- {r.stderr.strip()[:200]}")
+            elif fresh:
+                record("5 record fixtures", PASS,
+                       f"{len(fresh)} payloads recorded into {fixtures}")
+            else:
+                # No games with plays on this slate. Real in the offseason, and
+                # not the adapter's fault -- but it is not validation either.
+                record("5 record fixtures", BLOCKED,
+                       "no games with plays on this slate -- nothing recorded"
+                       + (f"; {n_stale} older payload(s) left in {fixtures}"
+                          if n_stale else ""))
 
             # 6 --- does the adapter understand them? ----------------------
+            # Steps 6 and 7 still run against whatever payloads exist, because
+            # parsing a real payload is worth checking even when it is an old
+            # one -- but say so, so the tick is not read as "today's feed".
+            age = ""
+            if not fresh and stale:
+                oldest = min(q.stat().st_mtime for q in stale)
+                age = (f" -- against {len(stale)} payload(s) "
+                       f"{(time.time() - oldest) / 86400:.1f}d old, NOT today's feed")
             r = run(["scripts/check_espn_fixtures.py", "--dir", str(fixtures)])
             out = r.stdout
             unknown = "PLAY TYPES THE MODEL HAS NEVER SEEN" in out
             record("6 fixture sanity", PASS if r.returncode == 0 else FAIL,
-                   "unknown play types present -- see below" if unknown
-                   else "no unknown play types")
+                   ("unknown play types present -- see below" if unknown
+                    else "no unknown play types") + age)
             if unknown:
                 print(out[out.index("PLAY TYPES THE MODEL"):][:1200], flush=True)
 
@@ -161,7 +207,7 @@ def main() -> int:
                 r = run(["scripts/live_poller.py", "--game", ids[0], "--once"])
                 good = r.returncode == 0 and "states" in r.stdout
                 record("7 one live poll", PASS if good else FAIL,
-                       (r.stdout.strip().splitlines() or [""])[0][:160]
+                       ((r.stdout.strip().splitlines() or [""])[0][:160] + age)
                        if good else r.stderr.strip()[:200])
 
     # 8 --- the API serves; no network needed ------------------------------
@@ -193,9 +239,20 @@ def main() -> int:
         print("Do not go live until these pass.")
         return 1
     if blocked:
-        print(f"BLOCKED: {len(blocked)} step(s) could not reach ESPN.")
-        print("Everything testable without the network passed. The live path is\n"
-              "still UNVALIDATED -- re-run this where egress is open.")
+        # Two different reasons land here, and they need different advice:
+        # ESPN unreachable (fix the machine) vs. reachable but no games to
+        # watch (fix nothing, come back in season). Step 4 tells them apart.
+        espn_ok = any(n.startswith("4 ") and st == PASS for n, st, _ in results)
+        print(f"BLOCKED: {len(blocked)} step(s) -- {', '.join(blocked)}")
+        if espn_ok:
+            print("ESPN is reachable and the adapter parses real payloads, but no\n"
+                  "game was live or finished on this slate, so nothing was recorded\n"
+                  "from today's feed. What is untested is ESPN DURING A REAL GAME --\n"
+                  "re-run this on a night with games. To rehearse the running clock\n"
+                  "now, see scripts/replay_server.py.")
+        else:
+            print("Everything testable without the network passed. The live path is\n"
+                  "still UNVALIDATED -- re-run this where egress is open.")
         return 2
     skipped_network = [n for n, s_, _ in results
                        if s_ == SKIP and n[0] in "4567"]

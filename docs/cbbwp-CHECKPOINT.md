@@ -113,7 +113,19 @@ EXPLAIN §7.7–7.10.
 
 ## The state this leaves the project in
 
-Ready to deploy, with **one open item**: the live path has never reached the
-real ESPN endpoint, because no environment available during development could.
-`scripts/smoke_live.py` closes it in one command on a machine with open egress,
-and exits 2 — not 0 — until that happens. See `cbbwp-deployment.md`.
+Ready to deploy. The live path reached the real ESPN endpoint for the first
+time on 2026-09-02: it is reachable, and the adapter parses real payloads
+(539 plays → 539 states, no unknown play types). That run also found that
+ESPN's edge refuses the client's default user-agent with a 403 — fixed, and
+overridable via `CBBWP_USER_AGENT`.
+
+On 2026-09-03 the deployment was rehearsed against a running clock without
+waiting for the season: `scripts/replay_server.py` serves archived ESPN games
+back as a growing live feed, and an unmodified `serve_live.py` scored six of
+them over real HTTP — 172 states, every final score reproduced, an overtime
+game carried through a third period.
+
+**One open item remains**: nothing has run against ESPN *while a real game was
+in progress*. A replay proves the code handles the archive; it cannot prove ESPN
+still sends that shape. `scripts/smoke_live.py` exits 2 — not 0 — until a run on
+a night with games. See `cbbwp-deployment.md`.

@@ -53,10 +53,27 @@ doubles 5.4M rows and briefly holds them as float64. It will be OOM-killed in a
 python3 scripts/smoke_live.py             # eight steps, one verdict
 ```
 
-Exit 0 = validated. Exit 1 = broken, do not go live. **Exit 2 = the offline
-steps passed but ESPN was unreachable, so the live path is still unvalidated** —
-which is the state the project is in today, because no environment available
-during development could reach `site.api.espn.com`.
+Exit 0 = validated. Exit 1 = broken, do not go live. Exit 2 = the offline steps
+passed but something needing the network did not happen — either ESPN was
+unreachable, or no game was live or finished on the slate. The verdict says
+which.
+
+Out of season, exit 2 is the honest answer: ESPN is reachable and the adapter
+parses real payloads, but there are no games to record. See
+`docs/cbbwp-deployment.md` for what is validated and what is not.
+
+**Rehearse a live night without waiting for one:**
+
+```bash
+python3 scripts/archive_replay_games.py   # once; needs network
+python3 scripts/replay_server.py --speed 5
+CBBWP_ESPN_BASE=http://127.0.0.1:8899 python3 scripts/serve_live.py
+```
+
+`replay_server.py` speaks ESPN's protocol back to the unmodified deployment,
+serving archived games with only the plays that would have happened by now — a
+growing feed, a running clock, real status transitions. Replay rows are tagged
+`"replay": true` and written to `data/replay/`, never `data/live/`.
 
 Then:
 
@@ -132,9 +149,10 @@ src/cbbwp/
   adapters/
     hoopr.py       historical parquet -> Events   (offline)
     espn.py        live ESPN feed     -> Events   (live)
-scripts/           the pipeline, the poller, the smoke test, the monitor
+scripts/           the pipeline, the poller, the smoke test, the replay
+                   server, the monitor
 deploy/            macOS LaunchAgents, Dockerfile, compose
-tests/             82 tests
+tests/             92 tests
 docs/              the project docs, kept alongside the code
 data/, artifacts/, registry/   built locally; not source
 ```
@@ -152,3 +170,8 @@ and features. Two tests enforce it:
 
 `tests/test_replay_harness.py` adds the third: a finished game fed through the
 live path in irregular chunks must match the offline answer exactly.
+
+`tests/test_replay_server.py` covers the dry-run simulator itself — plays must
+be revealed in game order from a countdown clock, must only ever grow, and the
+finished replay must equal the archive. A dry run that fails on the simulator's
+own bugs is the worst kind of false alarm to chase at tip-off.

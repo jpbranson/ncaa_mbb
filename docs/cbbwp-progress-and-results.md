@@ -6,10 +6,14 @@ Deployment scaffolding is built and tested: `cbbwp-deployment.md` is the run
 book. The **endgame simulator is finished, tested once, and does not ship**
 (`cbbwp-endgame-results.md`).
 
-**The one open item is the live smoke test.** `python3 scripts/smoke_live.py`
-closes it in a single command, but it must run somewhere that can reach
-`site.api.espn.com`. Neither sandbox can — both get
-`Tunnel connection failed: 403 Forbidden`.
+**The live path has now reached ESPN** (2026-09-02) and been rehearsed against a
+running clock (2026-09-03, via `scripts/replay_server.py`). The earlier
+`Tunnel connection failed: 403 Forbidden` was read as blocked egress; it was
+partly ESPN's edge refusing the client's own user-agent, which is fixed.
+
+**The one open item is a live night.** `python3 scripts/smoke_live.py` exits 2
+out of season, because there are no games to record — not because anything is
+broken.
 
 Shipped model is **v2** (`registry/v2`, sha `2d4bf58134fa2e64`). v1 is kept for
 provenance where it exists and is deliberately refused at load by current code.
@@ -17,7 +21,7 @@ provenance where it exists and is deliberately refused at load by current code.
 **Two working copies exist and they have diverged.**
 
 - `~/Downloads/ncaa_mbb` on **cas-w7r21674vv** (this file's copy) — has
-  `registry/v1`, so all 82 tests run with none skipped. Sessions 4 and 5's work
+  `registry/v1`, so all 92 tests run with none skipped. Sessions 4 and 5's work
   was done here.
 - `%USERPROFILE%\Downloads\mbb_prob_claude` on **jpbranson-desk** — session 3's
   bit-identical rebuild. Lacks `registry/v1`, so one test skips there.
@@ -62,12 +66,14 @@ Beats ESPN in every time bucket; the gap is widest in the final minute
     validate_endgame_table.py        Phase 4, honesty check on 2024
     blend_endgame.py                 Phase 5, --tune then --test, once
     smoke_live.py                    pre-flight check for a live night
+    replay_server.py                 archived games served back as a live feed
+    archive_replay_games.py          record the games the replay server serves
     serve_live.py                    deployment entry point: poller + API
     rebuild_test_preds.py            float64 predictions from the pinned model
     build_report_data.py             data behind the published artifact
     build_source_bundle.py           regenerates cbbwp-source.md
   deploy/                LaunchAgents, Dockerfile, compose
-  tests/                 82 tests, ~6s
+  tests/                 92 tests, ~6s
   data/raw/              527 MB of hoopR parquet, 10 seasons
   data/proc/             games, team stats, 8.56M state rows
   data/live/             poller output, one JSONL per day
@@ -257,8 +263,12 @@ run book. Nothing about the model changed.
 New:
 
 - `scripts/smoke_live.py` — the eight-step pre-flight check, one command. Exit 0
-  all pass, 1 broken, **2 = offline steps pass but ESPN unreachable, so the live
-  path is still unvalidated**. Exit 2 is where the project is today.
+  all pass, 1 broken, 2 = offline steps pass but something needing the network
+  did not happen (ESPN unreachable, or no games on the slate). Out of season,
+  exit 2 is the honest answer rather than a fault.
+- `scripts/replay_server.py` and `scripts/archive_replay_games.py` — replay
+  archived ESPN games back to the unmodified deployment as a live feed, so a
+  night can be rehearsed in September.
 - `scripts/serve_live.py` — the deployment entry point: poller and API in one
   process, identical on a laptop and in a container.
 - `src/cbbwp/api.py` — read-only HTTP (`/health`, `/games`, `/games/{id}`),
@@ -282,15 +292,17 @@ returns 503. Scoped to November–15 April so it does not cry all summer.
 `build_live_context.py`. Rebuilding the snapshot alone only refreshes its
 timestamp.
 
-82 tests, none skipped. `tests/test_live_deployment.py` covers config, the API
-and the freshness signal.
+92 tests, none skipped. `tests/test_live_deployment.py` covers config, the API
+and the freshness signal; `tests/test_replay_server.py` covers the dry-run
+simulator.
 
 ## Next up
 
-1. **The live smoke test — the only thing between here and production.**
-   On a machine that can reach `site.api.espn.com`: `python3 scripts/smoke_live.py`.
-   It must exit 0. Read step 6 carefully: unknown play type ids mean the ESPN
-   feed changed, and the honest fix is to refit with the new type present.
+1. **A live night — the only thing between here and production.**
+   `python3 scripts/smoke_live.py` on a night with games; it must exit 0. Out of
+   season it exits 2 for want of games, which is not a fault. Read step 6
+   carefully: unknown play type ids mean the ESPN feed changed, and the honest
+   fix is to refit with the new type present.
 2. **Then install it:** `bash deploy/install_macos.sh`, and
    `curl -s http://127.0.0.1:8808/health`.
 3. **Refresh the ratings for the 2027 season** once games start — data first,

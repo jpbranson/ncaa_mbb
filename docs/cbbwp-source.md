@@ -1,5 +1,5 @@
 # `cbbwp` source bundle
-Complete source. Regenerated 2026-09-02 17:09 from the `ncaa_mbb` working folder, at commit `9ad3391`.
+Complete source. Regenerated 2026-09-03 12:58 from the `ncaa_mbb` working folder, at commit `a74c02e`.
 
 State rules v2, model v2. This bundle is a mirror for disaster recovery; the folder is the source of truth (it also holds the data, the fitted model and the git history). Regenerate with `python3 scripts/build_source_bundle.py` whenever the source changes.
 
@@ -83,10 +83,27 @@ doubles 5.4M rows and briefly holds them as float64. It will be OOM-killed in a
 python3 scripts/smoke_live.py             # eight steps, one verdict
 ```
 
-Exit 0 = validated. Exit 1 = broken, do not go live. **Exit 2 = the offline
-steps passed but ESPN was unreachable, so the live path is still unvalidated** —
-which is the state the project is in today, because no environment available
-during development could reach `site.api.espn.com`.
+Exit 0 = validated. Exit 1 = broken, do not go live. Exit 2 = the offline steps
+passed but something needing the network did not happen — either ESPN was
+unreachable, or no game was live or finished on the slate. The verdict says
+which.
+
+Out of season, exit 2 is the honest answer: ESPN is reachable and the adapter
+parses real payloads, but there are no games to record. See
+`docs/cbbwp-deployment.md` for what is validated and what is not.
+
+**Rehearse a live night without waiting for one:**
+
+```bash
+python3 scripts/archive_replay_games.py   # once; needs network
+python3 scripts/replay_server.py --speed 5
+CBBWP_ESPN_BASE=http://127.0.0.1:8899 python3 scripts/serve_live.py
+```
+
+`replay_server.py` speaks ESPN's protocol back to the unmodified deployment,
+serving archived games with only the plays that would have happened by now — a
+growing feed, a running clock, real status transitions. Replay rows are tagged
+`"replay": true` and written to `data/replay/`, never `data/live/`.
 
 Then:
 
@@ -162,9 +179,10 @@ src/cbbwp/
   adapters/
     hoopr.py       historical parquet -> Events   (offline)
     espn.py        live ESPN feed     -> Events   (live)
-scripts/           the pipeline, the poller, the smoke test, the monitor
+scripts/           the pipeline, the poller, the smoke test, the replay
+                   server, the monitor
 deploy/            macOS LaunchAgents, Dockerfile, compose
-tests/             82 tests
+tests/             92 tests
 docs/              the project docs, kept alongside the code
 data/, artifacts/, registry/   built locally; not source
 ```
@@ -182,6 +200,11 @@ and features. Two tests enforce it:
 
 `tests/test_replay_harness.py` adds the third: a finished game fed through the
 live path in irregular chunks must match the offline answer exactly.
+
+`tests/test_replay_server.py` covers the dry-run simulator itself — plays must
+be revealed in game order from a countdown clock, must only ever grow, and the
+finished replay must equal the archive. A dry run that fails on the simulator's
+own bugs is the worst kind of false alarm to chase at tip-off.
 ```
 
 ## `src/cbbwp/__init__.py`
@@ -235,6 +258,7 @@ is a more stable key for those than a display string.
 from __future__ import annotations
 
 import json
+import os
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
@@ -246,6 +270,20 @@ from ..state import clock_to_seconds
 SITE_API = "https://site.api.espn.com/apis/site/v2/sports/basketball/mens-college-basketball"
 SCOREBOARD_URL = SITE_API + "/scoreboard"
 SUMMARY_URL = SITE_API + "/summary"
+
+# Point the client somewhere other than ESPN. The only intended use is
+# scripts/replay_server.py, which speaks ESPN's protocol back to the unmodified
+# deployed stack so a dry run exercises the real network path rather than a
+# fixture shortcut. Unset in production; there is no default but ESPN.
+ESPN_BASE_ENV = "CBBWP_ESPN_BASE"
+
+# ESPN's edge rejects bare short user-agents ("cbbwp/0.2") and browser-claiming
+# ones sent without a browser's other headers -- both return 403, deterministically
+# (15/15 on 2026-09-02, on both the scoreboard and summary endpoints). A client
+# that identifies itself honestly, with a contact URL, passes. Verify with
+# scripts/smoke_live.py step 4 before a live night: this is a WAF rule, and WAF
+# rules change. Override without editing code by setting CBBWP_USER_AGENT.
+DEFAULT_USER_AGENT = "cbbwp/0.2 (+https://github.com/jpbranson/ncaa_mbb)"
 
 # Play type id -> the type_text the model was trained on. See module docstring.
 TYPE_ID_TO_TEXT = {
@@ -445,26 +483,51 @@ class EspnClient:
     which keeps the asyncio loop free of a third-party HTTP dependency.
     """
 
-    def __init__(self, timeout: float = 10.0, user_agent: str = "cbbwp/0.2"):
+    def __init__(self, timeout: float = 10.0, user_agent: str | None = None,
+                 base_url: str | None = None):
         self.timeout = timeout
-        self.user_agent = user_agent
+        self.user_agent = user_agent or os.environ.get(
+            "CBBWP_USER_AGENT", DEFAULT_USER_AGENT)
+        # Read per instance, not at import, so a replay run is one env var and
+        # needs no reload of an already-imported module.
+        self.base_url = (base_url or os.environ.get(ESPN_BASE_ENV)
+                         or SITE_API).rstrip("/")
+
+    @property
+    def is_replay(self) -> bool:
+        """True when pointed at something other than ESPN itself.
+
+        Anything that reports a dry run should say so with this, so a replay is
+        never mistaken for a night of real games in a log or a smoke result.
+        """
+        return self.base_url != SITE_API
 
     def _get(self, url: str, params: dict | None = None) -> dict:
         if params:
             q = "&".join(f"{k}={v}" for k, v in params.items() if v is not None)
             url = f"{url}?{q}"
         req = urllib.request.Request(url, headers={"User-Agent": self.user_agent})
-        with urllib.request.urlopen(req, timeout=self.timeout) as r:
-            return json.loads(r.read().decode("utf-8"))
+        try:
+            with urllib.request.urlopen(req, timeout=self.timeout) as r:
+                return json.loads(r.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            # Do not retry: a 403 here is a deterministic edge rule, not a blip,
+            # so a retry only burns clock during a live game. Fail loudly, and
+            # name the value that was refused.
+            if e.code in (403, 429):
+                raise urllib.error.HTTPError(
+                    e.url, e.code, f"{e.reason} -- user-agent {self.user_agent!r} "
+                    "was refused; set CBBWP_USER_AGENT", e.headers, e.fp) from None
+            raise
 
     def scoreboard(self, date: str | None = None, groups: str = "50",
                    limit: int = 500) -> dict:
         """`date` is YYYYMMDD. groups=50 is Division I."""
-        return self._get(SCOREBOARD_URL,
+        return self._get(self.base_url + "/scoreboard",
                          {"dates": date, "groups": groups, "limit": limit})
 
     def summary(self, event_id: int | str) -> dict:
-        return self._get(SUMMARY_URL, {"event": event_id})
+        return self._get(self.base_url + "/summary", {"event": event_id})
 ```
 
 ## `src/cbbwp/adapters/hoopr.py`
@@ -2467,6 +2530,109 @@ def build_states(
             )
         )
     return states
+```
+
+## `scripts/archive_replay_games.py`
+
+```py
+"""Archive real ESPN games for the replay server to serve back.
+
+Needs network. Run once; the payloads are then reusable offline forever, which
+is the point - a dry run of the live path should not depend on ESPN being up,
+or on it being basketball season.
+
+    python3 scripts/archive_replay_games.py                # the default set
+    python3 scripts/archive_replay_games.py --date 20260307 --limit 10
+    python3 scripts/archive_replay_games.py --game 401808285
+
+The default set is chosen, not sampled. A replay is only worth running if it
+puts the model somewhere interesting, and "somewhere interesting" for a win
+probability model means: games decided in the last possession, at least one
+overtime, and a blowout to check the model does not dither when the answer is
+obvious. Blowouts matter as much as thrillers here - a model that hedges at 40
+points up is as wrong as one that panics at 1 point up.
+
+Payloads land in `tmp/replay/`, which is gitignored: they are ~500KB each and
+reproducible from this script, so they are a build product, not source.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import pathlib
+import sys
+
+ROOT = pathlib.Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "src"))
+
+from cbbwp.adapters.espn import (EspnClient, parse_summary,  # noqa: E402
+                                 scoreboard_games)
+
+# (game_id, why it is in the set). All from the 2025-26 season.
+DEFAULT_GAMES = [
+    (401856600, "2026 national championship, UConn/Michigan, 6-point game"),
+    (401808285, "overtime: Arkansas at Missouri, 3 periods"),
+    (401820791, "decided by 1: Stanford at NC State"),
+    (401822973, "6-point conference game: UConn at Marquette"),
+    (401820788, "rivalry, 15-point margin: UNC at Duke"),
+    (401856599, "blowout, 18 points: Michigan vs Arizona (Final Four)"),
+]
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--out", default=str(ROOT / "tmp/replay"))
+    ap.add_argument("--game", type=int, action="append",
+                    help="archive this game id instead of the default set")
+    ap.add_argument("--date", help="archive completed games from this slate")
+    ap.add_argument("--limit", type=int, default=10, help="with --date")
+    a = ap.parse_args()
+
+    out = pathlib.Path(a.out)
+    out.mkdir(parents=True, exist_ok=True)
+    c = EspnClient()
+    if c.is_replay:
+        print("refusing to archive from a replay server -- unset CBBWP_ESPN_BASE",
+              file=sys.stderr)
+        return 1
+
+    if a.game:
+        wanted = [(g, "requested") for g in a.game]
+    elif a.date:
+        games = [g for g in scoreboard_games(c.scoreboard(a.date))
+                 if g["completed"]]
+        wanted = [(g["game_id"], f"{a.date}: {g['name']}")
+                  for g in games[:a.limit]]
+        print(f"{a.date}: {len(games)} completed games, taking {len(wanted)}")
+    else:
+        wanted = DEFAULT_GAMES
+
+    ok = 0
+    for gid, why in wanted:
+        try:
+            payload = c.summary(gid)
+            events, header = parse_summary(payload)
+            if not events:
+                print(f"  {gid}  SKIP -- no plays (not started?)")
+                continue
+            (out / f"summary_{gid}.json").write_text(json.dumps(payload))
+            last = events[-1]
+            print(f"  {gid}  {len(events):>4} plays  "
+                  f"{last.away_score}-{last.home_score}  "
+                  f"{max(e.period for e in events)} periods  -- {why}")
+            ok += 1
+        except Exception as e:                          # noqa: BLE001
+            print(f"  {gid}  FAILED -- {type(e).__name__}: {e}", file=sys.stderr)
+
+    print(f"\n{ok}/{len(wanted)} archived in {out}")
+    if ok:
+        print("now: python3 scripts/replay_server.py --speed 60")
+    return 0 if ok else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
 ```
 
 ## `scripts/blend_endgame.py`
@@ -4571,6 +4737,12 @@ class Poller:
                         last["home_team_id"] = header.home_team_id
                         last["away_team_id"] = header.away_team_id
                         last["status"] = header.status
+                        # A simulated row must never be mistakable for a real
+                        # one. The JSONL is the record of truth, and it is
+                        # appended to, so an untagged dry run would leave fake
+                        # states in the durable record permanently.
+                        if self.client.is_replay:
+                            last["replay"] = True
                         self.emit(last, header)
                     secs = last["game_seconds_remaining"]
                 else:
@@ -4826,10 +4998,13 @@ if __name__ == "__main__":
 ```py
 """Record real ESPN payloads to disk, so the adapter can be tested against them.
 
-Run this on a machine that can reach ESPN (the sandbox this package was built
-in cannot - site.api.espn.com is blocked by egress policy). It saves the raw
-JSON exactly as returned; nothing is parsed or normalised, so the fixtures stay
-useful even if the adapter changes.
+Run this on a machine that can reach ESPN. It saves the raw JSON exactly as
+returned; nothing is parsed or normalised, so the fixtures stay useful even if
+the adapter changes.
+
+Games that have not started are skipped: they carry no plays, so recording one
+yields a fixture that proves nothing while looking just like a real one. Out of
+season that means nothing is recorded at all, which is the honest outcome.
 
     python3 scripts/record_espn_fixtures.py --date 20261115 --limit 5
     python3 scripts/record_espn_fixtures.py --game 401585555
@@ -4862,10 +5037,18 @@ else:
     sb = c.scoreboard(day)
     (out / "scoreboard.json").write_text(json.dumps(sb))
     games = scoreboard_games(sb)
-    print(f"scoreboard {day}: {len(games)} games")
-    # prefer games that are live or finished - a scheduled game has no plays
-    games.sort(key=lambda g: (g["status"] == "STATUS_SCHEDULED", g["game_id"]))
-    ids = [g["game_id"] for g in games[:a.limit]]
+    # A scheduled game carries no plays, so recording one produces a fixture
+    # that proves nothing while looking exactly like a real one. Drop them
+    # rather than sorting them to the back: out of season the whole slate is
+    # scheduled, and a directory of empty payloads is worse than none.
+    playable = [g for g in games if g["status"] != "STATUS_SCHEDULED"]
+    n_sched = len(games) - len(playable)
+    print(f"scoreboard {day}: {len(games)} games"
+          + (f" ({n_sched} not started yet, skipped)" if n_sched else ""))
+    if not playable:
+        print("no games with plays on this slate -- nothing to record")
+    playable.sort(key=lambda g: g["game_id"])
+    ids = [g["game_id"] for g in playable[:a.limit]]
 
 for gid in ids:
     s = c.summary(gid)
@@ -4873,6 +5056,350 @@ for gid in ids:
     p.write_text(json.dumps(s))
     print(f"  wrote {p.name}  ({len(s.get('plays') or []):,} plays)")
 print(f"\n{len(ids)} fixture(s) in {out}")
+```
+
+## `scripts/replay_server.py`
+
+```py
+"""Serve archived ESPN games back as if they were happening now.
+
+The gap this closes
+-------------------
+Everything in the live path had only ever been fed FINISHED games: a complete
+`plays` array, arriving all at once, with `STATUS_FINAL` on it. A real night
+looks nothing like that. The plays array grows between polls, the status starts
+scheduled and ends final, and the clock runs. `smoke_live.py` says so in its own
+verdict - "UNVALIDATED against a running clock".
+
+This script closes that gap without waiting for November. It speaks ESPN's
+protocol - the same two endpoints, the same JSON - and serves archived games
+with only the plays that would have occurred by now. Point the real deployment
+at it and nothing in the stack knows the difference:
+
+    python3 scripts/archive_replay_games.py            # once, needs network
+    python3 scripts/replay_server.py --speed 60        # terminal 1
+    CBBWP_ESPN_BASE=http://127.0.0.1:8899 \\
+        python3 scripts/serve_live.py --date 20260307  # terminal 2
+
+That is the whole point: the poller uses its real `EspnClient`, over real HTTP,
+with its real retry and backoff behaviour. A fixture directory would skip all of
+that, which is why `--fixture-dir` is not the same test.
+
+What is faithful, and what is not
+---------------------------------
+Faithful: payload shape (raw archived JSON, only the plays list truncated),
+growing plays, status transitions, `displayClock` and `period`, several games on
+one scoreboard progressing independently.
+
+NOT faithful, deliberately:
+  * Plays are revealed by their own clock, so they arrive in bursts at whatever
+    rate the game had. Real polls see steadier trickle.
+  * ESPN's retroactive corrections - a play inserted, rescored or deleted
+    minutes later - are not simulated. The poller is built to be immune to those
+    by replaying the whole game each poll, so this does not exercise that.
+  * No rate limiting, no 403s, no partial outages. `--flaky` injects errors when
+    that is what you want to test.
+
+A replay is a rehearsal, not a validation of live play. It cannot tell you ESPN
+did not change the feed since the archive was taken.
+"""
+from __future__ import annotations
+
+import argparse
+import copy
+import json
+import pathlib
+import re
+import sys
+import threading
+import time
+import urllib.parse
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from typing import Optional
+
+ROOT = pathlib.Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "src"))
+
+from cbbwp.adapters.espn import STATUS_FINAL, STATUS_PRE  # noqa: E402
+
+# Regulation is two 20-minute halves; overtimes are 5 minutes each.
+HALF_SECONDS = 20 * 60
+OT_SECONDS = 5 * 60
+STATUS_IN = "STATUS_IN_PROGRESS"
+
+
+def _int(v, default=0) -> int:
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return default
+
+
+def elapsed_seconds(play: dict) -> float:
+    """Seconds of game time from tip-off to this play.
+
+    ESPN gives period plus a COUNTDOWN clock, so this converts to a monotonic
+    ordinate. Without it, plays cannot be released in the order they happened.
+    """
+    period = _int((play.get("period") or {}).get("number"), 1) or 1
+    disp = str((play.get("clock") or {}).get("displayValue") or "")
+    m = re.match(r"^(\d+):(\d+)", disp)
+    if m:
+        remaining = int(m.group(1)) * 60 + int(m.group(2))
+    else:
+        m2 = re.match(r"^(\d+)\.(\d+)$", disp)      # under a minute: "42.7"
+        remaining = float(m2.group(1)) if m2 else 0.0
+    if period <= 2:
+        before = (period - 1) * HALF_SECONDS
+        return before + (HALF_SECONDS - remaining)
+    before = 2 * HALF_SECONDS + (period - 3) * OT_SECONDS
+    return before + (OT_SECONDS - remaining)
+
+
+def clock_display(remaining: float) -> str:
+    """ESPN's own formatting: m:ss, but tenths inside the last minute."""
+    remaining = max(0.0, remaining)
+    if remaining < 60:
+        return f"{remaining:.1f}"
+    return f"{int(remaining) // 60}:{int(remaining) % 60:02d}"
+
+
+class ReplayGame:
+    """One archived game, revealed as its own clock advances."""
+
+    def __init__(self, path: pathlib.Path, tip_offset: float = 0.0):
+        self.path = path
+        self.payload = json.loads(path.read_text())
+        self.game_id = int(path.stem.split("_")[1])
+        self.tip_offset = tip_offset          # replay seconds before tip-off
+        plays = self.payload.get("plays") or []
+        # Sort by game time. The archive is already in order, but a replay that
+        # depends on the archive being sorted breaks silently if it is not.
+        self.plays = sorted(plays, key=elapsed_seconds)
+        self.marks = [elapsed_seconds(p) for p in self.plays]
+        self.duration = self.marks[-1] if self.marks else 0.0
+        self.max_period = max(
+            (_int((p.get("period") or {}).get("number"), 1) for p in self.plays),
+            default=2)
+        hdr = (self.payload.get("header") or {})
+        comp = (hdr.get("competitions") or [{}])[0]
+        self.name = " @ ".join(
+            (c.get("team") or {}).get("abbreviation") or "?"
+            for c in sorted(comp.get("competitors") or [],
+                            key=lambda c: c.get("homeAway") != "away"))
+
+    def game_clock(self, elapsed: float) -> float:
+        """Game seconds elapsed, given replay seconds since this game's tip."""
+        return max(0.0, elapsed - self.tip_offset)
+
+    def state(self, elapsed: float) -> str:
+        g = self.game_clock(elapsed)
+        if elapsed < self.tip_offset:
+            return STATUS_PRE
+        return STATUS_FINAL if g >= self.duration else STATUS_IN
+
+    def n_revealed(self, elapsed: float) -> int:
+        g = self.game_clock(elapsed)
+        if elapsed < self.tip_offset:
+            return 0
+        if g >= self.duration:
+            return len(self.plays)
+        lo, hi = 0, len(self.marks)
+        while lo < hi:                          # bisect_right, no import
+            mid = (lo + hi) // 2
+            if self.marks[mid] <= g:
+                lo = mid + 1
+            else:
+                hi = mid
+        return lo
+
+    def period_and_clock(self, elapsed: float) -> tuple[int, str]:
+        g = self.game_clock(elapsed)
+        if g >= self.duration:
+            return self.max_period, "0.0"
+        if g < HALF_SECONDS:
+            return 1, clock_display(HALF_SECONDS - g)
+        if g < 2 * HALF_SECONDS:
+            return 2, clock_display(2 * HALF_SECONDS - g)
+        into_ot = g - 2 * HALF_SECONDS
+        ot = int(into_ot // OT_SECONDS) + 1
+        return 2 + ot, clock_display(OT_SECONDS - (into_ot % OT_SECONDS))
+
+    def summary(self, elapsed: float) -> dict:
+        """The archived payload, truncated to what has happened by `elapsed`."""
+        n = self.n_revealed(elapsed)
+        out = copy.deepcopy(self.payload)
+        out["plays"] = self.plays[:n]
+        status, (period, disp) = self.state(elapsed), self.period_and_clock(elapsed)
+        last = self.plays[n - 1] if n else None
+        home = _int((last or {}).get("homeScore"), 0)
+        away = _int((last or {}).get("awayScore"), 0)
+
+        comp = ((out.get("header") or {}).get("competitions") or [{}])[0]
+        comp["status"] = {
+            "period": period, "displayClock": disp,
+            "type": {"name": status, "completed": status == STATUS_FINAL,
+                     "state": {"STATUS_SCHEDULED": "pre", STATUS_IN: "in",
+                               STATUS_FINAL: "post"}[status]},
+        }
+        for c in comp.get("competitors") or []:
+            c["score"] = str(home if c.get("homeAway") == "home" else away)
+        return out
+
+    def scoreboard_event(self, elapsed: float) -> dict:
+        """This game as one entry in a scoreboard payload."""
+        status = self.state(elapsed)
+        period, disp = self.period_and_clock(elapsed)
+        comp = ((self.payload.get("header") or {}).get("competitions") or [{}])[0]
+        n = self.n_revealed(elapsed)
+        last = self.plays[n - 1] if n else None
+        competitors = []
+        for c in comp.get("competitors") or []:
+            side = c.get("homeAway")
+            score = _int((last or {}).get(
+                "homeScore" if side == "home" else "awayScore"), 0)
+            competitors.append({"homeAway": side, "score": str(score),
+                                "team": c.get("team") or {}})
+        return {
+            "id": str(self.game_id),
+            "shortName": self.name,
+            "date": (self.payload.get("header") or {}).get("date") or "",
+            "competitions": [{
+                "id": str(self.game_id),
+                "neutralSite": bool(comp.get("neutralSite")),
+                "competitors": competitors,
+                "status": {
+                    "period": period, "displayClock": disp,
+                    "type": {"name": status,
+                             "completed": status == STATUS_FINAL,
+                             "state": {"STATUS_SCHEDULED": "pre", STATUS_IN: "in",
+                                       STATUS_FINAL: "post"}[status]},
+                },
+            }],
+        }
+
+
+class Replay:
+    """The slate: every archived game, on one shared replay clock."""
+
+    def __init__(self, games: list[ReplayGame], speed: float):
+        self.games = games
+        self.speed = speed
+        self.t0 = time.time()
+        self.requests = 0
+        self.lock = threading.Lock()
+
+    @property
+    def elapsed(self) -> float:
+        """Game seconds since the replay started."""
+        return (time.time() - self.t0) * self.speed
+
+    def by_id(self, gid: int) -> Optional[ReplayGame]:
+        return next((g for g in self.games if g.game_id == gid), None)
+
+    def done(self) -> bool:
+        e = self.elapsed
+        return all(g.state(e) == STATUS_FINAL for g in self.games)
+
+
+class Handler(BaseHTTPRequestHandler):
+    replay: Replay = None           # set on the server before serve_forever
+    flaky: float = 0.0
+
+    def log_message(self, *args):   # quiet; the run prints its own progress
+        pass
+
+    def _send(self, code: int, body: dict) -> None:
+        raw = json.dumps(body).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(raw)))
+        self.end_headers()
+        self.wfile.write(raw)
+
+    def do_GET(self) -> None:                       # noqa: N802
+        r = self.replay
+        with r.lock:
+            r.requests += 1
+            n = r.requests
+        # Deterministic fault injection: every Nth request fails. Deterministic
+        # rather than random so a failing dry run can be re-run identically.
+        if self.flaky and n % int(1 / self.flaky) == 0:
+            self._send(503, {"error": "injected fault"})
+            return
+
+        parsed = urllib.parse.urlparse(self.path)
+        q = urllib.parse.parse_qs(parsed.query)
+        e = r.elapsed
+
+        if parsed.path.endswith("/scoreboard"):
+            self._send(200, {"events": [g.scoreboard_event(e) for g in r.games]})
+        elif parsed.path.endswith("/summary"):
+            gid = _int((q.get("event") or ["0"])[0])
+            g = r.by_id(gid)
+            if g is None:
+                self._send(404, {"error": f"no archived game {gid}"})
+            else:
+                self._send(200, g.summary(e))
+        else:
+            self._send(404, {"error": f"unhandled path {parsed.path}"})
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--dir", default=str(ROOT / "tmp/replay"),
+                    help="directory of archived summary_*.json")
+    ap.add_argument("--port", type=int, default=8899)
+    ap.add_argument("--speed", type=float, default=60.0,
+                    help="game seconds per real second (60 = a half in 20s)")
+    ap.add_argument("--stagger", type=float, default=0.0,
+                    help="game seconds between tip-offs, so games start apart")
+    ap.add_argument("--flaky", type=float, default=0.0,
+                    help="fail this fraction of requests, e.g. 0.1 for 1 in 10")
+    ap.add_argument("--game", type=int, action="append",
+                    help="replay only this game id (repeatable)")
+    a = ap.parse_args()
+
+    d = pathlib.Path(a.dir)
+    paths = sorted(d.glob("summary_*.json"))
+    if a.game:
+        want = {str(g) for g in a.game}
+        paths = [p for p in paths if p.stem.split("_")[1] in want]
+    if not paths:
+        print(f"no archived games in {d} -- run scripts/archive_replay_games.py",
+              file=sys.stderr)
+        return 1
+
+    games = [ReplayGame(p, tip_offset=i * a.stagger)
+             for i, p in enumerate(paths)]
+    replay = Replay(games, a.speed)
+
+    print(f"replaying {len(games)} game(s) at {a.speed}x from {d}")
+    for g in games:
+        print(f"  {g.game_id}  {g.name:<24} {len(g.plays):>4} plays  "
+              f"{g.duration/60:.0f} min of game time"
+              + (f"  tip +{g.tip_offset/60:.0f} min" if g.tip_offset else ""))
+    longest = max(g.tip_offset + g.duration for g in games)
+    print(f"\nfull slate takes {longest / a.speed / 60:.1f} real minutes")
+    print(f"serving on http://127.0.0.1:{a.port}\n\npoint the deployment at it:")
+    print(f"  CBBWP_ESPN_BASE=http://127.0.0.1:{a.port} "
+          f"python3 scripts/serve_live.py\n")
+
+    Handler.replay = replay
+    Handler.flaky = a.flaky
+    httpd = ThreadingHTTPServer(("127.0.0.1", a.port), Handler)
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        print("\nstopped")
+    finally:
+        httpd.server_close()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
 ```
 
 ## `scripts/serve_live.py`
@@ -4955,6 +5482,17 @@ def main() -> int:
     day = a.date or datetime.datetime.now().strftime("%Y%m%d")
     out = cfg.live_dir / f"wp_{day}.jsonl"
 
+    # A dry run against scripts/replay_server.py is a rehearsal, not a night of
+    # basketball. Say so loudly, and default its output somewhere separate, so
+    # simulated states cannot silently accumulate in the real record.
+    client = EspnClient()
+    if client.is_replay:
+        if cfg.live_dir == pathlib.Path(cfg.root) / "data" / "live":
+            out = pathlib.Path(cfg.root) / "data" / "replay" / f"wp_{day}.jsonl"
+        print(f"\n*** REPLAY MODE -- reading {client.base_url}, NOT ESPN.\n"
+              f"*** Rows are tagged \"replay\": true and written to {out}\n",
+              flush=True)
+
     store = LiveStore(history=cfg.api_history)
     httpd = None
     if not a.no_api:
@@ -4968,7 +5506,7 @@ def main() -> int:
             lambda: ctx.data_is_stale)
         print(f"api listening on http://{cfg.api_host}:{cfg.api_port}", flush=True)
 
-    poller = Poller(svc, ctx, EspnClient(), out, quiet=a.quiet,
+    poller = Poller(svc, ctx, client, out, quiet=a.quiet,
                     fixture_dir=cfg.fixture_dir, sink=store.update)
 
     loop = asyncio.new_event_loop()
@@ -4999,10 +5537,9 @@ if __name__ == "__main__":
 """The pre-flight check for a live night. One command, clear pass or fail.
 
 This is the only part of the system the offline test suite cannot cover, because
-it needs the real ESPN endpoint. It has never been run: neither the sandbox this
-was built in nor the Cowork device VM can reach `site.api.espn.com`. Run it on a
-machine with open network access, and run it BEFORE the first live night rather
-than during it.
+it needs the real ESPN endpoint. First run with open egress: 2026-09-02, which
+found that ESPN 403s the client's default user-agent (see cbbwp-deployment.md).
+Run it BEFORE a live night rather than during one.
 
     python3 scripts/smoke_live.py                 # full check, records fixtures
     python3 scripts/smoke_live.py --offline       # everything needing no network
@@ -5010,7 +5547,18 @@ than during it.
 
 Steps 1-3 and 8 work offline. Steps 4-7 need the network; if step 4 fails, the
 network steps are reported BLOCKED rather than FAILED, because "we could not
-reach ESPN from here" is a different fact from "the adapter is broken".
+reach ESPN from here" is a different fact from "the adapter is broken". The one
+exception is a 403/429 from ESPN: that is ESPN refusing US, not the network
+refusing to route, so it is a FAIL. Reporting it as blocked egress is what hid a
+real user-agent rule for an entire build cycle.
+
+Out of season, step 5 reports BLOCKED: the slate is all scheduled games, which
+carry no plays, so there is nothing to record. Steps 6 and 7 then run against
+whatever payloads are already on disk and say so in their detail line.
+
+What this cannot rehearse -- a feed that GROWS between polls -- is covered by
+scripts/replay_server.py, which serves archived games back to the unmodified
+deployment as a live feed. That is a rehearsal, not a substitute for this.
 
 Exit code 0 only if nothing FAILED. Blocked steps exit 2, so a scheduled run can
 tell "not validated yet" from "validated and broken".
@@ -5119,7 +5667,14 @@ def main() -> int:
             games = scoreboard_games(sb)
             reachable = True
             record("4 ESPN reachable", PASS,
-                   f"{len(games)} games on the slate, {time.time()-t0:.1f}s")
+                   f"{len(games)} games on the slate, {time.time()-t0:.1f}s, "
+                   f"ua={EspnClient().user_agent!r}")
+        except urllib.error.HTTPError as e:
+            # A 403/429 is ESPN refusing US, not the network refusing to route.
+            # Calling that "blocked egress" is what hid the user-agent rule for
+            # a whole build cycle, so name it as a real failure.
+            record("4 ESPN reachable", FAIL if e.code in (403, 429) else BLOCKED,
+                   f"HTTP {e.code}: {e.reason} -- ua={EspnClient().user_agent!r}")
         except (urllib.error.URLError, OSError, TimeoutError) as e:
             record("4 ESPN reachable", BLOCKED,
                    f"{type(e).__name__}: {e} -- run where egress is open")
@@ -5131,23 +5686,52 @@ def main() -> int:
                 record(n, BLOCKED, "no route to ESPN")
         else:
             # 5 --- record what ESPN is sending today ----------------------
+            # Count only payloads THIS run wrote. Counting whatever is already
+            # in the directory turns a day-old fixture into a green tick: on
+            # 2026-09-02 an empty offseason slate recorded nothing and step 5
+            # still passed, on files from the day before.
+            t_start = time.time()
             cmd = ["scripts/record_espn_fixtures.py", "--limit", str(a.limit),
                    "--out", str(fixtures)]
             if a.date:
                 cmd += ["--date", a.date]
             r = run(cmd)
-            n_fix = len(list(fixtures.glob("summary_*.json")))
-            record("5 record fixtures", PASS if r.returncode == 0 and n_fix else FAIL,
-                   f"{n_fix} payloads in {fixtures}"
-                   + ("" if r.returncode == 0 else f" -- {r.stderr.strip()[:200]}"))
+
+            def _fresh() -> list[pathlib.Path]:
+                return [q for q in fixtures.glob("summary_*.json")
+                        if q.stat().st_mtime >= t_start]
+
+            fresh, stale = _fresh(), list(fixtures.glob("summary_*.json"))
+            n_stale = len(stale) - len(fresh)
+            if r.returncode != 0:
+                record("5 record fixtures", FAIL,
+                       f"recorder exited {r.returncode} -- {r.stderr.strip()[:200]}")
+            elif fresh:
+                record("5 record fixtures", PASS,
+                       f"{len(fresh)} payloads recorded into {fixtures}")
+            else:
+                # No games with plays on this slate. Real in the offseason, and
+                # not the adapter's fault -- but it is not validation either.
+                record("5 record fixtures", BLOCKED,
+                       "no games with plays on this slate -- nothing recorded"
+                       + (f"; {n_stale} older payload(s) left in {fixtures}"
+                          if n_stale else ""))
 
             # 6 --- does the adapter understand them? ----------------------
+            # Steps 6 and 7 still run against whatever payloads exist, because
+            # parsing a real payload is worth checking even when it is an old
+            # one -- but say so, so the tick is not read as "today's feed".
+            age = ""
+            if not fresh and stale:
+                oldest = min(q.stat().st_mtime for q in stale)
+                age = (f" -- against {len(stale)} payload(s) "
+                       f"{(time.time() - oldest) / 86400:.1f}d old, NOT today's feed")
             r = run(["scripts/check_espn_fixtures.py", "--dir", str(fixtures)])
             out = r.stdout
             unknown = "PLAY TYPES THE MODEL HAS NEVER SEEN" in out
             record("6 fixture sanity", PASS if r.returncode == 0 else FAIL,
-                   "unknown play types present -- see below" if unknown
-                   else "no unknown play types")
+                   ("unknown play types present -- see below" if unknown
+                    else "no unknown play types") + age)
             if unknown:
                 print(out[out.index("PLAY TYPES THE MODEL"):][:1200], flush=True)
 
@@ -5159,7 +5743,7 @@ def main() -> int:
                 r = run(["scripts/live_poller.py", "--game", ids[0], "--once"])
                 good = r.returncode == 0 and "states" in r.stdout
                 record("7 one live poll", PASS if good else FAIL,
-                       (r.stdout.strip().splitlines() or [""])[0][:160]
+                       ((r.stdout.strip().splitlines() or [""])[0][:160] + age)
                        if good else r.stderr.strip()[:200])
 
     # 8 --- the API serves; no network needed ------------------------------
@@ -5191,9 +5775,20 @@ def main() -> int:
         print("Do not go live until these pass.")
         return 1
     if blocked:
-        print(f"BLOCKED: {len(blocked)} step(s) could not reach ESPN.")
-        print("Everything testable without the network passed. The live path is\n"
-              "still UNVALIDATED -- re-run this where egress is open.")
+        # Two different reasons land here, and they need different advice:
+        # ESPN unreachable (fix the machine) vs. reachable but no games to
+        # watch (fix nothing, come back in season). Step 4 tells them apart.
+        espn_ok = any(n.startswith("4 ") and st == PASS for n, st, _ in results)
+        print(f"BLOCKED: {len(blocked)} step(s) -- {', '.join(blocked)}")
+        if espn_ok:
+            print("ESPN is reachable and the adapter parses real payloads, but no\n"
+                  "game was live or finished on this slate, so nothing was recorded\n"
+                  "from today's feed. What is untested is ESPN DURING A REAL GAME --\n"
+                  "re-run this on a night with games. To rehearse the running clock\n"
+                  "now, see scripts/replay_server.py.")
+        else:
+            print("Everything testable without the network passed. The live path is\n"
+                  "still UNVALIDATED -- re-run this where egress is open.")
         return 2
     skipped_network = [n for n, s_, _ in results
                        if s_ == SKIP and n[0] in "4567"]
@@ -5817,6 +6412,50 @@ def test_the_current_model_loads():
         pytest.skip("no v2 artifact built yet")
     svc = WinProbabilityService(ROOT / "registry", "v2")
     assert svc.manifest["state_rules_version"] == 2
+
+
+def test_default_user_agent_carries_a_contact_url():
+    """ESPN's edge 403s bare short user-agents; the contact URL is what passes.
+
+    Measured 2026-09-02: "cbbwp/0.2" got 403 on 15/15 requests, and
+    "cbbwp/0.2 (+https://github.com/jpbranson/ncaa_mbb)" got 200 on 15/15, on
+    both the scoreboard and summary endpoints. The property that matters is the
+    contact URL, not the exact string - so that is what is asserted here, to
+    stop a well-meaning tidy-up ("shorten this ugly literal") from silently
+    breaking the live path months before anyone runs it again.
+    """
+    from cbbwp.adapters.espn import DEFAULT_USER_AGENT
+    assert "(+http" in DEFAULT_USER_AGENT
+    assert len(DEFAULT_USER_AGENT) > 20
+
+
+def test_user_agent_is_overridable_by_environment(monkeypatch):
+    """A WAF change must be a config edit plus a restart, never a code edit."""
+    from cbbwp.adapters.espn import DEFAULT_USER_AGENT, EspnClient
+    monkeypatch.setenv("CBBWP_USER_AGENT", "someone-else/9.9 (+https://example.org)")
+    assert EspnClient().user_agent == "someone-else/9.9 (+https://example.org)"
+    assert EspnClient(user_agent="explicit/1").user_agent == "explicit/1"
+    monkeypatch.delenv("CBBWP_USER_AGENT")
+    assert EspnClient().user_agent == DEFAULT_USER_AGENT
+
+
+def test_the_client_points_at_espn_unless_told_otherwise(monkeypatch):
+    """The replay hook must never become the default.
+
+    `CBBWP_ESPN_BASE` exists so scripts/replay_server.py can stand in for ESPN
+    during a dry run. A default pointing anywhere else would mean a live night
+    silently scoring simulated games.
+    """
+    from cbbwp.adapters.espn import SITE_API, EspnClient
+    monkeypatch.delenv("CBBWP_ESPN_BASE", raising=False)
+    c = EspnClient()
+    assert c.base_url == SITE_API
+    assert c.is_replay is False
+
+    monkeypatch.setenv("CBBWP_ESPN_BASE", "http://127.0.0.1:8899/")
+    r = EspnClient()
+    assert r.base_url == "http://127.0.0.1:8899"      # trailing slash trimmed
+    assert r.is_replay is True
 ```
 
 ## `tests/test_features.py`
@@ -6425,6 +7064,127 @@ def test_probabilities_are_bounded_and_finite(svc, game):
     ctx = PregameContext(events[0].game_id, home_id, away_id)
     p = np.array([r["home_win_prob"] for r in svc.score_game(events, ctx)])
     assert np.all(np.isfinite(p)) and p.min() >= 0.0 and p.max() <= 1.0
+```
+
+## `tests/test_replay_server.py`
+
+```py
+"""The replay server has to be trustworthy before a dry run means anything.
+
+If this thing reveals plays out of order, or lets the plays array shrink between
+polls, then a dry run is testing the simulator's bugs rather than the model's
+behaviour - and it would look like a live-path failure, which is the worst kind
+of false alarm to chase at tip-off.
+
+These run against whatever is in `tmp/replay/`, which is gitignored, so they
+skip when the archive has not been built. That is deliberate: the archive is a
+build product (`scripts/archive_replay_games.py`), not source.
+"""
+import pathlib
+import sys
+
+import pytest
+
+ROOT = pathlib.Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "scripts"))
+sys.path.insert(0, str(ROOT / "src"))
+
+from cbbwp.adapters.espn import STATUS_FINAL, STATUS_PRE, parse_summary  # noqa: E402
+
+REPLAY_DIR = ROOT / "tmp/replay"
+ARCHIVES = sorted(REPLAY_DIR.glob("summary_*.json")) if REPLAY_DIR.exists() else []
+
+pytestmark = pytest.mark.skipif(
+    not ARCHIVES, reason="no replay archive; run scripts/archive_replay_games.py")
+
+
+@pytest.fixture(scope="module")
+def games():
+    from replay_server import ReplayGame
+    return [ReplayGame(p) for p in ARCHIVES]
+
+
+def test_elapsed_seconds_is_monotonic_in_the_archive(games):
+    """ESPN's countdown clock must convert to a monotonic ordinate.
+
+    Period plus a counting-DOWN clock cannot be compared directly; getting this
+    wrong would reveal the second half before the first.
+    """
+    from replay_server import elapsed_seconds
+    for g in games:
+        marks = [elapsed_seconds(p) for p in g.plays]
+        assert marks == sorted(marks), f"{g.game_id} not monotonic"
+        assert marks[0] <= 60.0, f"{g.game_id} does not start near tip-off"
+
+
+def test_plays_only_ever_grow(games):
+    """The poller tolerates corrections, but a shrinking feed is not realistic."""
+    for g in games:
+        counts = [g.n_revealed(t) for t in range(0, int(g.duration) + 120, 30)]
+        assert counts == sorted(counts), f"{g.game_id} revealed count went backwards"
+        # At t=0 the opening tip has happened, so one play is correct. What must
+        # not happen is anything being visible BEFORE tip-off.
+        assert g.n_revealed(-1.0) == 0, f"{g.game_id} leaked plays before tip"
+        assert counts[0] <= 1, f"{g.game_id} revealed {counts[0]} plays at tip"
+        assert counts[-1] == len(g.plays), f"{g.game_id} never revealed everything"
+
+
+def test_status_goes_scheduled_then_in_progress_then_final(games):
+    from replay_server import STATUS_IN
+    for g in games:
+        assert g.state(-1.0) == STATUS_PRE
+        assert g.state(g.duration / 2) == STATUS_IN
+        assert g.state(g.duration + 1) == STATUS_FINAL
+
+
+def test_the_finished_replay_equals_the_archive(games):
+    """The end of a replay must be the real game, or the dry run proves nothing."""
+    for g in games:
+        final = g.summary(g.duration + 1)
+        assert len(final["plays"]) == len(g.plays)
+        events, header = parse_summary(final)
+        assert header.status == STATUS_FINAL
+        assert len(events) == len(g.plays)
+
+
+def test_a_mid_game_payload_still_parses_and_is_live(games):
+    """Half a game is the case the live path had never actually been given."""
+    from cbbwp.adapters.espn import header_from_summary
+    for g in games:
+        mid = g.summary(g.duration / 2)
+        assert 0 < len(mid["plays"]) < len(g.plays)
+        h = header_from_summary(mid)
+        assert h.is_live and not h.is_final
+        events, _ = parse_summary(mid)
+        # Dense 1..N numbering must hold on a partial feed too - that is what
+        # makes a live state comparable to the same state built offline.
+        assert [e.seq for e in events] == list(range(1, len(events) + 1))
+
+
+def test_the_clock_counts_down_within_a_period(games):
+    """A clock that runs backwards would drive the endgame model insane."""
+    g = games[0]
+    p1, c1 = g.period_and_clock(60)
+    p2, c2 = g.period_and_clock(360)
+    assert p1 == p2 == 1
+    to_s = lambda d: (int(d.split(":")[0]) * 60 + int(d.split(":")[1])
+                      if ":" in d else float(d))
+    assert to_s(c1) > to_s(c2)
+
+
+def test_scores_track_the_revealed_plays(games):
+    """The header score must agree with the plays shown, not the final score."""
+    for g in games:
+        mid = g.summary(g.duration / 2)
+        comp = (mid["header"]["competitions"])[0]
+        shown = {c["homeAway"]: int(c["score"]) for c in comp["competitors"]}
+        last = mid["plays"][-1]
+        assert shown["home"] == int(last["homeScore"])
+        assert shown["away"] == int(last["awayScore"])
+        final = g.summary(g.duration + 1)
+        fcomp = (final["header"]["competitions"])[0]
+        fshown = {c["homeAway"]: int(c["score"]) for c in fcomp["competitors"]}
+        assert (fshown["home"], fshown["away"]) != (0, 0)
 ```
 
 ## `tests/test_state.py`
