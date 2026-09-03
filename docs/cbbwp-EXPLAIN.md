@@ -1055,11 +1055,31 @@ championship payload has 12 inversions in 482 plays, e.g. `120416951` followed
 by `120416904` while the clock runs correctly forwards. Sorting on it took
 correct data and shuffled it.
 
-**What it cost.** Displacements as large as 986 seconds, one of them stepping
-from period 2 back into period 1, and mid-game win probability moving by up to
-**26.7 points**. Final probabilities were identical in every game, which is
-exactly why nothing ever complained: a displaced play perturbs the path and
-washes out by the buzzer.
+**What it cost — measured carefully, because the first measurement was wrong.**
+Displacements as large as 986 seconds, one of them stepping from period 2 back
+into period 1. The states fed to the model were genuinely wrong: they disagreed
+with the states hoopR produces for the same game, including possession.
+
+The effect on the *win probability curve* is much smaller than that sounds.
+Comparing each play's own probability under the two orderings, across six
+archived games:
+
+| | max change to one play | mean | final |
+|---|---|---|---|
+| six games, 2,764 plays | **3.6 points** | under 0.2 points | identical |
+
+An earlier note in this section claimed 26.7 points. That figure came from
+comparing the two curves *by ordinal position* — old[i] against new[i] — and
+position `i` is a different play in each ordering, so it was measuring the
+reordering rather than any change in the model's answer. Matching plays by
+identity, and resampling both curves onto a common game-time axis, agree with
+each other at around 3 points. **The bug was real and worth fixing; its visible
+effect on the curve was small.**
+
+The reason it is small is worth knowing: each ESPN play carries its own clock
+and its own score, so a displaced play still produces a mostly-correct state.
+What the ordering actually corrupts is the sequential bookkeeping — possession,
+and anything else derived by walking the plays in order.
 
 **Why every existing test missed it.** The parity tests run on payloads rebuilt
 from hoopR by `tests/espn_fixtures.py`, which synthesised `sequenceNumber` as

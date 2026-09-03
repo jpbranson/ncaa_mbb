@@ -127,8 +127,10 @@ game carried through a third period.
 
 **Fixed 2026-09-03**: the ESPN adapter was sorting plays by `sequenceNumber`,
 a nearly-but-not-quite monotonic key, and shuffling a feed that had arrived in
-the correct order — moving mid-game win probability by up to 26.7 points while
-leaving every final probability unchanged. The feed's array order is now
+the correct order. Measured properly (matching plays by identity, not by list
+position) the curve moved by at most 3.6 points and every final probability was
+unchanged; the states themselves, including possession, disagreed with hoopR.
+The feed's array order is now
 authoritative, and live states match hoopR exactly on real payloads. See
 EXPLAIN 8.8b.
 
