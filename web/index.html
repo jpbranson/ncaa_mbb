@@ -1,0 +1,538 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>cbbwp — win probability</title>
+<style>
+  :root {
+    --bg: #0f1115; --panel: #161a21; --line: #262c37; --ink: #e6e9ef;
+    --dim: #8b94a5; --home: #4f9cf9; --away: #f97362; --grid: #1e2430;
+    --accent: #ffd166;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font: 14px/1.5 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  header {
+    display: flex; align-items: baseline; gap: 16px; flex-wrap: wrap;
+    padding: 14px 20px; border-bottom: 1px solid var(--line);
+  }
+  header h1 { font-size: 15px; margin: 0; font-weight: 650; letter-spacing: .2px; }
+  header .meta { color: var(--dim); font-size: 12px; }
+  .tabs { display: flex; gap: 4px; margin-left: auto; }
+  .tab {
+    padding: 5px 12px; border-radius: 6px; cursor: pointer; font-size: 13px;
+    border: 1px solid transparent; color: var(--dim); background: none;
+  }
+  .tab[aria-selected="true"] { background: var(--panel); color: var(--ink); border-color: var(--line); }
+  main { display: grid; grid-template-columns: 300px 1fr; gap: 0; min-height: calc(100vh - 53px); }
+  aside { border-right: 1px solid var(--line); padding: 14px; overflow-y: auto; max-height: calc(100vh - 53px); }
+  aside h2 { font-size: 11px; text-transform: uppercase; letter-spacing: .8px;
+             color: var(--dim); margin: 0 0 10px; font-weight: 600; }
+  .game {
+    padding: 9px 10px; border-radius: 7px; cursor: pointer; margin-bottom: 5px;
+    border: 1px solid var(--line); background: var(--panel);
+  }
+  .game:hover { border-color: #38414f; }
+  .game[aria-current="true"] { border-color: var(--home); }
+  .game .t { font-size: 13px; }
+  .game .s { color: var(--dim); font-size: 11.5px; margin-top: 2px; }
+  .fetch { display: flex; gap: 6px; margin: 14px 0 6px; }
+  input, select, button {
+    font: inherit; color: var(--ink); background: var(--panel);
+    border: 1px solid var(--line); border-radius: 6px; padding: 6px 9px;
+  }
+  input { min-width: 0; flex: 1; }
+  button { cursor: pointer; }
+  button:hover:not(:disabled) { border-color: #47536b; }
+  button:disabled { opacity: .38; cursor: default; }
+  section.stage { padding: 18px 22px; display: flex; flex-direction: column; gap: 14px; }
+  .scoreline { display: flex; align-items: center; gap: 18px; flex-wrap: wrap; }
+  .team { display: flex; align-items: baseline; gap: 9px; }
+  .team .nm { font-size: 15px; }
+  .team .sc { font-size: 25px; font-weight: 660; font-variant-numeric: tabular-nums; }
+  .dot { width: 9px; height: 9px; border-radius: 50%; display: inline-block; }
+  .clock {
+    margin-left: auto; text-align: right; font-variant-numeric: tabular-nums;
+  }
+  .clock .big { font-size: 21px; font-weight: 620; }
+  .clock .sm { color: var(--dim); font-size: 12px; }
+  .wpbar { display: flex; height: 26px; border-radius: 6px; overflow: hidden; border: 1px solid var(--line); }
+  .wpbar div { display: flex; align-items: center; padding: 0 9px; font-size: 12px;
+               font-weight: 600; font-variant-numeric: tabular-nums; transition: width .25s ease; }
+  .wpbar .h { background: var(--home); color: #06203f; justify-content: flex-end; }
+  .wpbar .a { background: var(--away); color: #3d1109; }
+  figure { margin: 0; background: var(--panel); border: 1px solid var(--line); border-radius: 9px; padding: 10px; }
+  svg { display: block; width: 100%; height: auto; }
+  .controls { display: flex; align-items: center; gap: 9px; flex-wrap: wrap; }
+  [hidden] { display: none !important; }
+  .controls .sp { color: var(--dim); font-size: 12px; }
+  input[type=range] { flex: 1; min-width: 180px; accent-color: var(--home); padding: 0; border: none; background: none; }
+  .play {
+    background: var(--panel); border: 1px solid var(--line); border-radius: 9px;
+    padding: 11px 13px; min-height: 62px;
+  }
+  .play .ty { color: var(--accent); font-size: 11.5px; text-transform: uppercase;
+              letter-spacing: .6px; margin-bottom: 3px; }
+  .play .tx { font-size: 14px; }
+  .play .dl { color: var(--dim); font-size: 12px; margin-top: 5px; font-variant-numeric: tabular-nums; }
+  .empty { color: var(--dim); padding: 40px 0; text-align: center; }
+  .err { color: #ff9c8f; font-size: 12.5px; margin-top: 8px; }
+  kbd { background: #222836; border: 1px solid var(--line); border-bottom-width: 2px;
+        border-radius: 4px; padding: 1px 5px; font-size: 11px; font-family: inherit; }
+  @media (max-width: 820px) {
+    main { grid-template-columns: 1fr; }
+    aside { border-right: none; border-bottom: 1px solid var(--line); max-height: 260px; }
+  }
+</style>
+</head>
+<body>
+<header>
+  <h1>cbbwp</h1>
+  <span class="meta" id="modelmeta">loading…</span>
+  <div class="tabs" role="tablist">
+    <button class="tab" id="tab-replay" role="tab" aria-selected="true">Replay</button>
+    <button class="tab" id="tab-live" role="tab" aria-selected="false">Live</button>
+  </div>
+</header>
+
+<main>
+  <aside>
+    <h2 id="listhead">Archived games</h2>
+    <div id="list"></div>
+    <div id="fetchbox">
+      <div class="fetch">
+        <input id="gid" placeholder="ESPN game id" inputmode="numeric">
+        <button id="fetchbtn">Fetch</button>
+      </div>
+      <div class="meta" style="color:var(--dim);font-size:11.5px">
+        Any past game, pulled from ESPN and archived.
+      </div>
+      <div class="err" id="fetcherr"></div>
+    </div>
+  </aside>
+
+  <section class="stage">
+    <div id="stage-empty" class="empty">Pick a game to replay.</div>
+
+    <div id="stage-game" hidden>
+      <div class="scoreline">
+        <div class="team">
+          <span class="dot" style="background:var(--away)"></span>
+          <span class="nm" id="awayname">—</span>
+          <span class="sc" id="awayscore">0</span>
+        </div>
+        <div class="team">
+          <span class="dot" style="background:var(--home)"></span>
+          <span class="nm" id="homename">—</span>
+          <span class="sc" id="homescore">0</span>
+        </div>
+        <div class="clock">
+          <div class="big" id="clock">—</div>
+          <div class="sm" id="periodlbl">—</div>
+        </div>
+      </div>
+
+      <div class="wpbar" style="margin-top:14px">
+        <div class="a" id="wpa" style="width:50%">50%</div>
+        <div class="h" id="wph" style="width:50%">50%</div>
+      </div>
+
+      <figure style="margin-top:14px">
+        <svg id="chart" viewBox="0 0 900 260" preserveAspectRatio="none"
+             role="img" aria-label="Win probability over the course of the game"></svg>
+      </figure>
+
+      <div class="controls" id="transport" style="margin-top:14px">
+        <button id="first" title="Start">⏮</button>
+        <button id="back" title="Step back (←)">◀</button>
+        <button id="playpause" title="Play/pause (space)" style="min-width:74px">▶ Play</button>
+        <button id="fwd" title="Step forward (→)">▶</button>
+        <button id="last" title="End">⏭</button>
+        <label class="sp" style="display:flex;align-items:center;gap:5px;cursor:pointer"
+               title="The faint line is the rest of the game">
+          <input type="checkbox" id="spoil" checked style="accent-color:var(--home)">
+          show ending
+        </label>
+        <select id="speed" title="Replay speed">
+          <option value="1">1× real time</option>
+          <option value="5">5×</option>
+          <option value="15">15×</option>
+          <option value="60" selected>60×</option>
+          <option value="240">240×</option>
+          <option value="0">as fast as it draws</option>
+        </select>
+        <input type="range" id="scrub" min="0" max="0" value="0">
+        <span class="sp" id="pos">0 / 0</span>
+      </div>
+
+      <div class="play" style="margin-top:12px">
+        <div class="ty" id="ptype">—</div>
+        <div class="tx" id="ptext">—</div>
+        <div class="dl" id="pdelta">—</div>
+      </div>
+
+      <div class="meta" style="color:var(--dim);font-size:11.5px;margin-top:10px">
+        <kbd>space</kbd> play/pause · <kbd>←</kbd> <kbd>→</kbd> step · <kbd>home</kbd>
+        <kbd>end</kbd> jump. Every probability shown was produced by the model
+        itself; nothing here is interpolated.
+      </div>
+    </div>
+  </section>
+</main>
+
+<script>
+"use strict";
+const $ = id => document.getElementById(id);
+const REG = 1200;            // seconds in a half
+const OT = 300;              // seconds in an overtime period
+
+let mode = "replay";
+let game = null;             // the scored game currently loaded
+let idx = 0;                 // which play we are showing
+let timer = null;
+let liveTimer = null;
+let liveGid = null;   // which live game the right pane is showing
+
+/* ---------- helpers ---------------------------------------------------- */
+
+// Total game seconds elapsed at a play, so periods lay out end to end on the
+// x axis. The feed gives a countdown per period, which is not additive.
+function elapsed(p) {
+  // `secs` is seconds left in REGULATION, but each overtime restarts its own
+  // clock (state.py: game_seconds_remaining). Same rule for a replayed play and
+  // a live state, so both charts share one x axis.
+  const secs = p.secs, per = p.period;
+  if (per <= 2) return 2 * REG - secs;
+  return 2 * REG + (per - 3) * OT + (OT - secs);
+}
+function totalSeconds(g) {
+  const per = g.periods || 2;
+  return per <= 2 ? 2 * REG : 2 * REG + (per - 2) * OT;
+}
+function mmss(sec) {
+  sec = Math.max(0, sec);
+  const m = Math.floor(sec / 60), s = Math.floor(sec % 60);
+  return m + ":" + String(s).padStart(2, "0");
+}
+function periodLabel(p) {
+  return p <= 2 ? (p === 1 ? "1st half" : "2nd half")
+                : (p === 3 ? "OT" : "OT" + (p - 2));
+}
+function pct(x) { return (x * 100).toFixed(1) + "%"; }
+
+/* ---------- chart ------------------------------------------------------ */
+
+function drawChart() {
+  const svg = $("chart");
+  if (!game) { svg.innerHTML = ""; return; }
+  const W = 900, H = 260, PAD_L = 34, PAD_R = 10, PAD_T = 10, PAD_B = 20;
+  const total = totalSeconds(game);
+  const x = s => PAD_L + (s / total) * (W - PAD_L - PAD_R);
+  const y = p => PAD_T + (1 - p) * (H - PAD_T - PAD_B);
+
+  const parts = [];
+  // 50% line and quartiles, so the eye has something to measure against.
+  for (const p of [0.25, 0.5, 0.75]) {
+    parts.push(`<line x1="${PAD_L}" x2="${W - PAD_R}" y1="${y(p)}" y2="${y(p)}"
+      stroke="${p === 0.5 ? '#3a4354' : 'var(--grid)'}"
+      stroke-width="${p === 0.5 ? 1.2 : 1}" ${p === 0.5 ? '' : 'stroke-dasharray="3 4"'}/>`);
+    parts.push(`<text x="4" y="${y(p) + 4}" fill="var(--dim)" font-size="10">${p * 100}%</text>`);
+  }
+  // Period boundaries.
+  const per = game.periods || 2;
+  for (let k = 1; k < per; k++) {
+    const s = k <= 1 ? REG : 2 * REG + (k - 2) * OT;
+    parts.push(`<line x1="${x(s)}" x2="${x(s)}" y1="${PAD_T}" y2="${H - PAD_B}"
+      stroke="#333c4b" stroke-width="1"/>`);
+  }
+
+  const pts = game.plays.map(p => [x(elapsed(p)), y(p.wp)]);
+  const chron = pts.slice().sort((a, b) => a[0] - b[0]);
+  const path = chron.map((q, i) => (i ? "L" : "M") + q[0].toFixed(1) + " " + q[1].toFixed(1)).join(" ");
+  // The whole game, faint: context for where this moment sits. Optional,
+  // because on a game you have not seen it is a spoiler rather than context.
+  if (document.getElementById("spoil").checked) {
+    parts.push(`<path d="${path}" fill="none" stroke="#2c3545" stroke-width="1.5"/>`);
+  }
+  // The part already played, bright.
+  const seen = pts.slice(0, idx + 1).sort((a, b) => a[0] - b[0]);
+  if (seen.length > 1) {
+    const sp = seen.map((q, i) => (i ? "L" : "M") + q[0].toFixed(1) + " " + q[1].toFixed(1)).join(" ");
+    parts.push(`<path d="${sp}" fill="none" stroke="var(--home)" stroke-width="2.1"
+      stroke-linejoin="round"/>`);
+  }
+  const cur = pts[idx];
+  if (cur) {
+    parts.push(`<line x1="${cur[0]}" x2="${cur[0]}" y1="${PAD_T}" y2="${H - PAD_B}"
+      stroke="var(--accent)" stroke-width="1" opacity=".55"/>`);
+    parts.push(`<circle cx="${cur[0]}" cy="${cur[1]}" r="4.2" fill="var(--accent)"/>`);
+  }
+  parts.push(`<text x="${PAD_L}" y="${H - 6}" fill="var(--dim)" font-size="10">tip</text>`);
+  parts.push(`<text x="${W - PAD_R}" y="${H - 6}" fill="var(--dim)" font-size="10"
+    text-anchor="end">final</text>`);
+  svg.innerHTML = parts.join("");
+}
+
+/* ---------- rendering one moment --------------------------------------- */
+
+function render() {
+  if (!game) return;
+  const p = game.plays[idx];
+  $("homescore").textContent = p.home;
+  $("awayscore").textContent = p.away;
+  $("clock").textContent = mmss(p.clock);
+  $("periodlbl").textContent = periodLabel(p.period);
+
+  const h = Math.max(0, Math.min(1, p.wp));
+  $("wph").style.width = (h * 100).toFixed(1) + "%";
+  $("wpa").style.width = ((1 - h) * 100).toFixed(1) + "%";
+  $("wph").textContent = h >= 0.14 ? pct(h) : "";
+  $("wpa").textContent = (1 - h) >= 0.14 ? pct(1 - h) : "";
+
+  $("ptype").textContent = p.type || "—";
+  $("ptext").textContent = p.text || "(no description in the feed)";
+  const prev = idx > 0 ? game.plays[idx - 1] : null;
+  const d = prev ? p.wp - prev.wp : 0;
+  const arrow = d > 0 ? "▲" : d < 0 ? "▼" : "·";
+  const backwards = prev ? elapsed(prev) - elapsed(p) : 0;
+  $("pdelta").textContent =
+    `play ${p.seq} of ${game.plays.length}   ·   margin ${p.margin > 0 ? "+" : ""}${p.margin}`
+    + `   ·   home ${pct(p.wp)}   ${arrow} ${prev ? (d >= 0 ? "+" : "") + (d * 100).toFixed(1) + " pts" : ""}`
+    + (backwards > 0
+        ? `   ·   ⚠ the feed put this play ${Math.round(backwards)}s EARLIER than the one before it`
+        : "");
+
+  $("scrub").value = idx;
+  $("pos").textContent = `${idx + 1} / ${game.plays.length}`;
+  $("back").disabled = idx === 0;
+  $("first").disabled = idx === 0;
+  $("fwd").disabled = idx >= game.plays.length - 1;
+  $("last").disabled = idx >= game.plays.length - 1;
+  drawChart();
+}
+
+/* ---------- transport -------------------------------------------------- */
+
+function stop() {
+  if (timer) { clearTimeout(timer); timer = null; }
+  $("playpause").textContent = "▶ Play";
+}
+function atEnd() { return !game || idx >= game.plays.length - 1; }
+
+function step(n) {
+  if (!game) return;
+  idx = Math.max(0, Math.min(game.plays.length - 1, idx + n));
+  render();
+}
+
+function tick() {
+  if (atEnd()) { stop(); return; }
+  const speed = Number($("speed").value);
+  const a = game.plays[idx], b = game.plays[idx + 1];
+  idx += 1;
+  render();
+  if (atEnd()) { stop(); return; }
+  let delay;
+  if (speed === 0) {
+    delay = 16;                       // as fast as the browser will paint
+  } else {
+    // Real game time between the two plays, compressed by the speed factor.
+    // Clamped so a burst of same-second plays stays watchable and a long
+    // dead-ball gap does not look like the app has frozen.
+    const gap = Math.max(0, elapsed(b) - elapsed(a));
+    delay = Math.min(2500, Math.max(40, (gap * 1000) / speed));
+  }
+  timer = setTimeout(tick, delay);
+}
+
+function playPause() {
+  if (!game) return;
+  if (timer) { stop(); return; }
+  if (atEnd()) { idx = 0; render(); }
+  $("playpause").textContent = "❚❚ Pause";
+  timer = setTimeout(tick, 60);
+}
+
+/* ---------- loading ---------------------------------------------------- */
+
+async function loadGame(gid) {
+  stop();
+  $("stage-empty").textContent = "loading…";
+  $("stage-empty").hidden = false;
+  $("stage-game").hidden = true;
+  try {
+    const r = await fetch("/api/game/" + gid);
+    const j = await r.json();
+    if (!r.ok) throw new Error(j.error || r.statusText);
+    game = j; idx = 0;
+    $("homename").textContent = j.home_name;
+    $("awayname").textContent = j.away_name;
+    $("scrub").max = j.plays.length - 1;
+    $("modelmeta").textContent =
+      `model ${j.model_version} · state rules v${j.state_rules_version} · ${j.plays.length} plays`;
+    $("stage-empty").hidden = true;
+    $("stage-game").hidden = false;
+    document.querySelectorAll(".game").forEach(el =>
+      el.setAttribute("aria-current", String(Number(el.dataset.gid) === Number(gid))));
+    render();
+  } catch (e) {
+    $("stage-empty").textContent = "could not load that game: " + e.message;
+  }
+}
+
+async function loadList() {
+  const r = await fetch("/api/games");
+  const j = await r.json();
+  const box = $("list");
+  if (!j.games.length) {
+    box.innerHTML = `<div class="meta" style="color:var(--dim)">No archived games yet.
+      Run <code>scripts/archive_replay_games.py</code>, or fetch one by id below.</div>`;
+    return;
+  }
+  box.innerHTML = j.games.map(g => g.error
+    ? `<div class="game"><div class="t">${g.game_id}</div><div class="s">${g.error}</div></div>`
+    : `<div class="game" data-gid="${g.game_id}">
+         <div class="t">${g.away_name} @ ${g.home_name}</div>
+         <div class="s">${g.away_score}–${g.home_score} · ${g.plays} plays${
+           g.periods > 2 ? " · OT" : ""}</div>
+       </div>`).join("");
+  box.querySelectorAll(".game[data-gid]").forEach(el =>
+    el.onclick = () => loadGame(el.dataset.gid));
+}
+
+/* ---------- live ------------------------------------------------------- */
+
+async function pollLive() {
+  const r = await fetch("/api/live");
+  const j = await r.json();
+  const box = $("list");
+  if (j.offline || !j.games || !j.games.length) {
+    box.innerHTML = `<div class="meta" style="color:var(--dim)">${
+      j.offline ? "No live feed running. Start <code>scripts/serve_live.py</code>."
+                : "Live feed is up, but no games are in progress."}</div>`;
+    return;
+  }
+  box.innerHTML = j.games.map(g => `
+    <div class="game" data-gid="${g.game_id}">
+      <div class="t">game ${g.game_id}${g.replay ? " <em>(replay)</em>" : ""}</div>
+      <div class="s">P${g.period} · ${mmss(g.game_seconds_remaining)} left ·
+        margin ${g.margin > 0 ? "+" : ""}${g.margin} · home ${pct(g.home_win_prob)}</div>
+    </div>`).join("");
+  box.querySelectorAll(".game[data-gid]").forEach(el =>
+    el.onclick = () => { liveGid = Number(el.dataset.gid); loadLiveGame(); });
+  if (liveGid !== null) loadLiveGame();
+}
+
+async function loadLiveGame() {
+  if (liveGid === null) return;
+  const r = await fetch("/api/live/" + liveGid);
+  const j = await r.json();
+  if (j.offline || !j.game) return;
+  const g = j.game;
+  // The poller emits one row per poll, so history is the game as the feed has
+  // actually been seen -- sparser than a replay, and that is the honest picture
+  // of what was known at each moment rather than a smooth after-the-fact curve.
+  const hist = (g.history || []).concat(
+    (g.history || []).some(h => h.seq === g.seq) ? [] : [g]);
+  game = {
+    game_id: g.game_id,
+    periods: Math.max(2, ...hist.map(h => h.period)),
+    plays: hist.map(h => ({
+      seq: h.seq, period: h.period, secs: h.game_seconds_remaining,
+      margin: h.margin, wp: h.home_win_prob,
+      home: "", away: "", type: "", text: "",
+    })),
+  };
+  idx = game.plays.length - 1;
+  $("homename").textContent = j.home_name || ("home " + g.home_team_id);
+  $("awayname").textContent = j.away_name || ("away " + g.away_team_id);
+  $("homescore").textContent = g.margin > 0 ? "+" + g.margin : g.margin;
+  $("awayscore").textContent = "";
+  const perClock = g.period <= 1 ? g.game_seconds_remaining - REG
+                                 : g.game_seconds_remaining;
+  $("clock").textContent = mmss(perClock);
+  $("periodlbl").textContent = periodLabel(g.period)
+    + (g.replay ? " · replay" : "") + " · live";
+  const h = Math.max(0, Math.min(1, g.home_win_prob));
+  $("wph").style.width = (h * 100).toFixed(1) + "%";
+  $("wpa").style.width = ((1 - h) * 100).toFixed(1) + "%";
+  $("wph").textContent = h >= 0.14 ? pct(h) : "";
+  $("wpa").textContent = (1 - h) >= 0.14 ? pct(1 - h) : "";
+  $("ptype").textContent = "LIVE";
+  $("ptext").textContent = `${g.status} · play ${g.seq} · margin `
+    + `${g.margin > 0 ? "+" : ""}${g.margin}`;
+  $("pdelta").textContent = `${hist.length} polls recorded · home ${pct(g.home_win_prob)}`;
+  $("modelmeta").textContent =
+    `model ${j.model_version} · state rules v${j.state_rules_version} · live`;
+  $("stage-empty").hidden = true;
+  $("stage-game").hidden = false;
+  $("transport").hidden = true;
+  drawChart();
+}
+
+function setMode(next) {
+  mode = next;
+  stop();
+  if (liveTimer) { clearInterval(liveTimer); liveTimer = null; }
+  $("tab-replay").setAttribute("aria-selected", String(next === "replay"));
+  $("tab-live").setAttribute("aria-selected", String(next === "live"));
+  $("fetchbox").hidden = next !== "replay";
+  $("listhead").textContent = next === "replay" ? "Archived games" : "Live now";
+  if (next === "replay") { liveGid = null; $("transport").hidden = false; loadList(); }
+  else {
+    $("stage-empty").textContent = "Live games appear on the left as the poller finds them.";
+    $("stage-empty").hidden = false;
+    $("stage-game").hidden = true;
+    pollLive();
+    liveTimer = setInterval(pollLive, 5000);
+  }
+}
+
+/* ---------- wiring ----------------------------------------------------- */
+
+$("playpause").onclick = playPause;
+$("fwd").onclick = () => { stop(); step(1); };
+$("back").onclick = () => { stop(); step(-1); };
+$("first").onclick = () => { stop(); idx = 0; render(); };
+$("last").onclick = () => { stop(); idx = game.plays.length - 1; render(); };
+$("scrub").oninput = e => { stop(); idx = Number(e.target.value); render(); };
+$("spoil").onchange = drawChart;
+$("speed").onchange = () => { if (timer) { clearTimeout(timer); timer = setTimeout(tick, 40); } };
+$("tab-replay").onclick = () => setMode("replay");
+$("tab-live").onclick = () => setMode("live");
+
+$("fetchbtn").onclick = async () => {
+  const gid = $("gid").value.trim();
+  $("fetcherr").textContent = "";
+  if (!/^\d+$/.test(gid)) { $("fetcherr").textContent = "Game id must be digits."; return; }
+  $("fetchbtn").disabled = true; $("fetchbtn").textContent = "…";
+  try {
+    const r = await fetch("/api/fetch/" + gid);
+    const j = await r.json();
+    if (!r.ok) throw new Error(j.error || r.statusText);
+    await loadList();
+    await loadGame(gid);
+  } catch (e) {
+    $("fetcherr").textContent = e.message;
+  } finally {
+    $("fetchbtn").disabled = false; $("fetchbtn").textContent = "Fetch";
+  }
+};
+
+document.addEventListener("keydown", e => {
+  if (mode !== "replay" || !game) return;
+  if (e.target.tagName === "INPUT" && e.target.type !== "range") return;
+  if (e.key === " ") { e.preventDefault(); playPause(); }
+  else if (e.key === "ArrowRight") { e.preventDefault(); stop(); step(1); }
+  else if (e.key === "ArrowLeft") { e.preventDefault(); stop(); step(-1); }
+  else if (e.key === "Home") { stop(); idx = 0; render(); }
+  else if (e.key === "End") { stop(); idx = game.plays.length - 1; render(); }
+});
+
+setMode("replay");
+</script>
+</body>
+</html>

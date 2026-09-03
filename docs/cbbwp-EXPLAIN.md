@@ -1034,6 +1034,50 @@ face, and it visibly hedges on blowouts — where it says 3.4% the true rate is 
 our edge is simply being willing to be more confident where the data supports it. That is a
 legitimate win, not a trick, but it is the honest characterisation.
 
+### 8.8b ESPN's play ORDER and hoopR's disagree (found 2026-09-03, unresolved)
+
+Found while building `scripts/serve_viz.py`, because a chart makes an ordering
+problem visible in a way a test of final scores does not.
+
+The live adapter orders plays by ESPN's `sequenceNumber` (`_sequence_key`).
+hoopR's `game_play_number` — what the model was trained on — turns out to be a
+**different order for the same game**.
+
+Measured on three archived 2025-26 games where both sources are available, the
+plays themselves are identical (same multiset of period/clock/type, same count),
+so nothing is missing or duplicated. Only the order differs:
+
+| game | positions where the two orders agree |
+|---|---|
+| UNC at Duke | 397 / 401 (99%) |
+| Arkansas at Missouri | 434 / 453 (96%) |
+| UConn vs Michigan (championship) | **64 / 482 (13%)** |
+
+And the two are not equally defensible: **hoopR's order is chronological in all
+three games; ESPN's `sequenceNumber` order is not.** Across ten archived games,
+31 of 4,782 plays (0.65%) sit earlier in game time than the play before them,
+with single displacements as large as 986 seconds — and one case where the feed
+order steps from period 2 back into period 1.
+
+**What this does and does not establish.** It establishes that the live path
+feeds the state builder a different play order than training used, sometimes
+drastically, and that possession tracking and `game_seconds_remaining` are both
+order-dependent. It does **not** establish that served win probabilities are
+materially wrong: the dry run still reproduced every final score, and the last
+state of a game is the one the API serves. Nobody has yet measured the effect on
+mid-game probabilities, which is the number that would settle it.
+
+Why the existing parity tests did not catch it: `tests/test_espn_adapter.py`
+compares the ESPN adapter against the hoopR adapter on payloads **rebuilt from
+hoopR rows**, so the two share an order by construction. The test is sound for
+what it checks — field coercion, type mapping, numbering — and structurally
+blind to this.
+
+The honest next step is to measure it before changing anything: score a set of
+games both ways and compare the probability paths. Re-ordering the adapter by
+clock would be a change to the serving path of a frozen model, and it should not
+be made on the strength of a chart looking wrong.
+
 ### 8.8 The live adapter has not seen ESPN during a real game
 Corrected twice, and the caveat is now much narrower than it started.
 

@@ -147,6 +147,27 @@ What a replay does **not** cover, so it is never mistaken for validation:
   cannot prove ESPN still sends that shape.
 - Rate limiting and real-world 403s, unless you ask for them with `--flaky`.
 
+## Watching a game: `scripts/serve_viz.py`
+
+```bash
+python3 scripts/serve_viz.py            # http://127.0.0.1:8811
+```
+
+Standard library plus one HTML file: no build step, no CDN, so it works on a
+laptop whose network is having a bad night — which is exactly when you want to
+look at the live feed.
+
+| tab | what it shows |
+|---|---|
+| **Live** | whatever `serve_live.py` is tracking, polled every 5s. Click a game for its win-probability curve so far, built from the poller's own history — one point per poll, which is the honest picture of what was known at each moment. |
+| **Replay** | any archived game, with play/pause, speed (1× to 240×), step forward and back, and a scrubber. Type any ESPN game id to fetch and archive it. |
+
+Replay is precomputed, not streamed. `replay_server.py` runs a wall clock
+forwards for the *poller*; this runs `score_game` once and lets the browser
+scrub the result, so stepping backward is exact rather than re-derived. Nothing
+on the page is interpolated — every probability came out of
+`WinProbabilityService` as the live path would have produced it.
+
 ### First dry run: 2026-09-03
 
 Six archived 2025-26 games, 2,764 plays, replayed at 5x through the unmodified
@@ -352,6 +373,10 @@ back on its own; the JSONL will show the gap.
   file). It reaches the endpoint, parses real payloads, and has been rehearsed
   against a running clock via the replay server — but a replay cannot prove
   ESPN still sends that shape tonight.
+- **ESPN's play order differs from the training data's** (EXPLAIN 8.8b, found
+  2026-09-03, unresolved). Same plays, different order; hoopR's is
+  chronological and ESPN's `sequenceNumber` is not. Effect on served
+  probabilities is unmeasured.
 - **No licensed spread.** The pregame term uses ratings built from scratch;
   a closing spread would close roughly 0.8 points of RMSE and is the single
   largest available gain.

@@ -75,6 +75,21 @@ serving archived games with only the plays that would have happened by now — a
 growing feed, a running clock, real status transitions. Replay rows are tagged
 `"replay": true` and written to `data/replay/`, never `data/live/`.
 
+**Watch it:**
+
+```bash
+python3 scripts/serve_viz.py              # then open http://127.0.0.1:8811
+```
+
+A small web app, standard library and one HTML file — no build step, no CDN. Two
+tabs: **Live** draws whatever `serve_live.py` is tracking; **Replay** loads any
+past game and gives you play/pause, speed, step forward and back, and a
+scrubber. Any ESPN game id can be fetched and archived from the app itself.
+
+Replay is precomputed rather than streamed: `score_game` replays a whole game in
+milliseconds, so the browser scrubs an array and stepping backward is exact —
+the same number the model produced going forwards, not a re-derivation.
+
 Then:
 
 ```bash
