@@ -243,7 +243,8 @@ svg { display: block; width: 100%; height: auto; }
           <span class="kbd">space</span> play/pause ·
           <span class="kbd">&larr;</span> <span class="kbd">&rarr;</span> step ·
           <span class="kbd">home</span> <span class="kbd">end</span> jump.
-          Plays sharing a game clock are shown together as one moment.
+          Plays sharing a game clock are shown together as one moment, and moments
+          run in game-clock order even if the feed did not.
           Every probability came from the model itself; nothing is interpolated.
         </small>
       </div>
@@ -254,6 +255,7 @@ svg { display: block; width: 100%; height: auto; }
 <script>
 "use strict";
 const $ = id => document.getElementById(id);
+// -- pure: begin  (tests/test_viz.py runs this block under node, without a DOM)
 const REG = 1200, OT = 300;
 
 let mode = "replay";
@@ -294,12 +296,25 @@ function esc(s) {
 // 255 distinct moments, with clusters as long as 14. Stepping through those one
 // at a time is mostly stepping through paperwork.
 //
-// Consecutive plays only: the feed is not always in chronological order
-// (EXPLAIN 8.8b), and merging non-adjacent plays that happen to share a clock
-// would silently reorder the game.
+// Consecutive plays only. Merging non-adjacent plays that happen to share a
+// clock would hide the fact that something else happened in between.
+//
+// The moments are then STEPPED in game-clock order, whatever order the feed
+// supplied them in. The feed has been chronological on every real payload
+// measured (EXPLAIN 8.8b), but this page is where a disordered one would show
+// up, as a playhead that jumps forward and then back. The clock is the axis the
+// reader is watching, so it is the axis stepping follows. Nothing about the
+// numbers changes: every probability is still the one the model produced
+// walking the feed in the feed's own order, and a moment that sat out of clock
+// order in the feed says so (see `displaced` and the warning in render()).
 function buildMoments(plays) {
   const out = [];
+  let prevWp = null;
   for (const p of plays) {
+    // The change each play made, against the play the model saw just BEFORE
+    // it. That is a fact about feed order, so it is fixed here, before the sort.
+    p.prevWp = prevWp === null ? p.wp : prevWp;
+    prevWp = p.wp;
     const last = out[out.length - 1];
     if (last && last.period === p.period && last.secs === p.secs) last.plays.push(p);
     else out.push({ period: p.period, secs: p.secs, clock: p.clock, plays: [p] });
@@ -313,8 +328,21 @@ function buildMoments(plays) {
       m.clock = m.period <= 1 ? m.secs - REG : m.secs;
     }
   }
+  // A moment is displaced if the feed put it after something later on the
+  // clock, or before something earlier. Decided against its feed neighbours,
+  // so it has to be decided before the sort.
+  out.forEach((m, i) => {
+    const before = out[i - 1], after = out[i + 1];
+    m.displaced = before && elapsed(m) < elapsed(before) ? { after: before.seq }
+                : after && elapsed(m) > elapsed(after) ? { before: after.plays[0].seq }
+                : null;
+  });
+  // Array.prototype.sort is stable, so moments the feed already had in order
+  // keep their relative order, and a disordered feed comes out chronological.
+  out.sort((a, b) => elapsed(a) - elapsed(b));
   return out;
 }
+// -- pure: end
 
 /* ---------- chart ------------------------------------------------------ */
 
@@ -343,14 +371,14 @@ function drawChart() {
       stroke="#999" stroke-width="1" stroke-dasharray="2 3"/>`);
   }
 
+  // buildMoments() sorted these into game-time order, so index order is x order
+  // and the prefix up to the playhead is exactly the part of the game seen so far.
   const pts = game.moments.map(m => [x(elapsed(m)), y(m.wp)]);
-  // Drawn in game-time order: the feed does not always supply it that way.
-  const chron = pts.slice().sort((a, b) => a[0] - b[0]);
   const d = q => q.map((p, i) => (i ? "L" : "M") + p[0].toFixed(1) + " " + p[1].toFixed(1)).join(" ");
   if ($("spoil").checked) {
-    out.push(`<path d="${d(chron)}" fill="none" stroke="#ccc" stroke-width="1.5"/>`);
+    out.push(`<path d="${d(pts)}" fill="none" stroke="#ccc" stroke-width="1.5"/>`);
   }
-  const seen = pts.slice(0, idx + 1).sort((a, b) => a[0] - b[0]);
+  const seen = pts.slice(0, idx + 1);
   if (seen.length > 1) {
     out.push(`<path d="${d(seen)}" fill="none" stroke="var(--primary)"
       stroke-width="2" stroke-linejoin="round"/>`);
@@ -394,10 +422,11 @@ function render() {
 
   // Each play keeps its own probability, so a moment that moves the number
   // shows WHICH play moved it: a free-throw trip is several plays at one clock
-  // and only the makes shift anything.
-  let base = prev ? prev.wp : m.plays[0].wp;
+  // and only the makes shift anything. The change is measured against the play
+  // the model saw just before it (prevWp, fixed in feed order), which is the
+  // chronologically previous moment except where the feed was disordered.
   $("momentrows").innerHTML = m.plays.map(p => {
-    const dd = p.wp - base; base = p.wp;
+    const dd = p.wp - p.prevWp;
     const cls = dd > 0.0005 ? "up" : dd < -0.0005 ? "down" : "text-muted";
     const arrow = dd > 0.0005 ? "▲" : dd < -0.0005 ? "▼" : "·";
     return `<tr>
@@ -408,19 +437,21 @@ function render() {
     </tr>`;
   }).join("");
 
-  const total = prev ? m.wp - prev.wp : 0;
-  const backwards = prev ? elapsed(prev) - elapsed(m) : 0;
+  const total = m.wp - m.plays[0].prevWp;
   $("momentfoot").innerHTML =
     `<small class="text-muted">moment ${idx + 1} of ${game.moments.length} ·
      plays ${m.plays[0].seq}–${m.plays[m.plays.length - 1].seq} of ${game.nplays} ·
      margin ${m.margin > 0 ? "+" : ""}${m.margin} · home ${pct(m.wp)}${
        prev ? ` (${total >= 0 ? "+" : ""}${(total * 100).toFixed(1)} pts across this moment)` : ""}
      </small>`
-    + (backwards > 0
-        ? `<div class="alert-warning">The feed placed this moment
-           ${Math.round(backwards)}s <strong>earlier</strong> than the one before it.
-           ESPN orders by <code>sequenceNumber</code>, which does not always agree
-           with the clock those plays carry (EXPLAIN 8.8b).</div>`
+    + (m.displaced
+        ? `<div class="alert-warning">The feed did not deliver this moment in clock
+           order: it arrived ${m.displaced.after !== undefined
+             ? `after play ${m.displaced.after}, which is later on the clock`
+             : `before play ${m.displaced.before}, which is earlier on the clock`}.
+           It is shown here at its own clock time, and its probabilities are still
+           the model's, computed in the order the feed sent the plays
+           (EXPLAIN 8.8b).</div>`
         : "");
 
   $("scrub").value = idx;
