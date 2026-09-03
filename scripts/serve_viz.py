@@ -119,6 +119,11 @@ class Scorer:
                 "away": ev.away_score,
                 "type": ev.event_type,
                 "text": ev.text,
+                # Which side the feed credits the play to; None for the clock,
+                # officials and anything else that belongs to neither.
+                "team": ("home" if ev.team_id == header.home_team_id
+                         else "away" if ev.team_id == header.away_team_id
+                         else None),
             })
         out = {
             "game_id": game_id,

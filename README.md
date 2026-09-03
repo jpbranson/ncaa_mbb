@@ -85,7 +85,7 @@ python3 scripts/serve_viz.py              # then open http://127.0.0.1:8811
 ```
 
 A small web app, standard library and one HTML file — no build step, no CDN,
-Bootstrap 3 / Shiny styling written by hand. Two tabs: **Live** draws whatever
+plain text and one chart. Two views: **Live** draws whatever
 `serve_live.py` is tracking; **Replay** loads any past game and gives you
 play/pause, speed, step forward and back, and a scrubber. Any ESPN game id can
 be fetched and archived from the app itself.

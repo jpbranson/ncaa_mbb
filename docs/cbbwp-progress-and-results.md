@@ -329,8 +329,8 @@ overtime carried through a third period, and replay rows tagged and diverted so
 they can never contaminate `data/live/`.
 
 **A viz app** (`scripts/serve_viz.py` + `web/index.html`): live games and
-scrubable replays, stepping by *moment* rather than by play, Bootstrap 3 / Shiny
-styling written by hand so it needs no network of its own.
+scrubable replays, stepping by *moment* rather than by play, with no CDN so it
+needs no network of its own. (Restyled to plain text in session 7.)
 
 **The serving bug the app exposed.** `events_from_plays` sorted by ESPN's
 `sequenceNumber`. Measured on seven archived games: the raw `plays` array is

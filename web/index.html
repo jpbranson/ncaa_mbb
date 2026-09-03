@@ -5,253 +5,119 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>cbbwp — win probability</title>
 <style>
-/* ---------------------------------------------------------------------------
-   Bootstrap 3 / R Shiny default look, hand-written rather than pulled from a
-   CDN. The app has to work on a laptop with no network -- which is exactly when
-   you want to look at a live feed -- and a test asserts the page reaches
-   nowhere external. The values below are Bootstrap 3.3's own: #337ab7 primary,
-   #f5f5f5 wells with #e3e3e3 borders, 14px Helvetica at 1.428 line-height.
-   --------------------------------------------------------------------------- */
-:root {
-  --primary: #337ab7; --primary-dk: #2e6da4; --danger: #d9534f;
-  --text: #333; --muted: #777; --border: #ddd; --well: #f5f5f5;
-  --well-border: #e3e3e3; --grid: #e8e8e8;
-}
-* { box-sizing: border-box; }
+/* Plain on purpose. The subject is a number moving through a basketball game;
+   the page is text, one chart and one table, and nothing that exists only to
+   look finished. No cards, shadows, badges, motion or tooltips. */
+:root { --ink: #111; --faint: #777; --rule: #ccc; --grid: #e4e4e4;
+        --primary: #111; --danger: #b1261f; }
+html { color-scheme: light; }
 body {
-  margin: 0; padding: 0 15px 30px;
-  font-family: "Helvetica Neue", Helvetica, Arial, sans-serif;
-  font-size: 14px; line-height: 1.42857143; color: var(--text); background: #fff;
+  margin: 0; padding: 2rem 1.25rem 3rem; color: var(--ink); background: #fff;
+  font: 15px/1.45 "Helvetica Neue", Helvetica, Arial, sans-serif;
+  font-variant-numeric: tabular-nums;
 }
-.container { max-width: 1180px; margin: 0 auto; }
-h2 { font-size: 30px; font-weight: 500; margin: 22px 0 12px; line-height: 1.1; }
-h4 { font-size: 18px; font-weight: 500; margin: 0 0 10px; }
-a { color: var(--primary); text-decoration: none; }
-.text-muted { color: var(--muted); }
-small { font-size: 85%; }
-code { padding: 2px 4px; font-size: 90%; color: #c7254e; background: #f9f2f4;
-       border-radius: 4px; font-family: Menlo, Monaco, Consolas, monospace; }
-
-/* nav-tabs */
-.nav-tabs { list-style: none; margin: 0 0 18px; padding: 0;
-            border-bottom: 1px solid var(--border); display: flex; gap: 2px; }
-.nav-tabs li a {
-  display: block; padding: 10px 15px; border: 1px solid transparent;
-  border-radius: 4px 4px 0 0; color: var(--primary); cursor: pointer;
-  margin-bottom: -1px; background: none;
+.page { max-width: 820px; }
+h1 { font-size: 1.5rem; font-weight: normal; margin: 0 0 .25rem; }
+h1 small { font-size: 1rem; color: var(--faint); margin-left: .5rem; }
+h2 { font-size: 1rem; font-weight: bold; margin: 1.75rem 0 .5rem; }
+a { color: var(--ink); }
+.faint { color: var(--faint); }
+.modes { margin: 0 0 1.5rem; }
+.modes a.on { font-weight: bold; text-decoration: none; }
+ul.games { list-style: none; margin: 0 0 1rem; padding: 0; }
+ul.games li { margin: 0 0 .2rem; }
+ul.games li a { text-decoration: none; }
+ul.games li a:hover { text-decoration: underline; }
+ul.games li.on a { font-weight: bold; }
+.fetch { margin: 0 0 1rem; }
+input, select, button {
+  font: inherit; color: inherit; background: #fff; border: 1px solid var(--rule);
+  padding: .15rem .5rem; margin: 0;
 }
-.nav-tabs li a:hover { background: #eee; border-color: #eee #eee var(--border); }
-.nav-tabs li a.active {
-  color: #555; background: #fff; border: 1px solid var(--border);
-  border-bottom-color: transparent; cursor: default;
-}
-
-/* sidebarLayout */
-.row { display: grid; grid-template-columns: 340px 1fr; gap: 20px; align-items: start; }
-.well {
-  padding: 19px; background: var(--well); border: 1px solid var(--well-border);
-  border-radius: 4px; box-shadow: inset 0 1px 1px rgba(0,0,0,.05);
-}
-
-/* panels */
-.panel { background: #fff; border: 1px solid var(--border); border-radius: 4px;
-         box-shadow: 0 1px 1px rgba(0,0,0,.05); margin-bottom: 18px; }
-.panel-heading { padding: 10px 15px; background: var(--well);
-                 border-bottom: 1px solid var(--border); border-radius: 3px 3px 0 0; }
-.panel-body { padding: 15px; }
-
-/* form controls */
-.form-control {
-  display: block; width: 100%; height: 34px; padding: 6px 12px; font-size: 14px;
-  color: #555; background: #fff; border: 1px solid #ccc; border-radius: 4px;
-  box-shadow: inset 0 1px 1px rgba(0,0,0,.075); font-family: inherit;
-}
-select.form-control { width: auto; }
-.form-control:focus { border-color: #66afe9; outline: 0;
-  box-shadow: inset 0 1px 1px rgba(0,0,0,.075), 0 0 8px rgba(102,175,233,.6); }
-.btn {
-  display: inline-block; padding: 6px 12px; font-size: 14px; font-family: inherit;
-  line-height: 1.42857143; border-radius: 4px; border: 1px solid transparent;
-  cursor: pointer; user-select: none; white-space: nowrap;
-}
-.btn-default { color: #333; background: #fff; border-color: #ccc; }
-.btn-default:hover:not(:disabled) { background: #e6e6e6; border-color: #adadad; }
-.btn-primary { color: #fff; background: var(--primary); border-color: var(--primary-dk); }
-.btn-primary:hover:not(:disabled) { background: #286090; border-color: #204d74; }
-.btn:disabled { opacity: .65; cursor: not-allowed; }
-input[type=range] { width: 100%; accent-color: var(--primary); }
-input[type=checkbox] { accent-color: var(--primary); vertical-align: middle; }
-
-/* list-group: the game picker */
-.list-group { margin-bottom: 14px; }
-.list-group-item {
-  display: block; padding: 10px 15px; background: #fff; border: 1px solid var(--border);
-  margin-bottom: -1px; cursor: pointer;
-}
-.list-group-item:first-child { border-radius: 4px 4px 0 0; }
-.list-group-item:last-child { border-radius: 0 0 4px 4px; margin-bottom: 0; }
-.list-group-item:hover { background: #f5f5f5; }
-.list-group-item.active, .list-group-item.active:hover {
-  background: var(--primary); border-color: var(--primary); color: #fff; z-index: 2;
-}
-.list-group-item.active .text-muted, .list-group-item.active .lbl-warn { color: #e8f0f8; }
-.lbl-warn { color: #8a6d3b; }
-
-/* progress bar = the win probability split */
-.progress {
-  display: flex; height: 26px; margin: 0; overflow: hidden; background: var(--well);
-  border-radius: 4px; box-shadow: inset 0 1px 2px rgba(0,0,0,.1);
-}
-.progress-bar {
-  display: flex; align-items: center; font-size: 12px; line-height: 26px;
-  color: #fff; transition: width .3s ease; padding: 0 8px; white-space: nowrap;
-}
-.pb-away { background: var(--danger); }
-.pb-home { background: var(--primary); justify-content: flex-end; }
-
-/* scoreline */
-.scoreline { display: flex; align-items: center; gap: 22px; flex-wrap: wrap;
-             margin-bottom: 12px; }
-.team { display: flex; align-items: baseline; gap: 8px; }
-.team .sc { font-size: 26px; font-weight: 500; font-variant-numeric: tabular-nums; }
-.swatch { width: 11px; height: 11px; border-radius: 2px; display: inline-block; }
-.clockbox { margin-left: auto; text-align: right; font-variant-numeric: tabular-nums; }
-.clockbox .big { font-size: 22px; font-weight: 500; }
-
-/* transport */
-.controls { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
-.controls .grow { flex: 1; min-width: 200px; }
-
-/* the moment table */
-table.table { width: 100%; border-collapse: collapse; margin: 0; }
-.table > tbody > tr > td { padding: 8px; border-top: 1px solid var(--border);
-                           vertical-align: top; }
-.table > tbody > tr:first-child > td { border-top: 0; }
-.table-striped > tbody > tr:nth-of-type(odd) { background: #f9f9f9; }
-.badge {
-  display: inline-block; min-width: 10px; padding: 3px 7px; font-size: 12px;
-  font-weight: 700; line-height: 1; color: #fff; text-align: center;
-  background: var(--muted); border-radius: 10px; white-space: nowrap;
-}
-td.wpcell { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
-.up { color: #3c763d; } .down { color: #a94442; }
-.alert-warning { padding: 8px 12px; margin-top: 10px; color: #8a6d3b;
-                 background: #fcf8e3; border: 1px solid #faebcc; border-radius: 4px; }
-svg { display: block; width: 100%; height: auto; }
-.kbd { padding: 2px 5px; font-size: 11px; color: #fff; background: #333;
-       border-radius: 3px; font-family: Menlo, Monaco, Consolas, monospace; }
-@media (max-width: 860px) { .row { grid-template-columns: 1fr; } }
+input[type=text] { width: 9em; }
+button:disabled { color: var(--faint); }
+input[type=range] { border: 0; padding: 0; width: 100%; accent-color: var(--ink); }
+input[type=checkbox] { accent-color: var(--ink); }
+.score { font-size: 1.25rem; margin: 0 0 .25rem; }
+.score b { font-weight: normal; }
+.wp { margin: 0 0 1rem; }
+svg { display: block; width: 100%; height: auto; margin: 0 0 .75rem; }
+.controls { display: flex; flex-wrap: wrap; gap: .4rem .6rem; align-items: center; }
+.controls .grow { flex: 1; min-width: 12em; }
+.controls label { white-space: nowrap; }
+table { border-collapse: collapse; width: 100%; margin: .5rem 0 0; }
+td { padding: .3rem .6rem .3rem 0; border-top: 1px solid var(--grid); vertical-align: top; }
+td.type { white-space: nowrap; color: var(--faint); }
+td.num { text-align: right; white-space: nowrap; }
+tr:first-child td { border-top: 0; }
+.up { color: var(--ink); } .down { color: var(--danger); } .flat { color: var(--faint); }
+.note { margin: .75rem 0 0; font-style: italic; }
+.err { color: var(--danger); }
+.foot { margin: 2rem 0 0; color: var(--faint); font-size: .9rem; }
 </style>
 </head>
 <body>
-<div class="container">
-  <h2>cbbwp <small class="text-muted" id="modelmeta">loading…</small></h2>
+<div class="page">
+  <h1>cbbwp <small id="modelmeta">loading…</small></h1>
 
-  <ul class="nav-tabs">
-    <li><a id="tab-replay" class="active">Replay</a></li>
-    <li><a id="tab-live">Live</a></li>
-  </ul>
+  <p class="modes">
+    <a id="tab-replay" class="on" href="#replay">Replay</a> ·
+    <a id="tab-live" href="#live">Live</a>
+  </p>
 
-  <div class="row">
-    <div class="well">
-      <h4 id="listhead">Archived games</h4>
-      <div class="list-group" id="list"></div>
-      <div id="fetchbox">
-        <label for="gid"><strong>Fetch a game from ESPN</strong></label>
-        <div style="display:flex;gap:6px;margin:6px 0">
-          <input id="gid" class="form-control" placeholder="ESPN game id" inputmode="numeric">
-          <button id="fetchbtn" class="btn btn-primary">Fetch</button>
-        </div>
-        <small class="text-muted">Any past game, archived on arrival.</small>
-        <div class="alert-warning" id="fetcherr" style="display:none"></div>
+  <h2 id="listhead">Archived games</h2>
+  <ul class="games" id="list"></ul>
+  <p class="fetch" id="fetchbox">
+    Fetch from ESPN by game id:
+    <input id="gid" type="text" inputmode="numeric">
+    <button id="fetchbtn">Fetch</button>
+    <span class="err" id="fetcherr"></span>
+  </p>
+
+  <p id="stage-empty" class="faint">Pick a game.</p>
+
+  <div id="stage-game" hidden>
+    <p class="score">
+      <span id="awayname">—</span> <b id="awayscore">0</b>,
+      <span id="homename">—</span> <b id="homescore">0</b>
+      <span class="faint">· <span id="clock">—</span> <span id="periodlbl">—</span></span>
+    </p>
+    <p class="wp">Home win probability <b id="wpnum">50.0%</b></p>
+
+    <svg id="chart" viewBox="0 0 900 240" preserveAspectRatio="none"
+         role="img" aria-label="Win probability over the course of the game"></svg>
+
+    <div id="transport">
+      <div class="controls">
+        <button id="first">|&lt;</button>
+        <button id="back">&lt;</button>
+        <button id="playpause">Play</button>
+        <button id="fwd">&gt;</button>
+        <button id="last">&gt;|</button>
+        <select id="speed">
+          <option value="1">1× real time</option>
+          <option value="5">5×</option>
+          <option value="15">15×</option>
+          <option value="60" selected>60×</option>
+          <option value="240">240×</option>
+          <option value="0">fastest</option>
+        </select>
+        <label><input type="checkbox" id="spoil" checked> show ending</label>
+      </div>
+      <div class="controls" style="margin-top:.5rem">
+        <input type="range" id="scrub" class="grow" min="0" max="0" value="0">
+        <span class="faint" id="pos">0 / 0</span>
       </div>
     </div>
 
-    <div>
-      <div id="stage-empty" class="text-muted" style="padding:40px 0;text-align:center">
-        Pick a game to replay.
-      </div>
+    <h2><span id="momenthead">—</span> <span class="faint" id="momentsub"></span></h2>
+    <table><tbody id="momentrows"></tbody></table>
+    <div id="momentfoot"></div>
 
-      <div id="stage-game" hidden>
-        <div class="panel">
-          <div class="panel-body">
-            <div class="scoreline">
-              <div class="team">
-                <span class="swatch" style="background:var(--danger)"></span>
-                <span id="awayname">—</span> <span class="sc" id="awayscore">0</span>
-              </div>
-              <div class="team">
-                <span class="swatch" style="background:var(--primary)"></span>
-                <span id="homename">—</span> <span class="sc" id="homescore">0</span>
-              </div>
-              <div class="clockbox">
-                <div class="big" id="clock">—</div>
-                <div class="text-muted" id="periodlbl">—</div>
-              </div>
-            </div>
-            <div class="progress">
-              <div class="progress-bar pb-away" id="wpa" style="width:50%">50%</div>
-              <div class="progress-bar pb-home" id="wph" style="width:50%">50%</div>
-            </div>
-          </div>
-        </div>
-
-        <div class="panel">
-          <div class="panel-body" style="padding:10px">
-            <svg id="chart" viewBox="0 0 900 260" preserveAspectRatio="none"
-                 role="img" aria-label="Win probability over the course of the game"></svg>
-          </div>
-        </div>
-
-        <div class="panel" id="transport">
-          <div class="panel-body">
-            <div class="controls">
-              <button id="first" class="btn btn-default" title="Start">|&lt;</button>
-              <button id="back" class="btn btn-default" title="Step back (left arrow)">&lt;</button>
-              <button id="playpause" class="btn btn-primary" style="min-width:86px">▶ Play</button>
-              <button id="fwd" class="btn btn-default" title="Step forward (right arrow)">&gt;</button>
-              <button id="last" class="btn btn-default" title="End">&gt;|</button>
-              <select id="speed" class="form-control" title="Replay speed">
-                <option value="1">1× real time</option>
-                <option value="5">5×</option>
-                <option value="15">15×</option>
-                <option value="60" selected>60×</option>
-                <option value="240">240×</option>
-                <option value="0">fastest</option>
-              </select>
-              <label style="white-space:nowrap;margin:0;font-weight:400">
-                <input type="checkbox" id="spoil" checked> show ending
-              </label>
-            </div>
-            <div class="controls" style="margin-top:12px">
-              <input type="range" id="scrub" class="grow" min="0" max="0" value="0">
-              <span class="text-muted" id="pos" style="white-space:nowrap">0 / 0</span>
-            </div>
-          </div>
-        </div>
-
-        <div class="panel">
-          <div class="panel-heading">
-            <strong id="momenthead">—</strong>
-            <span class="text-muted" id="momentsub"></span>
-          </div>
-          <table class="table table-striped"><tbody id="momentrows"></tbody></table>
-          <div class="panel-body" style="padding-top:10px" id="momentfoot"></div>
-        </div>
-
-        <small class="text-muted">
-          <span class="kbd">space</span> play/pause ·
-          <span class="kbd">&larr;</span> <span class="kbd">&rarr;</span> step ·
-          <span class="kbd">home</span> <span class="kbd">end</span> jump.
-          Plays sharing a game clock are shown together as one moment, and moments
-          run in game-clock order even if the feed did not.
-          Every probability came from the model itself; nothing is interpolated.
-        </small>
-      </div>
-    </div>
+    <p class="foot">Space plays, arrows step, home and end jump. Plays at one
+    clock are one moment, shown in clock order. Nothing is interpolated.</p>
   </div>
 </div>
-
 <script>
 "use strict";
 const $ = id => document.getElementById(id);
@@ -349,21 +215,23 @@ function buildMoments(plays) {
 function drawChart() {
   const svg = $("chart");
   if (!game) { svg.innerHTML = ""; return; }
-  const W = 900, H = 260, L = 38, R = 12, T = 10, B = 22;
+  const W = 900, H = 240, L = 34, R = 6, T = 8, B = 20;
   const total = totalSeconds(game);
   const x = s => L + (s / total) * (W - L - R);
   const y = p => T + (1 - p) * (H - T - B);
   const out = [];
 
-  out.push(`<rect x="${L}" y="${T}" width="${W - L - R}" height="${H - T - B}"
-    fill="#fff" stroke="#ccc" stroke-width="1"/>`);
-  for (const p of [0.25, 0.5, 0.75]) {
+  const font = 'font-size="11" font-family="Helvetica Neue,Helvetica,Arial,sans-serif" fill="#777"';
+  for (const p of [0, 0.25, 0.5, 0.75, 1]) {
     out.push(`<line x1="${L}" x2="${W - R}" y1="${y(p)}" y2="${y(p)}"
-      stroke="${p === 0.5 ? '#bbb' : 'var(--grid)'}" stroke-width="1"
-      ${p === 0.5 ? 'stroke-dasharray="4 3"' : ''}/>`);
-    out.push(`<text x="${L - 6}" y="${y(p) + 4}" fill="#777" font-size="11"
-      text-anchor="end" font-family="Helvetica,Arial,sans-serif">${p * 100}%</text>`);
+      stroke="${p === 0.5 ? '#999' : 'var(--grid)'}" stroke-width="1"/>`);
+    if (p > 0 && p < 1) out.push(`<text x="${L - 5}" y="${y(p) + 4}" ${font}
+      text-anchor="end">${p * 100}</text>`);
   }
+  // The line is the home team's probability, so the top of the plot is theirs
+  // and the bottom is the visitors'. Say so, in the corners.
+  out.push(`<text x="${L + 5}" y="${T + 13}" ${font}>${esc($("homename").textContent)}</text>`);
+  out.push(`<text x="${L + 5}" y="${H - B - 5}" ${font}>${esc($("awayname").textContent)}</text>`);
   const per = game.periods || 2;
   for (let k = 1; k < per; k++) {
     const s = k <= 1 ? REG : 2 * REG + (k - 2) * OT;
@@ -376,24 +244,21 @@ function drawChart() {
   const pts = game.moments.map(m => [x(elapsed(m)), y(m.wp)]);
   const d = q => q.map((p, i) => (i ? "L" : "M") + p[0].toFixed(1) + " " + p[1].toFixed(1)).join(" ");
   if ($("spoil").checked) {
-    out.push(`<path d="${d(pts)}" fill="none" stroke="#ccc" stroke-width="1.5"/>`);
+    out.push(`<path d="${d(pts)}" fill="none" stroke="#c8c8c8" stroke-width="1"/>`);
   }
   const seen = pts.slice(0, idx + 1);
   if (seen.length > 1) {
-    out.push(`<path d="${d(seen)}" fill="none" stroke="var(--primary)"
-      stroke-width="2" stroke-linejoin="round"/>`);
+    out.push(`<path d="${d(seen)}" fill="none" stroke="var(--ink)"
+      stroke-width="1.5" stroke-linejoin="round"/>`);
   }
   const cur = pts[idx];
   if (cur) {
     out.push(`<line x1="${cur[0]}" x2="${cur[0]}" y1="${T}" y2="${H - B}"
       stroke="var(--danger)" stroke-width="1"/>`);
-    out.push(`<circle cx="${cur[0]}" cy="${cur[1]}" r="4" fill="var(--primary)"
-      stroke="#fff" stroke-width="1.5"/>`);
+    out.push(`<circle cx="${cur[0]}" cy="${cur[1]}" r="3" fill="var(--danger)"/>`);
   }
-  out.push(`<text x="${L}" y="${H - 6}" fill="#777" font-size="11"
-    font-family="Helvetica,Arial,sans-serif">tip</text>`);
-  out.push(`<text x="${W - R}" y="${H - 6}" fill="#777" font-size="11" text-anchor="end"
-    font-family="Helvetica,Arial,sans-serif">final</text>`);
+  out.push(`<text x="${L}" y="${H - 5}" ${font}>tip</text>`);
+  out.push(`<text x="${W - R}" y="${H - 5}" ${font} text-anchor="end">final</text>`);
   svg.innerHTML = out.join("");
 }
 
@@ -409,16 +274,12 @@ function render() {
   $("clock").textContent = mmss(m.clock);
   $("periodlbl").textContent = periodLabel(m.period);
 
-  const h = Math.max(0, Math.min(1, m.wp));
-  $("wph").style.width = (h * 100).toFixed(1) + "%";
-  $("wpa").style.width = ((1 - h) * 100).toFixed(1) + "%";
-  $("wph").textContent = h >= 0.15 ? pct(h) : "";
-  $("wpa").textContent = (1 - h) >= 0.15 ? pct(1 - h) : "";
+  $("wpnum").textContent = pct(m.wp);
 
   $("momenthead").textContent =
-    `${periodLabel(m.period)} · ${mmss(m.clock)} · ${m.away}–${m.home}`;
+    `${periodLabel(m.period)}, ${mmss(m.clock)}, ${m.away}–${m.home}`;
   $("momentsub").textContent = m.plays.length > 1
-    ? `  — ${m.plays.length} plays at this clock` : "";
+    ? `${m.plays.length} plays at this clock` : "";
 
   // Each play keeps its own probability, so a moment that moves the number
   // shows WHICH play moved it: a free-throw trip is several plays at one clock
@@ -427,31 +288,33 @@ function render() {
   // chronologically previous moment except where the feed was disordered.
   $("momentrows").innerHTML = m.plays.map(p => {
     const dd = p.wp - p.prevWp;
-    const cls = dd > 0.0005 ? "up" : dd < -0.0005 ? "down" : "text-muted";
-    const arrow = dd > 0.0005 ? "▲" : dd < -0.0005 ? "▼" : "·";
+    const cls = dd > 0.0005 ? "up" : dd < -0.0005 ? "down" : "flat";
+    const sign = dd > 0.0005 ? "+" : dd < -0.0005 ? "−" : "";
+    const team = p.team === "home" ? $("homename").textContent
+               : p.team === "away" ? $("awayname").textContent : "";
     return `<tr>
-      <td style="width:1%"><span class="badge">${esc(p.type || "—")}</span></td>
+      <td class="type">${esc(team)}</td>
+      <td class="type">${esc(p.type || "—")}</td>
       <td>${esc(p.text || "(no description in the feed)")}</td>
-      <td class="wpcell">${pct(p.wp)}
-        <span class="${cls}">${arrow} ${(dd * 100).toFixed(1)}</span></td>
+      <td class="num">${pct(p.wp)}
+        <span class="${cls}">${sign}${Math.abs(dd * 100).toFixed(1)}</span></td>
     </tr>`;
   }).join("");
 
   const total = m.wp - m.plays[0].prevWp;
   $("momentfoot").innerHTML =
-    `<small class="text-muted">moment ${idx + 1} of ${game.moments.length} ·
-     plays ${m.plays[0].seq}–${m.plays[m.plays.length - 1].seq} of ${game.nplays} ·
-     margin ${m.margin > 0 ? "+" : ""}${m.margin} · home ${pct(m.wp)}${
-       prev ? ` (${total >= 0 ? "+" : ""}${(total * 100).toFixed(1)} pts across this moment)` : ""}
-     </small>`
+    `<p class="faint">Moment ${idx + 1} of ${game.moments.length},
+     plays ${m.plays[0].seq}–${m.plays[m.plays.length - 1].seq} of ${game.nplays}.
+     Margin ${m.margin > 0 ? "+" : ""}${m.margin}${
+       prev ? `, ${total >= 0 ? "+" : "−"}${Math.abs(total * 100).toFixed(1)} across this moment` : ""}.
+     </p>`
     + (m.displaced
-        ? `<div class="alert-warning">The feed did not deliver this moment in clock
-           order: it arrived ${m.displaced.after !== undefined
+        ? `<p class="note">The feed did not deliver this moment in clock order: it
+           arrived ${m.displaced.after !== undefined
              ? `after play ${m.displaced.after}, which is later on the clock`
              : `before play ${m.displaced.before}, which is earlier on the clock`}.
-           It is shown here at its own clock time, and its probabilities are still
-           the model's, computed in the order the feed sent the plays
-           (EXPLAIN 8.8b).</div>`
+           It is shown at its own clock time; its probabilities are still the
+           model's, computed in the order the feed sent the plays (EXPLAIN 8.8b).</p>`
         : "");
 
   $("scrub").value = idx;
@@ -465,7 +328,7 @@ function render() {
 
 function stop() {
   if (timer) { clearTimeout(timer); timer = null; }
-  $("playpause").textContent = "▶ Play";
+  $("playpause").textContent = "Play";
 }
 function atEnd() { return !game || idx >= game.moments.length - 1; }
 function step(n) {
@@ -489,7 +352,7 @@ function playPause() {
   if (!game) return;
   if (timer) { stop(); return; }
   if (atEnd()) { idx = 0; render(); }
-  $("playpause").textContent = "❚❚ Pause";
+  $("playpause").textContent = "Pause";
   timer = setTimeout(tick, 80);
 }
 
@@ -516,8 +379,8 @@ async function loadGame(gid) {
       + (j.synthetic ? " · REBUILT FROM hoopR, not an ESPN recording" : "");
     $("stage-empty").hidden = true; $("stage-game").hidden = false;
     $("transport").hidden = false;
-    document.querySelectorAll(".list-group-item").forEach(el =>
-      el.classList.toggle("active", Number(el.dataset.gid) === Number(gid)));
+    document.querySelectorAll("#list li").forEach(el =>
+      el.classList.toggle("on", Number(el.dataset.gid) === Number(gid)));
     render();
   } catch (e) {
     $("stage-empty").textContent = "could not load that game: " + e.message;
@@ -528,20 +391,18 @@ async function loadList() {
   const j = await (await fetch("/api/games")).json();
   const box = $("list");
   if (!j.games.length) {
-    box.innerHTML = `<p class="text-muted">No archived games yet. Run
-      <code>scripts/archive_replay_games.py</code>, or fetch one below.</p>`;
+    box.innerHTML = `<li class="faint">No archived games yet. Run
+      scripts/archive_replay_games.py, or fetch one below.</li>`;
     return;
   }
   box.innerHTML = j.games.map(g => g.error
-    ? `<div class="list-group-item">${g.game_id}<br><small class="text-muted">${esc(g.error)}</small></div>`
-    : `<div class="list-group-item" data-gid="${g.game_id}">
-         ${esc(g.away_name)} @ ${esc(g.home_name)}
-         <br><small class="text-muted">${g.away_score}–${g.home_score} · ${g.plays} plays${
-           g.periods > 2 ? " · OT" : ""}</small>${
-           g.synthetic ? '<br><small class="lbl-warn">rebuilt from hoopR</small>' : ""}
-       </div>`).join("");
-  box.querySelectorAll(".list-group-item[data-gid]").forEach(el =>
-    el.onclick = () => loadGame(el.dataset.gid));
+    ? `<li class="faint">${g.game_id}: ${esc(g.error)}</li>`
+    : `<li data-gid="${g.game_id}"><a href="#${g.game_id}">${esc(g.away_name)} at ${
+         esc(g.home_name)}</a> <span class="faint">${g.away_score}–${g.home_score}${
+         g.periods > 2 ? ", OT" : ""}, ${g.plays} plays${
+         g.synthetic ? ", rebuilt from hoopR" : ""}</span></li>`).join("");
+  box.querySelectorAll("#list li[data-gid] a").forEach(el =>
+    el.onclick = e => { e.preventDefault(); loadGame(el.parentNode.dataset.gid); });
 }
 
 /* ---------- live ------------------------------------------------------- */
@@ -550,19 +411,20 @@ async function pollLive() {
   const j = await (await fetch("/api/live")).json();
   const box = $("list");
   if (j.offline || !j.games || !j.games.length) {
-    box.innerHTML = `<p class="text-muted">${j.offline
-      ? "No live feed running. Start <code>scripts/serve_live.py</code>."
-      : "Live feed is up, but no games are in progress."}</p>`;
+    box.innerHTML = `<li class="faint">${j.offline
+      ? "No live feed running. Start scripts/serve_live.py."
+      : "Live feed is up, but no games are in progress."}</li>`;
     return;
   }
   box.innerHTML = j.games.map(g => `
-    <div class="list-group-item${g.game_id === liveGid ? " active" : ""}" data-gid="${g.game_id}">
-      game ${g.game_id}${g.replay ? " (replay)" : ""}
-      <br><small class="text-muted">P${g.period} · ${mmss(g.game_seconds_remaining)} left ·
-        margin ${g.margin > 0 ? "+" : ""}${g.margin} · home ${pct(g.home_win_prob)}</small>
-    </div>`).join("");
-  box.querySelectorAll(".list-group-item[data-gid]").forEach(el =>
-    el.onclick = () => { liveGid = Number(el.dataset.gid); loadLiveGame(); });
+    <li class="${g.game_id === liveGid ? "on" : ""}" data-gid="${g.game_id}">
+      <a href="#${g.game_id}">game ${g.game_id}${g.replay ? " (replay)" : ""}</a>
+      <span class="faint">P${g.period}, ${mmss(g.game_seconds_remaining)} left,
+        margin ${g.margin > 0 ? "+" : ""}${g.margin}, home ${pct(g.home_win_prob)}</span>
+    </li>`).join("");
+  box.querySelectorAll("#list li[data-gid] a").forEach(el =>
+    el.onclick = e => { e.preventDefault();
+                        liveGid = Number(el.parentNode.dataset.gid); loadLiveGame(); });
   if (liveGid !== null) loadLiveGame();
 }
 
@@ -590,19 +452,15 @@ async function loadLiveGame() {
   $("awayscore").textContent = "";
   const perClock = g.period <= 1 ? g.game_seconds_remaining - REG : g.game_seconds_remaining;
   $("clock").textContent = mmss(perClock);
-  $("periodlbl").textContent = periodLabel(g.period) + (g.replay ? " · replay" : "") + " · live";
-  const h = Math.max(0, Math.min(1, g.home_win_prob));
-  $("wph").style.width = (h * 100).toFixed(1) + "%";
-  $("wpa").style.width = ((1 - h) * 100).toFixed(1) + "%";
-  $("wph").textContent = h >= 0.15 ? pct(h) : "";
-  $("wpa").textContent = (1 - h) >= 0.15 ? pct(1 - h) : "";
-  $("momenthead").textContent = `${g.status} · play ${g.seq}`;
-  $("momentsub").textContent = `  — ${hist.length} polls recorded`;
+  $("periodlbl").textContent = periodLabel(g.period) + (g.replay ? ", replay" : "") + ", live";
+  $("wpnum").textContent = pct(g.home_win_prob);
+  $("momenthead").textContent = `${g.status}, play ${g.seq}`;
+  $("momentsub").textContent = `${hist.length} polls recorded`;
   $("momentrows").innerHTML = `<tr><td>The poller re-scores the whole game every
     poll, so this is the model's current answer rather than an increment.</td>
-    <td class="wpcell">${pct(g.home_win_prob)}</td></tr>`;
-  $("momentfoot").innerHTML = `<small class="text-muted">margin
-    ${g.margin > 0 ? "+" : ""}${g.margin} · home ${pct(g.home_win_prob)}</small>`;
+    <td class="num">${pct(g.home_win_prob)}</td></tr>`;
+  $("momentfoot").innerHTML = `<p class="faint">Margin
+    ${g.margin > 0 ? "+" : ""}${g.margin}.</p>`;
   $("modelmeta").textContent =
     `model ${j.model_version} · state rules v${j.state_rules_version} · live`;
   $("stage-empty").hidden = true; $("stage-game").hidden = false;
@@ -615,17 +473,17 @@ async function loadLiveGame() {
 function setMode(next) {
   mode = next; stop();
   if (liveTimer) { clearInterval(liveTimer); liveTimer = null; }
-  $("tab-replay").classList.toggle("active", next === "replay");
-  $("tab-live").classList.toggle("active", next === "live");
+  $("tab-replay").classList.toggle("on", next === "replay");
+  $("tab-live").classList.toggle("on", next === "live");
   $("fetchbox").hidden = next !== "replay";
   $("listhead").textContent = next === "replay" ? "Archived games" : "Live now";
   $("stage-game").hidden = true;
   $("stage-empty").hidden = false;
   if (next === "replay") {
     liveGid = null; $("transport").hidden = false; loadList();
-    $("stage-empty").textContent = "Pick a game to replay.";
+    $("stage-empty").textContent = "Pick a game.";
   } else {
-    $("stage-empty").textContent = "Live games appear on the left as the poller finds them.";
+    $("stage-empty").textContent = "Live games appear above as the poller finds them.";
     pollLive(); liveTimer = setInterval(pollLive, 5000);
   }
 }
@@ -638,16 +496,14 @@ $("last").onclick = () => { stop(); idx = game.moments.length - 1; render(); };
 $("scrub").oninput = e => { stop(); idx = Number(e.target.value); render(); };
 $("spoil").onchange = drawChart;
 $("speed").onchange = () => { if (timer) { clearTimeout(timer); timer = setTimeout(tick, 40); } };
-$("tab-replay").onclick = () => setMode("replay");
-$("tab-live").onclick = () => setMode("live");
+$("tab-replay").onclick = e => { e.preventDefault(); setMode("replay"); };
+$("tab-live").onclick = e => { e.preventDefault(); setMode("live"); };
 
 $("fetchbtn").onclick = async () => {
   const gid = $("gid").value.trim();
   const err = $("fetcherr");
-  err.style.display = "none";
-  if (!/^\d+$/.test(gid)) {
-    err.textContent = "Game id must be digits."; err.style.display = "block"; return;
-  }
+  err.textContent = "";
+  if (!/^\d+$/.test(gid)) { err.textContent = "Game id must be digits."; return; }
   $("fetchbtn").disabled = true; $("fetchbtn").textContent = "…";
   try {
     const r = await fetch("/api/fetch/" + gid);
@@ -655,7 +511,7 @@ $("fetchbtn").onclick = async () => {
     if (!r.ok) throw new Error(j.error || r.statusText);
     await loadList(); await loadGame(gid);
   } catch (e) {
-    err.textContent = e.message; err.style.display = "block";
+    err.textContent = e.message;
   } finally {
     $("fetchbtn").disabled = false; $("fetchbtn").textContent = "Fetch";
   }

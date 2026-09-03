@@ -181,9 +181,9 @@ delivered out of clock order carries a warning saying where it actually sat.
 `tests/test_viz.py` runs the page's own moment builder under node on a
 deliberately disordered feed to hold this.
 
-The look is Bootstrap 3 / Shiny default, hand-written rather than pulled from a
-CDN, for the same reason as everything else here: it has to work on a laptop
-with no network.
+The page is plain on purpose: Helvetica, one chart, one table, no cards or
+motion. Nothing is pulled from a CDN, for the same reason as everything else
+here: it has to work on a laptop with no network.
 
 Replay is precomputed, not streamed. `replay_server.py` runs a wall clock
 forwards for the *poller*; this runs `score_game` once and lets the browser

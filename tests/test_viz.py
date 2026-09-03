@@ -70,6 +70,17 @@ def test_the_caption_belongs_to_the_probability_beside_it(scored):
         assert p["margin"] == p["home"] - p["away"], f"play {p['seq']} misaligned"
 
 
+def test_every_play_is_credited_to_a_side_or_to_nobody(scored):
+    """The page labels each play with its team, so the side must be resolved
+    here against the header's ids, never guessed from text."""
+    teams = [p["team"] for p in scored["plays"]]
+    assert set(teams) <= {"home", "away", None}
+    assert "home" in teams and "away" in teams
+    for p in scored["plays"]:
+        if p["type"] in ("JumpShot", "LayUpShot", "MadeFreeThrow"):
+            assert p["team"] in ("home", "away"), f"play {p['seq']} has a shot with no side"
+
+
 REG, OT = 1200, 300
 
 
