@@ -206,6 +206,35 @@ endgame override clips to 0.999, and the state a few seconds earlier was never
 touched by it. Intended, not a defect, and worth knowing before someone reads it
 as one at 11pm in February.
 
+### Second dry run: after the ordering fix
+
+Re-run at the same 5x with the `sequenceNumber` sort removed. Seven games (the
+sixth-plus-one now in the archive), 195 states, all tagged `"replay": true`, all
+seven reproducing the real final score, the overtime game carried through a
+third period, and `data/live/` untouched.
+
+**Comparing two dry runs is not a way to detect a model change.** The poller
+emits one row per poll, so two runs sample different plays at different game
+times — 24 to 39 points across a 40-minute game, one sample per 60–100 seconds.
+Interpolating between those is dominated by *where the samples fell*:
+
+| game | difference between the two runs | attributable to the fix |
+|---|---|---|
+| Arkansas at Missouri | 0.239 | ≤ 0.036 |
+| Stanford at NC State | 0.188 | ≤ 0.036 |
+| UConn at Marquette | 0.086 | ≤ 0.036 |
+| UConn vs Michigan | 0.073 | ≤ 0.036 |
+| Michigan vs Arizona | 0.057 | ≤ 0.036 |
+| UNC at Duke | 0.042 | ≤ 0.036 |
+
+Holding the ordering fixed and resampling one true curve at each run's own poll
+times reproduces the left column exactly, to three decimals. So the entire
+difference is sampling, and none of it is the fix.
+
+The fix's real effect is the right column, measured deterministically by scoring
+the same games both ways and matching plays by identity: at most 3.6 points on
+any single play, mean under 0.2, finals identical (EXPLAIN 8.8b).
+
 ### Step 6 can be vacuous, and now says so
 
 `tmp/fixtures/` may contain payloads **rebuilt from hoopR** by

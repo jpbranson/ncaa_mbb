@@ -1,5 +1,5 @@
 # `cbbwp` source bundle
-Complete source. Regenerated 2026-09-03 14:05 from the `ncaa_mbb` working folder, at commit `bff9db7`.
+Complete source. Regenerated 2026-09-03 14:18 from the `ncaa_mbb` working folder, at commit `571f5ab`.
 
 State rules v2, model v2. This bundle is a mirror for disaster recovery; the folder is the source of truth (it also holds the data, the fitted model and the git history). Regenerate with `python3 scripts/build_source_bundle.py` whenever the source changes.
 
