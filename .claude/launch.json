@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "viz",
+      "runtimeExecutable": ".venv/bin/python3",
+      "runtimeArgs": ["scripts/serve_viz.py", "--port", "8811"],
+      "port": 8811
+    }
+  ]
+}
