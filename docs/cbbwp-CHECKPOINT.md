@@ -8,14 +8,22 @@ count as an improvement. If you come back to this in a year, start here.*
 | | |
 |---|---|
 | Git tag | `checkpoint-2026-09-02` |
-| Shipped model | `registry/v2`, sha256 `2d4bf58134fa2e64`, LightGBM, 2.62 MB |
-| State rules | **v2** (`STATE_RULES_VERSION = 2` in `schemas.py`) |
+| Shipped model | `registry/v3`, sha256 `2d4bf58134fa2e64`, LightGBM, 2.62 MB |
+| State rules | **v3** (`STATE_RULES_VERSION = 3` in `schemas.py`) |
 | Features | 11, order is part of the contract |
 | Trained on | 2016–2023 · calibrated 2024 · tested 2025–2026 |
 | Endgame table | `registry/endgame/e1`, sha `ef41c4a74af1be04` — **built, not served** (rebuilt 2026-09-08, see below) |
-| Tests | 82 at the tag; 121 now, after session 6 and 7's live-path and viz tests and session 8's audit fixes. None skipped, ~7s |
+| Tests | 82 at the tag; 125 now, after session 6 and 7's live-path and viz tests and session 8's audit fixes. None skipped, ~7s |
 | Python | ≥ 3.10 (checkpoint built on 3.10.12; the suite also passes on 3.14) |
-| Prior model | `registry/v1`, sha `aaddca0d81606bc0`, state rules v1, deliberately refused at load |
+| Prior models | `registry/v2` (rules v2) and `registry/v1` (rules v1), both deliberately refused at load |
+
+**v3 is the same booster as v2, byte for byte.** `sha256 2d4bf58134fa2e64` is
+the same hash the tag carries. Rules v3 changed what an unreadable clock means
+(see below); measured across all ten seasons, **zero** of 19,462,128
+play-by-play rows carry one, so the rule changed no training row — the dataset
+rebuilt under v3 is identical row for row, and the refit under it reproduced the
+booster exactly. The version exists so the guard in `serve.py` can tell the two
+rule sets apart, not because the model moved.
 
 ## What it scores
 
@@ -23,8 +31,8 @@ Test seasons 2025–2026: 12,398 games, 2,233,937 states, none seen in training.
 
 | | Log loss | Brier | Accuracy | ECE |
 |---|---|---|---|---|
-| **LightGBM v2 (shipped)** | **0.3103** | **0.1008** | 85.20% | **0.0026** |
-| Logistic baseline | 0.3109 | 0.1009 | 85.19% | 0.0043 |
+| **LightGBM v3 (shipped)** | **0.3103** | **0.1008** | 85.20% | **0.0026** |
+| Logistic baseline | 0.3108 | 0.1009 | 85.19% | 0.0042 |
 | ESPN (deployed, same rows) | 0.3295 | 0.1061 | 84.58% | 0.0069 |
 
 By time remaining — never quote the average alone, it hides the failure mode:
@@ -55,7 +63,7 @@ changing only the weighting moves the headline by 17%.
    which lands about 0.0001 low on log loss and gives 85.19% / 0.0024 instead of
    85.20% / 0.0026. That is storage precision, not drift, and it has already
    been mistaken for the latter once.
-2. **Compare on identical rows.** Against v2 and against ESPN, in the same run.
+2. **Compare on identical rows.** Against v3 and against ESPN, in the same run.
 3. **Break it out by time bucket.** A change that improves the average while
    hurting the last minute is not an improvement.
 4. **Check calibration, not just log loss.** ECE, and `monitor.check` clustered
@@ -77,7 +85,7 @@ python3 scripts/build_games.py
 python3 scripts/build_team_stats.py
 python3 scripts/build_dataset.py
 python3 scripts/fit_models.py        # needs ~6 GB RAM
-python3 scripts/publish_model.py v2
+python3 scripts/publish_model.py v3
 python3 -m pytest -q
 ```
 
@@ -92,6 +100,16 @@ is OOM-killed under about 6 GB; everything else runs comfortably in 3 GB.
   LightGBM artifact is plain text and has no such problem, which is an argument
   for the format rather than for pinning the library. The baseline's figures
   cannot be recomputed on a machine with a different scikit-learn.
+
+  **Confirmed by the 2026-09-08 refit**, which is worth recording because it
+  shows the two artifacts behaving differently under the same conditions. The
+  refit ran on scikit-learn 1.9.0 against a provably identical dataset. The
+  LightGBM booster came out **byte for byte identical**. The logistic baseline
+  did not: log loss 0.3109 → 0.3108, ECE 0.0043 → 0.0042. Nothing about the data
+  or the code changed — only the library that solves the fit. A plain-text model
+  with pinned seeds reproduces; a pickled one from a different solver version
+  does not, and the difference lands exactly where a reader would mistake it for
+  drift. The baseline's row in the tables above now carries the 1.9.0 figures.
 - **`artifacts/` is entirely gitignored**, so a restored working copy has the
   model (in `registry/`) but none of the prediction files. Everything needed is
   rebuildable — `rebuild_test_preds.py` for the predictions, `fetch_data.py`
@@ -138,8 +156,21 @@ The three that change behaviour a future reader needs to know about:
   against an empty prior. `registry/context_latest.json` has been regenerated
   and its ratings moved by 0.84 sd (max 8.5 points).
 - **`registry/endgame/e1` and `e1_no2024` were rebuilt** (new hashes above).
-  `registry/v2` is untouched: no state rule, feature or model changed, so the
-  shipped model and every number in "What it scores" still stand exactly.
+
+Two further changes were made afterwards, on request, and both are recorded in
+full above and in `AUDIT-2026-09-08.md`:
+
+- **`STATE_RULES_VERSION` was bumped to 3** and the model republished as
+  `registry/v3` — the same booster, byte for byte. An unreadable clock now
+  carries the period's previous clock forward instead of becoming 0:00, which
+  is what stopped one malformed feed value from letting the endgame clamp
+  publish near-certainty with ten minutes left. `registry/v2` is kept and is now
+  refused at load, exactly as `v1` is; that refusal is tested for both.
+- **The endgame blend is tuned against a held-out table.** `--tune` used
+  `registry/endgame/e1`, which is fit on 2016–2024, while tuning on 2024. It now
+  defaults to `e1_no2024` and **refuses** a tune table that contains the tuning
+  season. The clean re-tune chose the identical four parameters, so the leak was
+  never driving the result — but a leak nobody is stopped by is a leak.
 
 ## The state this leaves the project in
 

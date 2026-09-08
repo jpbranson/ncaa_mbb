@@ -13,7 +13,7 @@ so a careless swap fails loudly at startup instead of silently serving skew.
 
     CBBWP_ROOT              project root (default: the repo this file is in)
     CBBWP_REGISTRY          model registry dir      (default: <root>/registry)
-    CBBWP_MODEL_VERSION     which model to serve    (default: v2)
+    CBBWP_MODEL_VERSION     which model to serve    (default: v3)
     CBBWP_CONTEXT           ratings snapshot path   (default: <registry>/context_latest.json)
     CBBWP_LIVE_DIR          JSONL output dir        (default: <root>/data/live)
     CBBWP_FIXTURE_DIR       replay from disk instead of the network (default: unset)
@@ -60,7 +60,7 @@ class Settings:
         return cls(
             root=root,
             registry=registry,
-            model_version=_env("CBBWP_MODEL_VERSION", "v2"),
+            model_version=_env("CBBWP_MODEL_VERSION", "v3"),
             context_path=pathlib.Path(
                 _env("CBBWP_CONTEXT", str(registry / "context_latest.json"))),
             live_dir=pathlib.Path(_env("CBBWP_LIVE_DIR", str(root / "data" / "live"))),

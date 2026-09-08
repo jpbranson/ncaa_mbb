@@ -14,7 +14,7 @@ from typing import Iterable, List, Optional
 import polars as pl
 
 from ..schemas import Event, HALF_SECONDS, OT_SECONDS
-from ..state import TEAM_TIMEOUT_TYPES, FOUL_TYPES, clock_to_seconds
+from ..state import TEAM_TIMEOUT_TYPES, FOUL_TYPES, parse_clock
 
 # Columns present in every season 2016-2026 of the hoopR mbb pbp files.
 BASE_COLS = [
@@ -45,7 +45,9 @@ def load_events(path: str, game_id: int) -> tuple[List[Event], int, int]:
             game_id=int(r["game_id"]),
             seq=int(r["game_play_number"]),
             period=int(r["period_number"] or 1),
-            clock_seconds=clock_to_seconds(r["clock_display_value"] or ""),
+            # None, not 0, when the clock cannot be read: build_states carries
+            # the period's previous clock forward (STATE_RULES_VERSION 3).
+            clock_seconds=parse_clock(r["clock_display_value"] or ""),
             home_score=int(r["home_score"] or 0),
             away_score=int(r["away_score"] or 0),
             event_type=r["type_text"] or "",
@@ -63,6 +65,13 @@ def load_events(path: str, game_id: int) -> tuple[List[Event], int, int]:
 # Vectorised bulk path
 # --------------------------------------------------------------------------
 def _clock_seconds_expr(col: str = "clock_display_value") -> pl.Expr:
+    """Vectorised twin of `state.parse_clock`: NULL when the clock is unreadable.
+
+    It used to `.fill_null(0)` here, which is the vectorised half of the bug
+    STATE_RULES_VERSION 3 fixes: an unreadable clock silently became 0:00, and
+    a 0:00 in the second half reads as a finished game. The null is now carried
+    forward in `states_lazy`, matching `state.build_states`.
+    """
     parts = pl.col(col).str.split_exact(":", 1)
     mm = parts.struct.field("field_0").cast(pl.Float64, strict=False)
     ss = parts.struct.field("field_1").cast(pl.Float64, strict=False)
@@ -70,7 +79,6 @@ def _clock_seconds_expr(col: str = "clock_display_value") -> pl.Expr:
         pl.when(pl.col(col).str.contains(":"))
         .then(mm * 60 + ss.floor())
         .otherwise(pl.col(col).cast(pl.Float64, strict=False).floor())
-        .fill_null(0)
         .cast(pl.Int32)
     )
 
@@ -103,24 +111,34 @@ def states_lazy(lf: pl.LazyFrame, timeouts_at_tip: int = 4) -> pl.LazyFrame:
     is_team_to = t.is_in(list(TEAM_TIMEOUT_TYPES))
     is_foul = t.is_in(list(FOUL_TYPES))
     period = pl.col("period_number").fill_null(1).clip(lower_bound=1).cast(pl.Int32)
-    plen = pl.when(period <= 2).then(pl.lit(HALF_SECONDS)).otherwise(pl.lit(OT_SECONDS))
-    clock = _clock_seconds_expr().clip(0, None)
-    clock = pl.min_horizontal(clock, plen).cast(pl.Int32)
-    gsr = pl.when(period <= 1).then(pl.lit(HALF_SECONDS) + clock).otherwise(clock)
+    # `_period` is materialised first because the clock's
+    # forward-fill has to be windowed on the period, and a window needs a
+    # column rather than an expression.
+    plen_col = pl.when(pl.col("_period") <= 2).then(pl.lit(HALF_SECONDS)).otherwise(pl.lit(OT_SECONDS))
+    # Same rule as state.build_states: carry an unreadable clock forward within
+    # its period, and start a period whose first clock is unreadable at full
+    # length. tests/test_parity.py holds the two implementations together, and
+    # test_state.py pins the rule itself on both paths.
+    clock_filled = (pl.col("_raw_clock").forward_fill().over(["game_id", "_period"])
+                    .fill_null(plen_col))
+    clock = pl.min_horizontal(clock_filled.clip(lower_bound=0), plen_col).cast(pl.Int32)
+    gsr = (pl.when(pl.col("_period") <= 1)
+           .then(pl.lit(HALF_SECONDS) + pl.col("_clock"))
+           .otherwise(pl.col("_clock")))
 
-    allot = pl.lit(timeouts_at_tip) + (period - 2).clip(lower_bound=0)
+    allot = pl.lit(timeouts_at_tip) + (pl.col("_period") - 2).clip(lower_bound=0)
 
     return (
         lf.sort(["game_id", "game_play_number"])
+        .with_columns(_period=period, _raw_clock=_clock_seconds_expr())
+        .with_columns(_clock=clock)
         .with_columns(
-            _period=period,
-            _clock=clock,
             _gsr=gsr.cast(pl.Int32),
             _poss_set=poss_set,
             _to_home=(is_team_to & (pl.col("team_id") == pl.col("home_team_id"))).cast(pl.Int32),
             _to_away=(is_team_to & (pl.col("team_id") == pl.col("away_team_id"))).cast(pl.Int32),
             _allot=allot,
-            _half=pl.when(period <= 1).then(pl.lit(1)).otherwise(pl.lit(2)),
+            _half=pl.when(pl.col("_period") <= 1).then(pl.lit(1)).otherwise(pl.lit(2)),
             _foul_home=(is_foul & (pl.col("team_id") == pl.col("home_team_id"))).cast(pl.Int32),
             _foul_away=(is_foul & (pl.col("team_id") == pl.col("away_team_id"))).cast(pl.Int32),
         )
@@ -139,6 +157,6 @@ def states_lazy(lf: pl.LazyFrame, timeouts_at_tip: int = 4) -> pl.LazyFrame:
         )
         .rename({"_period": "period", "_clock": "clock_seconds",
                  "_gsr": "game_seconds_remaining", "game_play_number": "seq"})
-        .drop(["_poss_set", "_to_home", "_to_away", "_allot", "home_used", "away_used",
-               "_half", "_foul_home", "_foul_away"])
+        .drop(["_raw_clock", "_poss_set", "_to_home", "_to_away", "_allot",
+               "home_used", "away_used", "_half", "_foul_home", "_foul_away"])
     )

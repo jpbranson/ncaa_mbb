@@ -362,7 +362,7 @@ ratings at 0.70 carryover and says so.
 This was a requirement, so it is a config change and a restart — never an edit:
 
 ```bash
-CBBWP_MODEL_VERSION=v3 python3 scripts/serve_live.py
+CBBWP_MODEL_VERSION=v4 python3 scripts/serve_live.py
 ```
 
 or change the value in `~/Library/LaunchAgents/com.cbbwp.live.plist` and reload.
@@ -382,13 +382,21 @@ Three guards make a careless swap fail at startup rather than silently:
 2. **`STATE_RULES_VERSION`.** It refuses a model fit under different state
    rules even when the feature *names* still match — the case that nearly
    shipped train/serve skew on 2026-09-01. **Bump it whenever the meaning of a
-   `GameState` field changes, and refit.**
+   `GameState` field changes, and refit.** Exercised for real on 2026-09-08
+   (rules v2 → v3): the bump refused `registry/v2` at startup even though its
+   model file is byte-identical to `v3`'s, which is the whole point.
 3. **Startup ordering.** `serve_live.py` loads the model before it binds a port
    or opens a file, so a bad version is a failure to start, not a failure at
    tip-off.
 
-Old versions stay in `registry/`. `registry/v1` is deliberately refused at load
-by current code and kept only for provenance — that refusal is itself tested.
+Old versions stay in `registry/`. `registry/v1` (rules v1) and `registry/v2`
+(rules v2) are both deliberately refused at load by current code and kept only
+for provenance — that refusal is itself tested, for both.
+
+`v2` is the instructive one. Its model file is the **same booster as v3, byte
+for byte**, and its feature names are identical; only the state-rules stamp
+differs. Nothing except that guard distinguishes them, which is precisely the
+case the guard was added for.
 
 ## The container, when you want it
 
@@ -413,7 +421,7 @@ Every setting is an environment variable with a working default, so a bare
 
 | variable | default | |
 |---|---|---|
-| `CBBWP_MODEL_VERSION` | `v2` | which model serves |
+| `CBBWP_MODEL_VERSION` | `v3` | which model serves |
 | `CBBWP_REGISTRY` | `<root>/registry` | where artifacts live |
 | `CBBWP_CONTEXT` | `<registry>/context_latest.json` | ratings snapshot |
 | `CBBWP_LIVE_DIR` | `<root>/data/live` | JSONL output |

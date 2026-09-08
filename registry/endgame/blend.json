@@ -5,11 +5,12 @@
   "beta": 0.05,
   "w_max": 0.30000000000000004,
   "table": "registry/endgame/e1",
-  "model": "registry/v2",
+  "tune_table": "registry/endgame/e1_no2024",
+  "model": "registry/v3",
   "tuned_on_season": 2024,
-  "tune_log_loss_inside_60s": 0.12138237731068025,
+  "tune_log_loss_inside_60s": 0.12140524473298425,
   "tune_baseline_model_only": 0.12229312197954076,
   "tune_baseline_model_only_unclamped": 0.12198951369594463,
-  "tune_table_only": 0.13378185164888776,
+  "tune_table_only": 0.13384819026991915,
   "n_tune_rows": 103554
 }

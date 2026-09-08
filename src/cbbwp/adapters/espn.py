@@ -146,11 +146,14 @@ def chronological_inversions(events: Sequence[Event]) -> int:
     somebody is told about rather than something silently rearranged.
     """
     def elapsed(e: Event) -> int:
+        # An unreadable clock is None here; the carry-forward that resolves it
+        # lives in build_states, and this function is only counting order, so
+        # treat it as 0 rather than reimplementing the rule.
+        c = e.clock_seconds or 0
         if e.period <= 2:
-            return 2 * HALF_SECONDS - game_seconds_remaining(e.period,
-                                                             e.clock_seconds)
+            return 2 * HALF_SECONDS - game_seconds_remaining(e.period, c)
         return (2 * HALF_SECONDS + (e.period - 3) * OT_SECONDS
-                + (OT_SECONDS - e.clock_seconds))
+                + (OT_SECONDS - c))
     t = [elapsed(e) for e in events]
     return sum(1 for i in range(1, len(t)) if t[i] < t[i - 1])
 
@@ -213,7 +216,9 @@ def events_from_plays(plays: Sequence[dict], game_id: int) -> List[Event]:
                 game_id=game_id,
                 seq=n,
                 period=period,
-                clock_seconds=clock_to_seconds(clock),
+                # None, not 0, when the clock cannot be read: build_states
+                # carries the period's previous clock forward (rules v3).
+                clock_seconds=parse_clock(clock),
                 home_score=_int(p.get("homeScore"), 0) or 0,
                 away_score=_int(p.get("awayScore"), 0) or 0,
                 event_type=play_type_text(p),

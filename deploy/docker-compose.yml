@@ -18,7 +18,7 @@ services:
       - ../registry:/app/registry:ro
       - cbbwp-live:/data/live
     environment:
-      CBBWP_MODEL_VERSION: "v2"
+      CBBWP_MODEL_VERSION: "v3"
       CBBWP_RATINGS_MAX_AGE: "3"
     stop_grace_period: 20s
 

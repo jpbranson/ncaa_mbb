@@ -125,7 +125,7 @@ def _curves() -> list[dict]:
     aggregate metric will.
     """
     import lightgbm as lgb
-    booster = lgb.Booster(model_file=str(ROOT / "registry" / "v2" / "model.txt"))
+    booster = lgb.Booster(model_file=str(ROOT / "registry" / "v3" / "model.txt"))
 
     st = (pl.scan_parquet(ROOT / "data" / "proc" / "states" / f"states_{CURVE_SEASON}.parquet")
           .select(FEATURE_NAMES + [c for c in

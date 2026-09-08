@@ -138,17 +138,40 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--tune", action="store_true")
     ap.add_argument("--test", action="store_true")
-    ap.add_argument("--table", default="registry/endgame/e1")
-    ap.add_argument("--model", default="registry/v2")
+    ap.add_argument("--table", default="registry/endgame/e1",
+                    help="table used by --test (may include the tuning season)")
+    ap.add_argument("--tune-table", default="registry/endgame/e1_no2024",
+                    help="table used by --tune; must NOT have been fit on the "
+                         "tuning season")
+    ap.add_argument("--model", default="registry/v3")
     a = ap.parse_args()
 
     import lightgbm as lgb
     booster = lgb.Booster(model_file=str(ROOT / a.model / "model.txt"))
-    tdir = ROOT / a.table
-    table = np.load(tdir / "table.npz")["table"].astype(np.float64)
-    means = json.loads((tdir / "manifest.json").read_text())["ft_bucket_means"]
+
+    def load_table(rel: str):
+        d = ROOT / rel
+        m = json.loads((d / "manifest.json").read_text())
+        return (np.load(d / "table.npz")["table"].astype(np.float64),
+                m["ft_bucket_means"], m)
 
     if a.tune:
+        # Tune against a table that has NOT seen the tuning season.
+        #
+        # This used to tune on 2024 using `e1`, which is fit on 2016-2024 -- so
+        # the season choosing the blend weights was inside the table those
+        # weights were chosen for. It never threatened the headline number (the
+        # single-shot test is on 2025-2026, which no table has seen), but it
+        # made the four parameters slightly optimistic about their own tuning
+        # season, and there is a purpose-built held-out table sitting right next
+        # to it. Refuse rather than warn: a leak nobody is stopped by is a leak.
+        table, means, tmeta = load_table(a.tune_table)
+        if TUNE_SEASON in tmeta["seasons_used"]:
+            raise SystemExit(
+                f"refusing to tune on {TUNE_SEASON} with {a.tune_table}, which "
+                f"was fit on it (seasons_used={tmeta['seasons_used']}).\n"
+                "  Pass --tune-table registry/endgame/e1_no2024, or build a "
+                "table that holds the tuning season out.")
         d = load_frame(TUNE_SEASON, table, means, booster)
         inside = d["secs"] <= HANDOFF
         y, sec = d["y"][inside], d["secs"][inside]
@@ -172,7 +195,10 @@ def main() -> None:
         cfg = {
             "handoff_seconds": HANDOFF, "gamma": gamma, "alpha": alpha, "beta": beta,
             "w_max": w_max,
-            "table": a.table, "model": a.model, "tuned_on_season": TUNE_SEASON,
+            # Both tables are recorded: the weights were chosen against the
+            # held-out one, and --test applies them to the full one.
+            "table": a.table, "tune_table": a.tune_table,
+            "model": a.model, "tuned_on_season": TUNE_SEASON,
             "tune_log_loss_inside_60s": ll,
             "tune_baseline_model_only": log_loss(y, pm_shipped),
             "tune_baseline_model_only_unclamped": log_loss(y, pm),
@@ -194,6 +220,8 @@ def main() -> None:
         )
     cfg = json.loads(CONFIG.read_text())
     cfg_hash = hashlib.sha256(CONFIG.read_bytes()).hexdigest()[:16]
+    tdir = ROOT / a.table
+    table, means, _ = load_table(a.table)
 
     parts = [load_frame(s, table, means, booster) for s in TEST_SEASONS]
     d = {k: np.concatenate([p[k] for p in parts]) for k in parts[0]}

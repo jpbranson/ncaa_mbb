@@ -55,7 +55,7 @@ cat > "$LIVE" <<PLIST
   <key>WorkingDirectory</key><string>$ROOT</string>
   <key>EnvironmentVariables</key><dict>
     <key>CBBWP_ROOT</key><string>$ROOT</string>
-    <key>CBBWP_MODEL_VERSION</key><string>v2</string>
+    <key>CBBWP_MODEL_VERSION</key><string>v3</string>
     <key>CBBWP_API_PORT</key><string>8808</string>
   </dict>
   <key>RunAtLoad</key><true/>

@@ -6,7 +6,7 @@ computed from that export land about 0.0001 low on log loss and differ in the
 fourth decimal on accuracy and ECE -- enough to look like drift when it is only
 storage precision.
 
-Nothing here refits anything. The model in registry/v2 is pinned and hashed, so
+Nothing here refits anything. The model in registry/v3 is pinned and hashed, so
 re-running it over the same state rows reproduces the original predictions
 exactly, at full precision, in a few seconds and a few hundred MB.
 
@@ -32,7 +32,7 @@ def main() -> None:
     import lightgbm as lgb
     import pickle
 
-    gbm = lgb.Booster(model_file=str(ROOT / "registry" / "v2" / "model.txt"))
+    gbm = lgb.Booster(model_file=str(ROOT / "registry" / "v3" / "model.txt"))
     frames = [pl.scan_parquet(ROOT / "data" / "proc" / "states" / f"states_{s}.parquet")
               for s in TEST_SEASONS]
     te = (pl.concat(frames)

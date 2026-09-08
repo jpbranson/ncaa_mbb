@@ -24,8 +24,8 @@ REPLAY_DIR = ROOT / "tmp" / "replay"
 ARCHIVES = sorted(REPLAY_DIR.glob("summary_*.json")) if REPLAY_DIR.exists() else []
 
 pytestmark = pytest.mark.skipif(
-    not ARCHIVES or not (ROOT / "registry" / "v2").exists(),
-    reason="needs registry/v2 and an archive (scripts/archive_replay_games.py)")
+    not ARCHIVES or not (ROOT / "registry" / "v3").exists(),
+    reason="needs registry/v3 and an archive (scripts/archive_replay_games.py)")
 
 
 @pytest.fixture(scope="module")

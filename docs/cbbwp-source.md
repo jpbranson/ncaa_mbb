@@ -1,5 +1,5 @@
 # `cbbwp` source bundle
-Complete source. Regenerated 2026-09-08 11:46 from the `ncaa_mbb` working folder, at commit `28ec0ee`.
+Complete source. Regenerated 2026-09-08 13:50 from the `ncaa_mbb` working folder, at commit `0c2b0b9`.
 
 State rules v2, model v2. This bundle is a mirror for disaster recovery; the folder is the source of truth (it also holds the data, the fitted model and the git history). Regenerate with `python3 scripts/build_source_bundle.py` whenever the source changes.
 
@@ -41,8 +41,8 @@ Beats ESPN's deployed model in every time bucket.
 
 | Model | Log loss | Brier | Accuracy | ECE |
 |---|---|---|---|---|
-| **LightGBM v2 (shipped)** | **0.3103** | 0.1008 | 85.20% | 0.0026 |
-| Logistic baseline | 0.3109 | 0.1009 | 85.19% | 0.0043 |
+| **LightGBM v3 (shipped)** | **0.3103** | 0.1008 | 85.20% | 0.0026 |
+| Logistic baseline | 0.3108 | 0.1009 | 85.19% | 0.0042 |
 | ESPN (deployed, same rows) | 0.3295 | 0.1061 | 84.58% | 0.0069 |
 
 Checkpointed at `checkpoint-2026-09-02`. What is frozen, and what a future
@@ -71,13 +71,14 @@ python3 scripts/build_games.py         # results + as-of pregame ratings
 python3 scripts/build_team_stats.py    # as-of FT% and pace
 python3 scripts/build_dataset.py       # replay -> 8.6M state rows + features
 python3 scripts/fit_models.py          # logistic + LightGBM  (needs ~6 GB RAM)
-python3 scripts/publish_model.py v2    # pinned registry artifact
+python3 scripts/publish_model.py v3    # pinned registry artifact
 python3 scripts/evaluate.py            # metrics by time bucket vs ESPN
 pytest tests -q
 ```
 
 Seeds are pinned (`seed=20260831`, `deterministic=True`), so a refit reproduces
-`registry/v2` exactly — verified across two different machines, byte for byte.
+`registry/v3` exactly — verified across two different machines, and again on the
+2026-09-08 refit, byte for byte.
 
 **Memory note:** `fit_models.py` peaks around 4–6 GB — the symmetry mirroring
 doubles 5.4M rows and briefly holds them as float64. It will be OOM-killed in a
@@ -170,7 +171,7 @@ the ESPN feed has changed and the model needs a refit, not a patched adapter.**
 A config change and a restart, never an edit:
 
 ```bash
-CBBWP_MODEL_VERSION=v3 python3 scripts/serve_live.py
+CBBWP_MODEL_VERSION=v4 python3 scripts/serve_live.py
 ```
 
 Every setting is an environment variable with a working default
@@ -411,11 +412,14 @@ def chronological_inversions(events: Sequence[Event]) -> int:
     somebody is told about rather than something silently rearranged.
     """
     def elapsed(e: Event) -> int:
+        # An unreadable clock is None here; the carry-forward that resolves it
+        # lives in build_states, and this function is only counting order, so
+        # treat it as 0 rather than reimplementing the rule.
+        c = e.clock_seconds or 0
         if e.period <= 2:
-            return 2 * HALF_SECONDS - game_seconds_remaining(e.period,
-                                                             e.clock_seconds)
+            return 2 * HALF_SECONDS - game_seconds_remaining(e.period, c)
         return (2 * HALF_SECONDS + (e.period - 3) * OT_SECONDS
-                + (OT_SECONDS - e.clock_seconds))
+                + (OT_SECONDS - c))
     t = [elapsed(e) for e in events]
     return sum(1 for i in range(1, len(t)) if t[i] < t[i - 1])
 
@@ -478,7 +482,9 @@ def events_from_plays(plays: Sequence[dict], game_id: int) -> List[Event]:
                 game_id=game_id,
                 seq=n,
                 period=period,
-                clock_seconds=clock_to_seconds(clock),
+                # None, not 0, when the clock cannot be read: build_states
+                # carries the period's previous clock forward (rules v3).
+                clock_seconds=parse_clock(clock),
                 home_score=_int(p.get("homeScore"), 0) or 0,
                 away_score=_int(p.get("awayScore"), 0) or 0,
                 event_type=play_type_text(p),
@@ -654,7 +660,7 @@ from typing import Iterable, List, Optional
 import polars as pl
 
 from ..schemas import Event, HALF_SECONDS, OT_SECONDS
-from ..state import TEAM_TIMEOUT_TYPES, FOUL_TYPES, clock_to_seconds
+from ..state import TEAM_TIMEOUT_TYPES, FOUL_TYPES, parse_clock
 
 # Columns present in every season 2016-2026 of the hoopR mbb pbp files.
 BASE_COLS = [
@@ -685,7 +691,9 @@ def load_events(path: str, game_id: int) -> tuple[List[Event], int, int]:
             game_id=int(r["game_id"]),
             seq=int(r["game_play_number"]),
             period=int(r["period_number"] or 1),
-            clock_seconds=clock_to_seconds(r["clock_display_value"] or ""),
+            # None, not 0, when the clock cannot be read: build_states carries
+            # the period's previous clock forward (STATE_RULES_VERSION 3).
+            clock_seconds=parse_clock(r["clock_display_value"] or ""),
             home_score=int(r["home_score"] or 0),
             away_score=int(r["away_score"] or 0),
             event_type=r["type_text"] or "",
@@ -703,6 +711,13 @@ def load_events(path: str, game_id: int) -> tuple[List[Event], int, int]:
 # Vectorised bulk path
 # --------------------------------------------------------------------------
 def _clock_seconds_expr(col: str = "clock_display_value") -> pl.Expr:
+    """Vectorised twin of `state.parse_clock`: NULL when the clock is unreadable.
+
+    It used to `.fill_null(0)` here, which is the vectorised half of the bug
+    STATE_RULES_VERSION 3 fixes: an unreadable clock silently became 0:00, and
+    a 0:00 in the second half reads as a finished game. The null is now carried
+    forward in `states_lazy`, matching `state.build_states`.
+    """
     parts = pl.col(col).str.split_exact(":", 1)
     mm = parts.struct.field("field_0").cast(pl.Float64, strict=False)
     ss = parts.struct.field("field_1").cast(pl.Float64, strict=False)
@@ -710,7 +725,6 @@ def _clock_seconds_expr(col: str = "clock_display_value") -> pl.Expr:
         pl.when(pl.col(col).str.contains(":"))
         .then(mm * 60 + ss.floor())
         .otherwise(pl.col(col).cast(pl.Float64, strict=False).floor())
-        .fill_null(0)
         .cast(pl.Int32)
     )
 
@@ -743,24 +757,34 @@ def states_lazy(lf: pl.LazyFrame, timeouts_at_tip: int = 4) -> pl.LazyFrame:
     is_team_to = t.is_in(list(TEAM_TIMEOUT_TYPES))
     is_foul = t.is_in(list(FOUL_TYPES))
     period = pl.col("period_number").fill_null(1).clip(lower_bound=1).cast(pl.Int32)
-    plen = pl.when(period <= 2).then(pl.lit(HALF_SECONDS)).otherwise(pl.lit(OT_SECONDS))
-    clock = _clock_seconds_expr().clip(0, None)
-    clock = pl.min_horizontal(clock, plen).cast(pl.Int32)
-    gsr = pl.when(period <= 1).then(pl.lit(HALF_SECONDS) + clock).otherwise(clock)
+    # `_period` is materialised first because the clock's
+    # forward-fill has to be windowed on the period, and a window needs a
+    # column rather than an expression.
+    plen_col = pl.when(pl.col("_period") <= 2).then(pl.lit(HALF_SECONDS)).otherwise(pl.lit(OT_SECONDS))
+    # Same rule as state.build_states: carry an unreadable clock forward within
+    # its period, and start a period whose first clock is unreadable at full
+    # length. tests/test_parity.py holds the two implementations together, and
+    # test_state.py pins the rule itself on both paths.
+    clock_filled = (pl.col("_raw_clock").forward_fill().over(["game_id", "_period"])
+                    .fill_null(plen_col))
+    clock = pl.min_horizontal(clock_filled.clip(lower_bound=0), plen_col).cast(pl.Int32)
+    gsr = (pl.when(pl.col("_period") <= 1)
+           .then(pl.lit(HALF_SECONDS) + pl.col("_clock"))
+           .otherwise(pl.col("_clock")))
 
-    allot = pl.lit(timeouts_at_tip) + (period - 2).clip(lower_bound=0)
+    allot = pl.lit(timeouts_at_tip) + (pl.col("_period") - 2).clip(lower_bound=0)
 
     return (
         lf.sort(["game_id", "game_play_number"])
+        .with_columns(_period=period, _raw_clock=_clock_seconds_expr())
+        .with_columns(_clock=clock)
         .with_columns(
-            _period=period,
-            _clock=clock,
             _gsr=gsr.cast(pl.Int32),
             _poss_set=poss_set,
             _to_home=(is_team_to & (pl.col("team_id") == pl.col("home_team_id"))).cast(pl.Int32),
             _to_away=(is_team_to & (pl.col("team_id") == pl.col("away_team_id"))).cast(pl.Int32),
             _allot=allot,
-            _half=pl.when(period <= 1).then(pl.lit(1)).otherwise(pl.lit(2)),
+            _half=pl.when(pl.col("_period") <= 1).then(pl.lit(1)).otherwise(pl.lit(2)),
             _foul_home=(is_foul & (pl.col("team_id") == pl.col("home_team_id"))).cast(pl.Int32),
             _foul_away=(is_foul & (pl.col("team_id") == pl.col("away_team_id"))).cast(pl.Int32),
         )
@@ -779,8 +803,8 @@ def states_lazy(lf: pl.LazyFrame, timeouts_at_tip: int = 4) -> pl.LazyFrame:
         )
         .rename({"_period": "period", "_clock": "clock_seconds",
                  "_gsr": "game_seconds_remaining", "game_play_number": "seq"})
-        .drop(["_poss_set", "_to_home", "_to_away", "_allot", "home_used", "away_used",
-               "_half", "_foul_home", "_foul_away"])
+        .drop(["_raw_clock", "_poss_set", "_to_home", "_to_away", "_allot",
+               "home_used", "away_used", "_half", "_foul_home", "_foul_away"])
     )
 ```
 
@@ -1067,7 +1091,7 @@ so a careless swap fails loudly at startup instead of silently serving skew.
 
     CBBWP_ROOT              project root (default: the repo this file is in)
     CBBWP_REGISTRY          model registry dir      (default: <root>/registry)
-    CBBWP_MODEL_VERSION     which model to serve    (default: v2)
+    CBBWP_MODEL_VERSION     which model to serve    (default: v3)
     CBBWP_CONTEXT           ratings snapshot path   (default: <registry>/context_latest.json)
     CBBWP_LIVE_DIR          JSONL output dir        (default: <root>/data/live)
     CBBWP_FIXTURE_DIR       replay from disk instead of the network (default: unset)
@@ -1114,7 +1138,7 @@ class Settings:
         return cls(
             root=root,
             registry=registry,
-            model_version=_env("CBBWP_MODEL_VERSION", "v2"),
+            model_version=_env("CBBWP_MODEL_VERSION", "v3"),
             context_path=pathlib.Path(
                 _env("CBBWP_CONTEXT", str(registry / "context_latest.json"))),
             live_dir=pathlib.Path(_env("CBBWP_LIVE_DIR", str(root / "data" / "live"))),
@@ -2475,7 +2499,11 @@ class Event:
     game_id: int
     seq: int
     period: int                  # 1,2 = halves; 3+ = overtime
-    clock_seconds: int           # seconds left IN THE PERIOD at the play
+    # Seconds left IN THE PERIOD at the play. `None` means the feed gave no
+    # readable clock for this play; `state.build_states` resolves that by
+    # carrying the period's previous clock forward. An adapter must NOT
+    # substitute 0 for "unknown" - see STATE_RULES_VERSION 3 below.
+    clock_seconds: Optional[int]
     home_score: int
     away_score: int
     event_type: str              # e.g. "JumpShot", "Timeout", "DefensiveRebound"
@@ -2559,7 +2587,24 @@ DOUBLE_BONUS_FOULS = 10
 # Bump this whenever the meaning of any GameState field changes, and refit.
 #   1 - original rules, shipped 2026-08-31 (registry/v1)
 #   2 - made field goals detected by scoring+shooting flags, not type names
-STATE_RULES_VERSION = 2
+#   3 - an unreadable clock carries the period's previous clock forward instead
+#       of silently becoming 0:00 (2026-09-08)
+#
+# On 3: `clock_to_seconds` mapped both "this play has no clock" and "this clock
+# is a format we do not understand" to 0. In the FIRST half that is harmless
+# (game_seconds_remaining = 1200, mid-game). In the second half or an overtime
+# it means `game_seconds_remaining == 0`, and `endgame.apply` reads that as "the
+# game is over" and clamps the published probability to 0.999 - a confident,
+# wrong number on a game with ten minutes left, produced by one malformed field.
+#
+# Measured before making the change: across all ten seasons, 19,462,128
+# play-by-play rows, **zero** carry an unreadable clock. So this rule changes no
+# training row, and the refit under it reproduced registry/v2 byte for byte
+# (published as registry/v3). It is a guard against a feed that changes, not a
+# correction of anything in the data - which is exactly why it had to be a
+# version bump rather than a quiet edit: nothing about the numbers would have
+# revealed it either way.
+STATE_RULES_VERSION = 3
 ```
 
 ## `src/cbbwp/serve.py`
@@ -2813,6 +2858,13 @@ def build_states(
     home_id, away_id = ctx.home_team_id, ctx.away_team_id
 
     states: List[GameState] = []
+    # An unreadable clock carries the period's previous clock forward rather
+    # than becoming 0:00 (STATE_RULES_VERSION 3). A period whose first play has
+    # no readable clock starts at full length, because the period has just
+    # started -- carrying 0:00 across the half-time break would be worse than
+    # the bug this replaces.
+    prev_clock: Optional[int] = None
+    prev_period: Optional[int] = None
     poss = 0.5
     home_used = away_used = 0
     home_fouls = away_fouls = 0
@@ -2841,7 +2893,13 @@ def build_states(
         allot = timeouts_at_tip + max(0, period - 2)
 
         poss = _possession_after(ev, home_id, away_id, poss)
-        clock = max(0, min(int(ev.clock_seconds or 0), period_length(period)))
+        plen = period_length(period)
+        raw = ev.clock_seconds
+        if raw is None:
+            raw = prev_clock if (prev_period == period and
+                                 prev_clock is not None) else plen
+        clock = max(0, min(int(raw), plen))
+        prev_clock, prev_period = clock, period
 
         states.append(
             GameState(
@@ -3114,17 +3172,40 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--tune", action="store_true")
     ap.add_argument("--test", action="store_true")
-    ap.add_argument("--table", default="registry/endgame/e1")
-    ap.add_argument("--model", default="registry/v2")
+    ap.add_argument("--table", default="registry/endgame/e1",
+                    help="table used by --test (may include the tuning season)")
+    ap.add_argument("--tune-table", default="registry/endgame/e1_no2024",
+                    help="table used by --tune; must NOT have been fit on the "
+                         "tuning season")
+    ap.add_argument("--model", default="registry/v3")
     a = ap.parse_args()
 
     import lightgbm as lgb
     booster = lgb.Booster(model_file=str(ROOT / a.model / "model.txt"))
-    tdir = ROOT / a.table
-    table = np.load(tdir / "table.npz")["table"].astype(np.float64)
-    means = json.loads((tdir / "manifest.json").read_text())["ft_bucket_means"]
+
+    def load_table(rel: str):
+        d = ROOT / rel
+        m = json.loads((d / "manifest.json").read_text())
+        return (np.load(d / "table.npz")["table"].astype(np.float64),
+                m["ft_bucket_means"], m)
 
     if a.tune:
+        # Tune against a table that has NOT seen the tuning season.
+        #
+        # This used to tune on 2024 using `e1`, which is fit on 2016-2024 -- so
+        # the season choosing the blend weights was inside the table those
+        # weights were chosen for. It never threatened the headline number (the
+        # single-shot test is on 2025-2026, which no table has seen), but it
+        # made the four parameters slightly optimistic about their own tuning
+        # season, and there is a purpose-built held-out table sitting right next
+        # to it. Refuse rather than warn: a leak nobody is stopped by is a leak.
+        table, means, tmeta = load_table(a.tune_table)
+        if TUNE_SEASON in tmeta["seasons_used"]:
+            raise SystemExit(
+                f"refusing to tune on {TUNE_SEASON} with {a.tune_table}, which "
+                f"was fit on it (seasons_used={tmeta['seasons_used']}).\n"
+                "  Pass --tune-table registry/endgame/e1_no2024, or build a "
+                "table that holds the tuning season out.")
         d = load_frame(TUNE_SEASON, table, means, booster)
         inside = d["secs"] <= HANDOFF
         y, sec = d["y"][inside], d["secs"][inside]
@@ -3148,7 +3229,10 @@ def main() -> None:
         cfg = {
             "handoff_seconds": HANDOFF, "gamma": gamma, "alpha": alpha, "beta": beta,
             "w_max": w_max,
-            "table": a.table, "model": a.model, "tuned_on_season": TUNE_SEASON,
+            # Both tables are recorded: the weights were chosen against the
+            # held-out one, and --test applies them to the full one.
+            "table": a.table, "tune_table": a.tune_table,
+            "model": a.model, "tuned_on_season": TUNE_SEASON,
             "tune_log_loss_inside_60s": ll,
             "tune_baseline_model_only": log_loss(y, pm_shipped),
             "tune_baseline_model_only_unclamped": log_loss(y, pm),
@@ -3170,6 +3254,8 @@ def main() -> None:
         )
     cfg = json.loads(CONFIG.read_text())
     cfg_hash = hashlib.sha256(CONFIG.read_bytes()).hexdigest()[:16]
+    tdir = ROOT / a.table
+    table, means, _ = load_table(a.table)
 
     parts = [load_frame(s, table, means, booster) for s in TEST_SEASONS]
     d = {k: np.concatenate([p[k] for p in parts]) for k in parts[0]}
@@ -3760,7 +3846,7 @@ def _curves() -> list[dict]:
     aggregate metric will.
     """
     import lightgbm as lgb
-    booster = lgb.Booster(model_file=str(ROOT / "registry" / "v2" / "model.txt"))
+    booster = lgb.Booster(model_file=str(ROOT / "registry" / "v3" / "model.txt"))
 
     st = (pl.scan_parquet(ROOT / "data" / "proc" / "states" / f"states_{CURVE_SEASON}.parquet")
           .select(FEATURE_NAMES + [c for c in
@@ -4164,7 +4250,7 @@ def main():
                     help="restrict a backtest to the last N days of the season")
     ap.add_argument("--glob", default=str(ROOT / "data/live/*.jsonl"))
     ap.add_argument("--registry", default=str(ROOT / "registry"))
-    ap.add_argument("--version", default="v2")
+    ap.add_argument("--version", default="v3")
     ap.add_argument("--json", default=None, help="also write the report here")
     ap.add_argument("--z", type=float, default=monitor.Z_ALERT)
     ap.add_argument("--min-gap", type=float, default=monitor.MIN_GAP)
@@ -5586,7 +5672,7 @@ def main() -> int:
     ap.add_argument("--date", help="slate to follow, YYYYMMDD (default: today)")
     ap.add_argument("--game", type=int, help="follow a single game id")
     ap.add_argument("--once", action="store_true", help="one pass, then exit")
-    ap.add_argument("--version", default="v2", help="model registry version")
+    ap.add_argument("--version", default="v3", help="model registry version")
     ap.add_argument("--registry", default=str(ROOT / "registry"))
     ap.add_argument("--context", default=str(ROOT / "registry/context_latest.json"))
     ap.add_argument("--out", default=None, help="JSONL output path")
@@ -5738,7 +5824,7 @@ computed from that export land about 0.0001 low on log loss and differ in the
 fourth decimal on accuracy and ECE -- enough to look like drift when it is only
 storage precision.
 
-Nothing here refits anything. The model in registry/v2 is pinned and hashed, so
+Nothing here refits anything. The model in registry/v3 is pinned and hashed, so
 re-running it over the same state rows reproduces the original predictions
 exactly, at full precision, in a few seconds and a few hundred MB.
 
@@ -5764,7 +5850,7 @@ def main() -> None:
     import lightgbm as lgb
     import pickle
 
-    gbm = lgb.Booster(model_file=str(ROOT / "registry" / "v2" / "model.txt"))
+    gbm = lgb.Booster(model_file=str(ROOT / "registry" / "v3" / "model.txt"))
     frames = [pl.scan_parquet(ROOT / "data" / "proc" / "states" / f"states_{s}.parquet")
               for s in TEST_SEASONS]
     te = (pl.concat(frames)
@@ -6499,7 +6585,11 @@ class Scorer:
                 "seq": row["seq"],
                 "period": row["period"],
                 "secs": row["game_seconds_remaining"],
-                "clock": ev.clock_seconds,
+                # Derived from the STATE, not from the raw event: an unreadable
+                # clock is None on the event and is resolved by build_states
+                # (rules v3). This inverts game_seconds_remaining exactly.
+                "clock": (row["game_seconds_remaining"] - 1200
+                          if row["period"] <= 1 else row["game_seconds_remaining"]),
                 "margin": row["margin"],
                 "wp": round(row["home_win_prob"], 5),
                 "home": ev.home_score,
@@ -7533,7 +7623,11 @@ def test_missing_and_null_fields_do_not_raise():
     evs = espn.events_from_plays([{"type": {"id": "584"}}], game_id=1)
     assert len(evs) == 1
     e = evs[0]
-    assert (e.period, e.clock_seconds, e.home_score, e.team_id) == (1, 0, 0, None)
+    # clock_seconds is None, NOT 0. A play with no clock is an absence, and
+    # under STATE_RULES_VERSION 3 build_states resolves it by carrying the
+    # period's previous clock forward. Substituting 0 here is what let one
+    # missing field read as "the game is over" in the second half.
+    assert (e.period, e.clock_seconds, e.home_score, e.team_id) == (1, None, 0, None)
 
 
 def test_header_parsing():
@@ -7622,13 +7716,13 @@ def test_espn_adapter_matches_hoopr_states(game_ids):
 
 
 @pytestmark_data
-@pytest.mark.skipif(not (ROOT / "registry/v2").exists(),
+@pytest.mark.skipif(not (ROOT / "registry/v3").exists(),
                     reason="no model registry built yet")
 def test_espn_path_gives_identical_win_probabilities(game_ids):
     from espn_fixtures import summary_from_hoopr
     from cbbwp.serve import WinProbabilityService
 
-    svc = WinProbabilityService(ROOT / "registry", "v2")
+    svc = WinProbabilityService(ROOT / "registry", "v3")
     for gid in game_ids[:5]:
         ref_events, home_id, away_id = load_events(PBP, gid)
         ctx = PregameContext(gid, home_id, away_id, pregame_exp_margin=2.5,
@@ -7670,18 +7764,27 @@ def test_serving_refuses_a_model_fit_under_older_state_rules():
     2026-09-01 before it was caught.
     """
     from cbbwp.serve import WinProbabilityService
-    if not (ROOT / "registry/v1").exists():
-        pytest.skip("no v1 artifact kept")
-    with pytest.raises(RuntimeError, match="state rules"):
-        WinProbabilityService(ROOT / "registry", "v1")
+    # Every superseded version must be refused, not just the oldest. v2 is the
+    # interesting one: it is only ONE rule version behind, its feature names are
+    # identical, and its model file is byte-for-byte the same booster as v3 --
+    # so nothing except this guard distinguishes it.
+    for old in ("v1", "v2"):
+        if not (ROOT / "registry" / old).exists():
+            continue
+        with pytest.raises(RuntimeError, match="state rules"):
+            WinProbabilityService(ROOT / "registry", old)
 
 
 def test_the_current_model_loads():
     from cbbwp.serve import WinProbabilityService
-    if not (ROOT / "registry/v2").exists():
-        pytest.skip("no v2 artifact built yet")
-    svc = WinProbabilityService(ROOT / "registry", "v2")
-    assert svc.manifest["state_rules_version"] == 2
+    if not (ROOT / "registry/v3").exists():
+        pytest.skip("no v3 artifact built yet")
+    svc = WinProbabilityService(ROOT / "registry", "v3")
+    # Against the constant, not a literal: this assertion was written as `== 2`
+    # and had to be hand-edited at the v3 bump, which is exactly the kind of
+    # drift the constant exists to prevent.
+    from cbbwp.schemas import STATE_RULES_VERSION
+    assert svc.manifest["state_rules_version"] == STATE_RULES_VERSION
 
 
 def test_default_user_agent_carries_a_contact_url():
@@ -7832,7 +7935,7 @@ def test_settings_have_working_defaults_with_no_environment(monkeypatch):
     for k in [k for k in list(__import__("os").environ) if k.startswith("CBBWP_")]:
         monkeypatch.delenv(k, raising=False)
     s = Settings.from_env()
-    assert s.model_version == "v2"
+    assert s.model_version == "v3"
     assert s.api_port == 8808
     assert s.fixture_dir is None
     assert s.registry.name == "registry"
@@ -8582,13 +8685,13 @@ PBP = str(ROOT / "data/raw/pbp/pbp_2025.parquet")
 REGISTRY = ROOT / "registry"
 
 pytestmark = pytest.mark.skipif(
-    not (REGISTRY / "v2").exists() or not pathlib.Path(PBP).exists(),
+    not (REGISTRY / "v3").exists() or not pathlib.Path(PBP).exists(),
     reason="no model registry or pbp data built yet")
 
 
 @pytest.fixture(scope="module")
 def svc():
-    return WinProbabilityService(REGISTRY, "v2")
+    return WinProbabilityService(REGISTRY, "v3")
 
 
 @pytest.fixture(scope="module")
@@ -8795,6 +8898,8 @@ def test_scores_track_the_revealed_plays(games):
 import sys, pathlib
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "src"))
 
+import polars as pl
+
 from cbbwp.schemas import Event, PregameContext
 from cbbwp.state import build_states, clock_to_seconds, game_seconds_remaining
 
@@ -8815,6 +8920,49 @@ def test_clock_parsing():
     assert clock_to_seconds("0:23.4") == 23
     assert clock_to_seconds("") == 0
     assert clock_to_seconds(None or "") == 0
+
+
+def test_an_unreadable_clock_is_none_not_zero():
+    """The distinction STATE_RULES_VERSION 3 rests on.
+
+    `clock_to_seconds` folded "no clock" and "a clock we cannot read" into 0,
+    and a 0 in the second half means "the game is over" to endgame.apply.
+    """
+    from cbbwp.state import parse_clock
+    assert parse_clock("19:48") == 1188
+    assert parse_clock("0:23.4") == 23
+    assert parse_clock("42.7") == 42
+    assert parse_clock("") is None
+    assert parse_clock("  ") is None
+    assert parse_clock("nonsense") is None
+    # A real 0:00 is a number, not an absence.
+    assert parse_clock("0:00") == 0
+
+
+def test_an_unreadable_clock_carries_the_period_forward():
+    """Rules v3. The dangerous case is the second half, where a fabricated
+    0:00 would let the endgame clamp publish near-certainty mid-game."""
+    ctx = PregameContext(1, HOME, AWAY)
+    s = build_states([
+        ev(1, 2, 900, 40, 38, "Jumpball"),
+        Event(1, 2, 2, None, 40, 38, "Substitution", HOME, 0, False, False),
+        ev(3, 2, 880, 42, 38, "JumpShot", HOME, True, 2, shooting=True),
+    ], ctx)
+    assert [x.clock_seconds for x in s] == [900, 900, 880]
+    # ...and so the clamp never sees a finished game.
+    assert [x.game_seconds_remaining for x in s] == [900, 900, 880]
+
+
+def test_a_period_that_opens_unreadable_starts_at_full_length():
+    """Carrying 0:00 across the half-time break would be worse than the bug."""
+    ctx = PregameContext(1, HOME, AWAY)
+    s = build_states([
+        ev(1, 1, 3, 40, 38, "JumpShot", HOME, True, 2, shooting=True),
+        Event(1, 2, 2, None, 40, 38, "Jumpball", None, 0, False, False),
+    ], ctx)
+    assert s[0].clock_seconds == 3
+    assert s[1].clock_seconds == 1200          # a new half, not 0:03
+    assert s[1].game_seconds_remaining == 1200
 
 
 def test_game_clock_is_regulation_wide_and_ot_resets():
@@ -8866,6 +9014,50 @@ def test_official_timeouts_do_not_consume_team_timeouts():
     ctx = PregameContext(1, HOME, AWAY)
     s = build_states([ev(1, 1, 1200, 0, 0, "OfficialTVTimeOut", HOME)], ctx)
     assert s[0].home_timeouts == 4
+
+
+def test_the_vectorised_path_carries_an_unreadable_clock_the_same_way():
+    """Both implementations of rules v3, on the case real data does not contain.
+
+    `test_parity.py` compares the two paths on real games -- where, measured
+    across all ten seasons, zero rows carry an unreadable clock. So it cannot
+    see this rule at all, and without this test the vectorised half of v3 would
+    be shipped untested.
+    """
+    from cbbwp.adapters.hoopr import states_lazy
+
+    rows = [
+        # (play, period, clock string) -- "" and junk are the unreadable cases
+        (1, 2, "15:00"), (2, 2, ""), (3, 2, "nonsense"), (4, 2, "14:30"),
+        (5, 3, ""),                      # an overtime that opens unreadable
+        (6, 3, "4:00"),
+    ]
+    lf = pl.DataFrame({
+        "game_id": [1] * len(rows),
+        "game_play_number": [r[0] for r in rows],
+        "period_number": [r[1] for r in rows],
+        "clock_display_value": [r[2] for r in rows],
+        "home_score": [0] * len(rows), "away_score": [0] * len(rows),
+        "type_text": ["Substitution"] * len(rows),
+        "team_id": [HOME] * len(rows),
+        "score_value": [0] * len(rows),
+        "scoring_play": [False] * len(rows),
+        "shooting_play": [False] * len(rows),
+        "home_team_id": [HOME] * len(rows), "away_team_id": [AWAY] * len(rows),
+    }).lazy()
+    vec = states_lazy(lf).collect().sort("seq")
+
+    ref = build_states(
+        [Event(1, p, per, None if not c or c == "nonsense"
+               else (int(c.split(":")[0]) * 60 + int(c.split(":")[1])),
+               0, 0, "Substitution", HOME, 0, False, False)
+         for p, per, c in rows],
+        PregameContext(1, HOME, AWAY))
+
+    assert [s.clock_seconds for s in ref] == [900, 900, 900, 870, 300, 240]
+    assert list(vec["clock_seconds"]) == [s.clock_seconds for s in ref]
+    assert list(vec["game_seconds_remaining"]) == [
+        s.game_seconds_remaining for s in ref]
 ```
 
 ## `tests/test_viz.py`
@@ -8897,8 +9089,8 @@ REPLAY_DIR = ROOT / "tmp" / "replay"
 ARCHIVES = sorted(REPLAY_DIR.glob("summary_*.json")) if REPLAY_DIR.exists() else []
 
 pytestmark = pytest.mark.skipif(
-    not ARCHIVES or not (ROOT / "registry" / "v2").exists(),
-    reason="needs registry/v2 and an archive (scripts/archive_replay_games.py)")
+    not ARCHIVES or not (ROOT / "registry" / "v3").exists(),
+    reason="needs registry/v3 and an archive (scripts/archive_replay_games.py)")
 
 
 @pytest.fixture(scope="module")
@@ -9721,7 +9913,7 @@ jobs:
           import pathlib, sys
           sys.path.insert(0, "src")
           from cbbwp.serve import WinProbabilityService
-          svc = WinProbabilityService(pathlib.Path("registry"), "v2")
+          svc = WinProbabilityService(pathlib.Path("registry"), "v3")
           print("loaded", svc.version, svc.manifest["sha256"])
           PY
 

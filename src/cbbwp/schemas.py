@@ -21,7 +21,11 @@ class Event:
     game_id: int
     seq: int
     period: int                  # 1,2 = halves; 3+ = overtime
-    clock_seconds: int           # seconds left IN THE PERIOD at the play
+    # Seconds left IN THE PERIOD at the play. `None` means the feed gave no
+    # readable clock for this play; `state.build_states` resolves that by
+    # carrying the period's previous clock forward. An adapter must NOT
+    # substitute 0 for "unknown" - see STATE_RULES_VERSION 3 below.
+    clock_seconds: Optional[int]
     home_score: int
     away_score: int
     event_type: str              # e.g. "JumpShot", "Timeout", "DefensiveRebound"
@@ -105,4 +109,21 @@ DOUBLE_BONUS_FOULS = 10
 # Bump this whenever the meaning of any GameState field changes, and refit.
 #   1 - original rules, shipped 2026-08-31 (registry/v1)
 #   2 - made field goals detected by scoring+shooting flags, not type names
-STATE_RULES_VERSION = 2
+#   3 - an unreadable clock carries the period's previous clock forward instead
+#       of silently becoming 0:00 (2026-09-08)
+#
+# On 3: `clock_to_seconds` mapped both "this play has no clock" and "this clock
+# is a format we do not understand" to 0. In the FIRST half that is harmless
+# (game_seconds_remaining = 1200, mid-game). In the second half or an overtime
+# it means `game_seconds_remaining == 0`, and `endgame.apply` reads that as "the
+# game is over" and clamps the published probability to 0.999 - a confident,
+# wrong number on a game with ten minutes left, produced by one malformed field.
+#
+# Measured before making the change: across all ten seasons, 19,462,128
+# play-by-play rows, **zero** carry an unreadable clock. So this rule changes no
+# training row, and the refit under it reproduced registry/v2 byte for byte
+# (published as registry/v3). It is a guard against a feed that changes, not a
+# correction of anything in the data - which is exactly why it had to be a
+# version bump rather than a quiet edit: nothing about the numbers would have
+# revealed it either way.
+STATE_RULES_VERSION = 3

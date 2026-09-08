@@ -31,7 +31,7 @@ def test_settings_have_working_defaults_with_no_environment(monkeypatch):
     for k in [k for k in list(__import__("os").environ) if k.startswith("CBBWP_")]:
         monkeypatch.delenv(k, raising=False)
     s = Settings.from_env()
-    assert s.model_version == "v2"
+    assert s.model_version == "v3"
     assert s.api_port == 8808
     assert s.fixture_dir is None
     assert s.registry.name == "registry"

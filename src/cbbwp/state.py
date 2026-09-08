@@ -145,6 +145,13 @@ def build_states(
     home_id, away_id = ctx.home_team_id, ctx.away_team_id
 
     states: List[GameState] = []
+    # An unreadable clock carries the period's previous clock forward rather
+    # than becoming 0:00 (STATE_RULES_VERSION 3). A period whose first play has
+    # no readable clock starts at full length, because the period has just
+    # started -- carrying 0:00 across the half-time break would be worse than
+    # the bug this replaces.
+    prev_clock: Optional[int] = None
+    prev_period: Optional[int] = None
     poss = 0.5
     home_used = away_used = 0
     home_fouls = away_fouls = 0
@@ -173,7 +180,13 @@ def build_states(
         allot = timeouts_at_tip + max(0, period - 2)
 
         poss = _possession_after(ev, home_id, away_id, poss)
-        clock = max(0, min(int(ev.clock_seconds or 0), period_length(period)))
+        plen = period_length(period)
+        raw = ev.clock_seconds
+        if raw is None:
+            raw = prev_clock if (prev_period == period and
+                                 prev_clock is not None) else plen
+        clock = max(0, min(int(raw), plen))
+        prev_clock, prev_period = clock, period
 
         states.append(
             GameState(

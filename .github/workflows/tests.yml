@@ -48,7 +48,7 @@ jobs:
           import pathlib, sys
           sys.path.insert(0, "src")
           from cbbwp.serve import WinProbabilityService
-          svc = WinProbabilityService(pathlib.Path("registry"), "v2")
+          svc = WinProbabilityService(pathlib.Path("registry"), "v3")
           print("loaded", svc.version, svc.manifest["sha256"])
           PY
 

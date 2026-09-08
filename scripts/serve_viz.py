@@ -129,7 +129,11 @@ class Scorer:
                 "seq": row["seq"],
                 "period": row["period"],
                 "secs": row["game_seconds_remaining"],
-                "clock": ev.clock_seconds,
+                # Derived from the STATE, not from the raw event: an unreadable
+                # clock is None on the event and is resolved by build_states
+                # (rules v3). This inverts game_seconds_remaining exactly.
+                "clock": (row["game_seconds_remaining"] - 1200
+                          if row["period"] <= 1 else row["game_seconds_remaining"]),
                 "margin": row["margin"],
                 "wp": round(row["home_win_prob"], 5),
                 "home": ev.home_score,

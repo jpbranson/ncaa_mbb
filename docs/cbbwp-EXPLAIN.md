@@ -705,7 +705,7 @@ Test set: 2025 and 2026, 12,398 games, 2,233,937 snapshots, none of which the mo
 | Model | Log loss | Brier | Accuracy | Calibration error |
 |---|---|---|---|---|
 | **LightGBM v2 (shipped)** | **0.3103** | **0.1008** | 85.20% | **0.0026** |
-| Logistic baseline | 0.3109 | 0.1009 | 85.19% | 0.0043 |
+| Logistic baseline | 0.3108 | 0.1009 | 85.19% | 0.0042 |
 | ESPN (deployed) | 0.3295 | 0.1061 | 84.58% | 0.0069 |
 
 Broken out by time remaining — never report the average alone, because it hides the failure
@@ -1009,6 +1009,43 @@ work around the corrupted feature.**
 It was still right to fix, for reasons that are not about log loss. The endgame simulator
 depends on possession being correct in a way the model does not, and a feature that means two
 different things inside one training set is a defect whatever the metric says.
+
+### 8.2b State rules v3: an unreadable clock is not 0:00
+
+The same shape of defect, found by audit on 2026-09-08 (`AUDIT-2026-09-08.md` M5), and fixed
+before it ever cost anything.
+
+`clock_to_seconds` mapped two different facts to the same number. "This play carries no clock"
+— normal; ESPN sends administrative rows that way — and "this clock is in a format this code
+does not understand" both became **0**. In the first half that is harmless: `0` means
+`game_seconds_remaining = 1200`, an unremarkable mid-game state. In the second half or an
+overtime it means `game_seconds_remaining = 0`, and `endgame.apply` reads that as *the game is
+over* and clamps the published probability to 0.999. One malformed field, and the scoreboard
+asserts near-certainty with ten minutes left.
+
+**The fix** (state rules v3): `parse_clock` returns `None` when it cannot read a clock, and
+`build_states` carries the period's previous clock forward — the same "carry" philosophy the
+possession rules already use. A period whose first clock is unreadable starts at full length,
+because carrying 0:00 across the half-time break would be worse than the bug.
+
+**What it was worth: provably nothing, on this data, and that is the point.** Measured before
+making the change: across all ten seasons, **0 of 19,462,128** play-by-play rows carry an
+unreadable clock. So the rule changes no training row. The dataset rebuilt under v3 is
+identical row for row, and the refit under it reproduced the booster **byte for byte** —
+`registry/v3` carries the same `sha256 2d4bf58134fa2e64` as `v2`.
+
+Which raises the fair question: why bump the version at all, and pay for a refit, to change
+nothing? Because the alternative is worse in the exact way this project keeps getting bitten.
+The rule now differs between a model artifact and the code that feeds it, and *nothing about
+the numbers would reveal that* — the same silence that nearly shipped skew at v2. A rule
+change with zero measured effect today is still a rule change the moment ESPN sends one
+malformed clock. Bumping is cheap and the guard is what makes it safe; not bumping saves
+nothing and removes the only signal.
+
+The detection is kept and surfaced rather than thrown away: `espn.clock_parse_failures` counts
+unreadable clocks per payload, the poller warns and stamps `feed_bad_clocks` into the JSONL,
+and `check_espn_fixtures.py` reports them beside unknown play type ids. If the count ever
+stops being zero, that is the feed changing, and somebody finds out.
 
 ### 8.3 Timeouts are approximate
 The men's rule is fiddly: a team that doesn't use its 60-second timeout in the first half

@@ -80,7 +80,11 @@ def test_missing_and_null_fields_do_not_raise():
     evs = espn.events_from_plays([{"type": {"id": "584"}}], game_id=1)
     assert len(evs) == 1
     e = evs[0]
-    assert (e.period, e.clock_seconds, e.home_score, e.team_id) == (1, 0, 0, None)
+    # clock_seconds is None, NOT 0. A play with no clock is an absence, and
+    # under STATE_RULES_VERSION 3 build_states resolves it by carrying the
+    # period's previous clock forward. Substituting 0 here is what let one
+    # missing field read as "the game is over" in the second half.
+    assert (e.period, e.clock_seconds, e.home_score, e.team_id) == (1, None, 0, None)
 
 
 def test_header_parsing():
@@ -169,13 +173,13 @@ def test_espn_adapter_matches_hoopr_states(game_ids):
 
 
 @pytestmark_data
-@pytest.mark.skipif(not (ROOT / "registry/v2").exists(),
+@pytest.mark.skipif(not (ROOT / "registry/v3").exists(),
                     reason="no model registry built yet")
 def test_espn_path_gives_identical_win_probabilities(game_ids):
     from espn_fixtures import summary_from_hoopr
     from cbbwp.serve import WinProbabilityService
 
-    svc = WinProbabilityService(ROOT / "registry", "v2")
+    svc = WinProbabilityService(ROOT / "registry", "v3")
     for gid in game_ids[:5]:
         ref_events, home_id, away_id = load_events(PBP, gid)
         ctx = PregameContext(gid, home_id, away_id, pregame_exp_margin=2.5,
@@ -217,18 +221,27 @@ def test_serving_refuses_a_model_fit_under_older_state_rules():
     2026-09-01 before it was caught.
     """
     from cbbwp.serve import WinProbabilityService
-    if not (ROOT / "registry/v1").exists():
-        pytest.skip("no v1 artifact kept")
-    with pytest.raises(RuntimeError, match="state rules"):
-        WinProbabilityService(ROOT / "registry", "v1")
+    # Every superseded version must be refused, not just the oldest. v2 is the
+    # interesting one: it is only ONE rule version behind, its feature names are
+    # identical, and its model file is byte-for-byte the same booster as v3 --
+    # so nothing except this guard distinguishes it.
+    for old in ("v1", "v2"):
+        if not (ROOT / "registry" / old).exists():
+            continue
+        with pytest.raises(RuntimeError, match="state rules"):
+            WinProbabilityService(ROOT / "registry", old)
 
 
 def test_the_current_model_loads():
     from cbbwp.serve import WinProbabilityService
-    if not (ROOT / "registry/v2").exists():
-        pytest.skip("no v2 artifact built yet")
-    svc = WinProbabilityService(ROOT / "registry", "v2")
-    assert svc.manifest["state_rules_version"] == 2
+    if not (ROOT / "registry/v3").exists():
+        pytest.skip("no v3 artifact built yet")
+    svc = WinProbabilityService(ROOT / "registry", "v3")
+    # Against the constant, not a literal: this assertion was written as `== 2`
+    # and had to be hand-edited at the v3 bump, which is exactly the kind of
+    # drift the constant exists to prevent.
+    from cbbwp.schemas import STATE_RULES_VERSION
+    assert svc.manifest["state_rules_version"] == STATE_RULES_VERSION
 
 
 def test_default_user_agent_carries_a_contact_url():

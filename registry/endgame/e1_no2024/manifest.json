@@ -1,7 +1,7 @@
 {
   "version": "e1_no2024",
-  "state_rules_version": 2,
-  "built": "2026-09-08T16:37:10Z",
+  "state_rules_version": 3,
+  "built": "2026-09-08T18:45:26Z",
   "sha256_16": "6804b2e63ff8e790",
   "seasons_used": [
     2016,
@@ -34,7 +34,7 @@
   ],
   "foul_max": 10,
   "ft_bucket_means": [
-    0.6676215163559747,
+    0.6676215163559748,
     0.7093128333392268,
     0.7491113428077254
   ],
@@ -45,7 +45,7 @@
     "own_ft_bucket_violations": 0,
     "opp_ft_bucket_max_increment": 0.0,
     "opp_ft_bucket_violations": 0,
-    "own_fouls_max_increment": 0.021387046151474312,
+    "own_fouls_max_increment": 0.021387046151474257,
     "opp_fouls_min_increment": -0.07594546151163717,
     "possession_min_advantage": 0.0,
     "possession_violations": 0
@@ -57,7 +57,7 @@
     "own_ft_bucket_violations": 0,
     "opp_ft_bucket_max_increment": 0.0,
     "opp_ft_bucket_violations": 0,
-    "own_fouls_max_increment": 0.021387046151474312,
+    "own_fouls_max_increment": 0.021387046151474257,
     "opp_fouls_min_increment": -0.07594546151163717,
     "possession_min_advantage": 0.0,
     "possession_violations": 0

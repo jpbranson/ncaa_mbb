@@ -6,8 +6,8 @@ Beats ESPN's deployed model in every time bucket.
 
 | Model | Log loss | Brier | Accuracy | ECE |
 |---|---|---|---|---|
-| **LightGBM v2 (shipped)** | **0.3103** | 0.1008 | 85.20% | 0.0026 |
-| Logistic baseline | 0.3109 | 0.1009 | 85.19% | 0.0043 |
+| **LightGBM v3 (shipped)** | **0.3103** | 0.1008 | 85.20% | 0.0026 |
+| Logistic baseline | 0.3108 | 0.1009 | 85.19% | 0.0042 |
 | ESPN (deployed, same rows) | 0.3295 | 0.1061 | 84.58% | 0.0069 |
 
 Checkpointed at `checkpoint-2026-09-02`. What is frozen, and what a future
@@ -36,13 +36,14 @@ python3 scripts/build_games.py         # results + as-of pregame ratings
 python3 scripts/build_team_stats.py    # as-of FT% and pace
 python3 scripts/build_dataset.py       # replay -> 8.6M state rows + features
 python3 scripts/fit_models.py          # logistic + LightGBM  (needs ~6 GB RAM)
-python3 scripts/publish_model.py v2    # pinned registry artifact
+python3 scripts/publish_model.py v3    # pinned registry artifact
 python3 scripts/evaluate.py            # metrics by time bucket vs ESPN
 pytest tests -q
 ```
 
 Seeds are pinned (`seed=20260831`, `deterministic=True`), so a refit reproduces
-`registry/v2` exactly — verified across two different machines, byte for byte.
+`registry/v3` exactly — verified across two different machines, and again on the
+2026-09-08 refit, byte for byte.
 
 **Memory note:** `fit_models.py` peaks around 4–6 GB — the symmetry mirroring
 doubles 5.4M rows and briefly holds them as float64. It will be OOM-killed in a
@@ -135,7 +136,7 @@ the ESPN feed has changed and the model needs a refit, not a patched adapter.**
 A config change and a restart, never an edit:
 
 ```bash
-CBBWP_MODEL_VERSION=v3 python3 scripts/serve_live.py
+CBBWP_MODEL_VERSION=v4 python3 scripts/serve_live.py
 ```
 
 Every setting is an environment variable with a working default
