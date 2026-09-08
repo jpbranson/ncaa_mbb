@@ -234,18 +234,43 @@ Two things would plausibly change the answer, neither of them a tweak:
 
 ## Reproducing
 
+Two tables are built, not one. `e1` uses every training season; `e1_no2024`
+holds 2024 out, and it is what **both** the Phase 4 validation and the Phase 5
+tuning run against — neither may see the season it is judged on. The sequence
+below is the whole thing, in order:
+
 ```bash
-for s in 2016 2017 2018 2019 2021 2022 2023 2024; do
+NO24="2016 2017 2018 2019 2021 2022 2023"
+
+for s in $NO24 2024; do
   python3 scripts/estimate_endgame_params.py --season $s
   python3 scripts/estimate_endgame_possessions.py --season $s
 done
+
+# combined parameters: all training seasons, and a 2024-free variant
 python3 scripts/estimate_endgame_params.py --combine
 python3 scripts/estimate_endgame_possessions.py --combine
-python3 scripts/build_endgame_table.py                 # -> registry/endgame/e1
-python3 scripts/validate_endgame_table.py              # Phase 4, on 2024
-python3 scripts/blend_endgame.py --tune                # 2024
-python3 scripts/blend_endgame.py --test                # 2025-2026, once
+python3 scripts/estimate_endgame_params.py --combine --only $NO24 \
+    --out artifacts/endgame_params_no2024.json
+python3 scripts/estimate_endgame_possessions.py --combine --only $NO24 \
+    --out artifacts/endgame_possessions_no2024.json
+
+python3 scripts/build_endgame_table.py                  # -> registry/endgame/e1
+python3 scripts/build_endgame_table.py --version e1_no2024 \
+    --params artifacts/endgame_params_no2024.json \
+    --poss   artifacts/endgame_possessions_no2024.json \
+    --seasons $NO24                                     # -> e1_no2024
+
+python3 scripts/validate_endgame_table.py               # Phase 4, 2024, on e1_no2024
+python3 scripts/blend_endgame.py --tune                 # 2024, on e1_no2024
+python3 scripts/blend_endgame.py --test                 # 2025-2026, on e1, once
 ```
 
-Both estimators refuse to read 2025 or 2026, and `validate_endgame_table.py`
-refuses to validate on a season the table was fitted on.
+Three refusals keep that honest, and none of them is a warning:
+
+- both estimators refuse to read 2025 or 2026 at all;
+- `validate_endgame_table.py` refuses to validate on a season its table was
+  fitted on;
+- `blend_endgame.py --tune` refuses a `--tune-table` containing the tuning
+  season (added 2026-09-08 — it previously tuned on 2024 against `e1`, which is
+  fit on 2024).

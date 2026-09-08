@@ -1,7 +1,7 @@
 # EXPLAIN.md — how the win probability model works, and why every choice was made
 
 *Written for someone who has to stand up and explain this, and answer questions about it.*
-Last updated: 2026-09-03 · Model version `v2` (`registry/v2`, sha `2d4bf58134fa2e64`)
+Last updated: 2026-09-08 · Model version `v3` (`registry/v3`, sha `2d4bf58134fa2e64`)
 
 ---
 
@@ -215,7 +215,7 @@ which was measured and not shipped.
      logistic baseline + LightGBM, split by season
                     │
             publish_model.py
-        pinned artifact in registry/v2
+        pinned artifact in registry/v3
                     │
                 serve.py
        SAME state + feature builders, live
@@ -419,7 +419,7 @@ probabilities, and honest probabilities are the entire product.
 
 All random seeds are pinned (`seed=20260831`, `deterministic=True`), so refitting reproduces
 the shipped artifact exactly rather than approximately. The fitted model is 2.6 MB of text and
-is not in the project docs, so the seed pinning is what makes `registry/v2` reproducible. A
+is not in the project docs, so the seed pinning is what makes `registry/v3` reproducible. A
 rebuild on a second machine matched it byte for byte.
 
 ### 3.7 Calibration — and why there isn't any
@@ -447,7 +447,7 @@ Both clip at 0.999 rather than 1.000. §7.8 explains why that last detail matter
 
 `src/cbbwp/serve.py` is deliberately thin. It:
 
-- loads a **pinned** model artifact from `registry/v2` — an immutable directory with a
+- loads a **pinned** model artifact from `registry/v3` — an immutable directory with a
   manifest recording the version, the exact feature list, a content hash, and the seasons it
   was trained on;
 - **refuses to start** if the feature list in the manifest doesn't match the feature list the
@@ -468,7 +468,7 @@ Both clip at 0.999 rather than 1.000. §7.8 explains why that last detail matter
   identical states — and identical win probabilities — to the *offline* hoopR adapter for the
   same game, in the feed's own array order. See §3.10.
 
-Current status: 110 tests, all passing, none skipped, about 6 seconds.
+Current status: 125 tests, all passing, none skipped, about 7 seconds.
 
 ### 3.10 The live path (added 2026-09-01)
 
@@ -704,7 +704,7 @@ Test set: 2025 and 2026, 12,398 games, 2,233,937 snapshots, none of which the mo
 
 | Model | Log loss | Brier | Accuracy | Calibration error |
 |---|---|---|---|---|
-| **LightGBM v2 (shipped)** | **0.3103** | **0.1008** | 85.20% | **0.0026** |
+| **LightGBM v3 (shipped)** | **0.3103** | **0.1008** | 85.20% | **0.0026** |
 | Logistic baseline | 0.3108 | 0.1009 | 85.19% | 0.0042 |
 | ESPN (deployed) | 0.3295 | 0.1061 | 84.58% | 0.0069 |
 
@@ -765,7 +765,7 @@ stop the trees fitting noise in directions we know are wrong. **There is no
 trust-versus-accuracy tradeoff here.** This is worth mentioning; most people assume there is.
 
 ### 7.6 Ship LightGBM even though logistic regression nearly matches it
-**The numbers:** 0.3103 vs 0.3109 overall. In the final minute, 0.1246 vs 0.1267 — a 1.7%
+**The numbers:** 0.3103 vs 0.3108 overall. In the final minute, 0.1246 vs 0.1265 — a 1.5%
 improvement in the place people scrutinise most.
 **Why LightGBM anyway:** it wins where it counts, it is better calibrated (0.0026 vs 0.0043),
 and it is the foundation for the extra features still to come.
@@ -1288,9 +1288,9 @@ advance, and declined (§7.14).
 | `deploy/` | macOS LaunchAgents, Dockerfile, compose. Same entry point either way. |
 | `src/cbbwp/endgame_sim.py` | The endgame solver and lookup table. A documented diagnostic; **not** wired into `serve.py` — see §7.14. |
 | `registry/endgame/e1/` | The solved table, its manifest and a readable CSV of canonical states. |
-| `tests/` | 110 tests: state rules, feature contract, bulk parity, ESPN-adapter parity and play order, endgame rules, replay harness, the dry-run replay server, the viz app's play/probability join and stepping order, monitor statistics, endgame-table structure and the ESPN free-throw labelling convention. |
-| `registry/v2/` | The pinned model artifact and manifest, stamped with the state-rules version. |
-| `registry/v1/` | The pre-fix model, kept for provenance. Refused at load by current code. |
+| `tests/` | 125 tests: state rules (including the v3 clock carry-forward, on both implementations), feature contract, bulk parity, ESPN-adapter parity and play order, ratings-prior parity between the training chain and the live snapshot, the ratings snapshot reloading on disk change, endgame rules, replay harness, the dry-run replay server, the viz app's play/probability join and stepping order, monitor statistics, endgame-table structure and the ESPN free-throw labelling convention. |
+| `registry/v3/` | The pinned model artifact and manifest, stamped with the state-rules version. |
+| `registry/v1/`, `registry/v2/` | Superseded models, kept for provenance. Both refused at load by current code — v2 despite its model file being byte-identical to v3’s, because its state-rules stamp differs. |
 | `registry/context_latest.json` | Today's team ratings and season-to-date stats, for live games. |
 
 ---

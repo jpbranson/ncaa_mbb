@@ -32,6 +32,7 @@ pip install polars pyarrow lightgbm scikit-learn pytest numpy certifi
 
 ```bash
 python3 scripts/fetch_data.py          # ~527 MB of hoopR parquet, ~1 min
+python3 scripts/fetch_data.py --verify # inputs match data_checksums.json
 python3 scripts/build_games.py         # results + as-of pregame ratings
 python3 scripts/build_team_stats.py    # as-of FT% and pace
 python3 scripts/build_dataset.py       # replay -> 8.6M state rows + features
@@ -44,6 +45,14 @@ pytest tests -q
 Seeds are pinned (`seed=20260831`, `deterministic=True`), so a refit reproduces
 `registry/v3` exactly — verified across two different machines, and again on the
 2026-09-08 refit, byte for byte.
+
+That claim is only as good as the inputs, and hoopR is a live repository that
+can be rebuilt upstream. `data_checksums.json` records the sha256 of every
+parquet the model was built from and is committed, so `--verify` tells you
+whether a refit that fails to reproduce is a code problem or a *data* problem.
+`publish_model.py` will not overwrite an existing registry version without
+`--force`: a version is a name a deployment loads, and two models under one name
+makes every number recorded against it ambiguous.
 
 **Memory note:** `fit_models.py` peaks around 4–6 GB — the symmetry mirroring
 doubles 5.4M rows and briefly holds them as float64. It will be OOM-killed in a
@@ -127,6 +136,10 @@ the snapshot alone gives you a file with today's timestamp and last month's
 ratings. The snapshot records `latest_game_date` and `/health` reports
 `data_age_days` beside `ratings_age_days` so this cannot happen silently.
 
+You do **not** need to restart the service after rebuilding it: the poller
+re-reads the snapshot whenever the file changes, so the daily ratings agent and
+the always-on poller compose the way the installer implies.
+
 Step 6 of the smoke test is the one the offline suite cannot do: it reports
 play-type ids the model was never trained on. **A frequent unknown type means
 the ESPN feed has changed and the model needs a refit, not a patched adapter.**
@@ -165,7 +178,8 @@ src/cbbwp/
   features.py      the 11 features, one definition, used by training AND serving
   ratings.py       in-house pregame ratings (our stand-in for the betting spread)
   serve.py         WinProbabilityService; refuses to start on a contract mismatch
-  live_context.py  pregame context for a game that has not been played yet
+  live_context.py  pregame context for a game not yet played; reloads the
+                   ratings snapshot when it changes on disk
   endgame.py       rule-based clamps the data cannot teach efficiently (live)
   endgame_sim.py   the endgame lookup table (diagnostic only — see EXPLAIN 7.14)
   calibration.py   time-bucketed isotonic (diagnostic only — see EXPLAIN 7.7)
@@ -179,8 +193,12 @@ scripts/           the pipeline, the poller, the smoke test, the replay
                    server, the viz app, the monitor
 web/               the viz app's single page (no build step, no CDN)
 deploy/            macOS LaunchAgents, Dockerfile, compose
-tests/             121 tests
+tests/             125 tests
 docs/              the project docs, kept alongside the code
+.github/workflows/ CI: the offline suite on every push, the full suite weekly
+data_checksums.json  sha256 of every hoopR parquet, so "rebuilt byte-identically"
+                   is checkable from a fresh clone (`fetch_data.py --verify`)
+AUDIT-2026-09-08.md  an independent audit of the whole project, and every fix
 data/, artifacts/, registry/   built locally; not source
 ```
 
@@ -202,3 +220,16 @@ live path in irregular chunks must match the offline answer exactly.
 be revealed in game order from a countdown clock, must only ever grow, and the
 finished replay must equal the archive. A dry run that fails on the simulator's
 own bugs is the worst kind of false alarm to chase at tip-off.
+
+`tests/test_ratings_parity.py` closes the one gap those left. Parity tests
+compare the two *state* builders; nothing compared the two **ratings** paths,
+and they had silently diverged — training chains a prior across every season,
+the live snapshot used to fit one season against an empty prior. Same ridge fit,
+different prior, so the pregame term served live was not the quantity the model
+learned.
+
+Two of these can only see what the data contains, which is worth knowing when
+adding a rule. Real feeds contain no unreadable clock in any of ten seasons, so
+`test_state.py` exercises the carry-forward rule (state rules v3) on both the
+canonical and vectorised paths with a synthetic one — otherwise half of that
+rule would ship untested.

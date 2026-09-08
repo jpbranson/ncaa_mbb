@@ -1,12 +1,12 @@
 # CBB Win Probability — build log and re-entry point
 
-**Last worked: 2026-09-03 (session 7).** The model is **checkpointed at
-`registry/v2` and tagged `checkpoint-2026-09-02`** — see `cbbwp-CHECKPOINT.md`.
-The model itself has not changed since; session 6 was all live path, and it
-found and fixed a real serving bug (play ordering — see below). Deployment
-scaffolding is built and tested: `cbbwp-deployment.md` is the run book. The
-**endgame simulator is finished, tested once, and does not ship**
-(`cbbwp-endgame-results.md`).
+**Last worked: 2026-09-08 (session 8 — the independent audit and its fixes).**
+The model is **checkpointed at `registry/v3` and tagged
+`checkpoint-2026-09-02`** — see `cbbwp-CHECKPOINT.md`. The booster itself has
+never changed: `v3` is byte for byte the artifact the tag carries, republished
+under state rules v3. Deployment scaffolding is built and tested:
+`cbbwp-deployment.md` is the run book. The **endgame simulator is finished,
+tested twice, and does not ship** (`cbbwp-endgame-results.md`).
 
 **The live path has now reached ESPN** (2026-09-02) and been rehearsed against a
 running clock (2026-09-03, via `scripts/replay_server.py`). The earlier
@@ -17,13 +17,15 @@ partly ESPN's edge refusing the client's own user-agent, which is fixed.
 out of season, because there are no games to record — not because anything is
 broken.
 
-Shipped model is **v2** (`registry/v2`, sha `2d4bf58134fa2e64`). v1 is kept for
-provenance where it exists and is deliberately refused at load by current code.
+Shipped model is **v3** (`registry/v3`, sha `2d4bf58134fa2e64` — the same
+booster as v2, republished under state rules v3). `registry/v1` and
+`registry/v2` are both kept for provenance and are both deliberately refused at
+load by current code; that refusal is tested for each.
 
 **Two working copies exist and they have diverged.**
 
 - `~/Downloads/ncaa_mbb` on **cas-w7r21674vv** (this file's copy) — has
-  `registry/v1`, so all 110 tests run with none skipped. Sessions 4 and 5's work
+  `registry/v1`, so all 125 tests run with none skipped. Sessions 4 and 5's work
   was done here.
 - `%USERPROFILE%\Downloads\mbb_prob_claude` on **jpbranson-desk** — session 3's
   bit-identical rebuild. Lacks `registry/v1`, so one test skips there.
@@ -46,7 +48,7 @@ Trained on 2016–2023, calibrated on 2024, tested on 2025–2026 (2.23M states,
 
 | Model | Log loss | Brier | Accuracy | ECE |
 |---|---|---|---|---|
-| **LightGBM v2 (shipped)** | **0.3103** | 0.1008 | 85.20% | 0.0026 |
+| **LightGBM v3 (shipped)** | **0.3103** | 0.1008 | 85.20% | 0.0026 |
 | Logistic baseline | 0.3108 | 0.1009 | 85.19% | 0.0042 |
 | ESPN (deployed, same rows) | 0.3295 | 0.1061 | 84.58% | 0.0069 |
 
@@ -57,6 +59,9 @@ Beats ESPN in every time bucket; the gap is widest in the final minute
 
 ```
   README.md              setup, run order, layout, the parity tests
+  AUDIT-2026-09-08.md    the independent audit and every fix it produced
+  data_checksums.json    sha256 of each hoopR parquet; fetch_data.py --verify
+  .github/workflows/     CI: offline suite on every push, full suite weekly
   docs/                  README.md says which doc to read for what
   src/cbbwp/             the package
     endgame.py           rule-based clamps applied on the live path
@@ -75,14 +80,18 @@ Beats ESPN in every time bucket; the gap is widest in the final minute
     rebuild_test_preds.py            float64 predictions from the pinned model
     build_report_data.py             data behind the published artifact
     build_source_bundle.py           regenerates cbbwp-source.md
+    build_live_context.py            ratings snapshot; chains the season prior
+    calibration_monitor.py           weekly drift check, backtest or live
+    fetch_data.py                    hoopR download; --record / --verify hashes
+    publish_model.py                 pins an artifact; refuses to overwrite
   deploy/                LaunchAgents, Dockerfile, compose
-  tests/                 110 tests, ~6s
+  tests/                 125 tests, ~7s
   data/raw/              527 MB of hoopR parquet, 10 seasons
   data/proc/             games, team stats, 8.56M state rows
   data/live/             poller output, one JSONL per day
   data/replay/           dry-run output; replay rows never touch data/live/
   web/                   the viz app's single page
-  registry/v2/           the pinned model + manifest
+  registry/v3/           the pinned model + manifest (v1, v2 kept, both refused)
   registry/endgame/e1/   the endgame table, manifest, readable.csv (unused in serving)
   registry/context_latest.json   ratings snapshot, for live games
   artifacts/             fitted model, eval predictions, endgame parameters
@@ -105,7 +114,7 @@ python3 scripts/build_games.py
 python3 scripts/build_team_stats.py
 python3 scripts/build_dataset.py  # accepts optional season args
 python3 scripts/fit_models.py     # needs ~6 GB RAM
-python3 scripts/publish_model.py v2
+python3 scripts/publish_model.py v3
 ```
 
 **`fit_models.py` needs ~6 GB of RAM.** The symmetry mirroring doubles 5.4M rows
@@ -375,6 +384,59 @@ counted under the old sort). 101 → 110 tests.
 yet built, pointed at `registry/v1`, and had two sections numbered 7.10. All
 fixed; the endgame section is now §7.14. Install instructions everywhere now use
 a virtualenv, as the run book already required.
+
+## Session 8 (2026-09-08) — an independent audit, and everything it found
+
+Full report and per-finding resolution: **`AUDIT-2026-09-08.md`** at the repo
+root. The project was read from first principles against its own documented
+claims, nothing assumed correct because a doc said so. The headline numbers all
+reproduced and the parity architecture held up. Two findings were serious.
+
+**The service never reloaded the ratings snapshot.** `serve_live.py` read it
+once at startup, so `deploy/install_macos.sh`'s daily ratings agent was
+rewriting a file the running poller never read again — a process up for a season
+would serve launch-day ratings — and `/health` reported a permanent 503 after
+`CBBWP_RATINGS_MAX_AGE` days of uptime, advising a rebuild cron had already
+done. `cbbwp.live_context.ReloadingContextProvider` now re-reads on mtime
+change, and `build_live_context.py` writes atomically so a reload cannot see a
+half-written file. Verified against a running service: `/health` followed the
+file within 8 seconds.
+
+**The endgame table's fouling parameters were the mirror image of reality.**
+Possession runs were segmented on the possession *after* each event, and a made
+free throw flips possession, so every free-throw trip was credited to the team
+that committed the foul rather than the team that shot it. The artifact recorded
+a *trailing* offence reaching the line 71–84% of the time in the last ten
+seconds and a *leading* offence 10–18%. Corrected, the table improved on every
+measure (Phase 4 log loss 0.1384 → 0.1338, ECE 0.0173 → 0.0090) and the isotonic
+repair the build applies fell a hundredfold, which is the real evidence the
+parameters are now right. **The pre-registered verdict did not change**: 0.63%
+against a 1% bar.
+
+Also fixed: the live pregame term was not on the training scale
+(`build_live_context.py` seeded from one previous season against an empty prior
+while training chains every season with CARRYOVER — `ratings.carried_prior` is
+now the single definition, cutting early-November error against the stored
+offline term by 30%); `chronological_inversions` existed and nothing called it;
+replay rows could still reach `data/live/`; the viz score cache was never
+invalidated; `serve.py` never checked the manifest hash it recorded; there was
+no CI. 111 → 121 tests.
+
+**Then two follow-ups, on request.**
+
+`STATE_RULES_VERSION` 2 → 3: an unreadable clock now carries the period's
+previous clock forward instead of becoming 0:00, which is what stopped one
+malformed field from letting the endgame clamp publish near-certainty with ten
+minutes left (EXPLAIN §8.2b). Measured first — **0 of 19,462,128** rows across
+ten seasons carry one — so the rule changes no training row, the rebuilt dataset
+is identical row for row, and the refit reproduced the booster **byte for byte**.
+Republished as `registry/v3`; `registry/v2` is now refused at load despite being
+the same bytes, which is exactly what the guard is for.
+
+And the endgame blend now tunes against a held-out table: `--tune` used `e1`
+(fit on 2016–2024) while tuning on 2024, and now defaults to `e1_no2024` and
+*refuses* a tune table containing the tuning season. The clean re-tune chose the
+identical parameters, so the leak was never driving the result. 121 → 125 tests.
 
 ## Next up
 

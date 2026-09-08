@@ -1,6 +1,7 @@
 # docs/
 
-Nine documents. Which one you want depends on why you are here.
+Nine documents here, plus the audit at the repository root. Which one you want
+depends on why you are here.
 
 | Start here if you want to… | Read |
 |---|---|
@@ -23,6 +24,12 @@ Nine documents. Which one you want depends on why you are here.
 | `cbb-win-probability-model-plan.md` | The original design plan, kept verbatim. Where the build departed from it, EXPLAIN §7 says why. |
 | `cbbwp-source.md` | Every source file in one document, for disaster recovery. **Generated — do not edit by hand.** |
 
+One more document lives at the repository root rather than here:
+
+| File | What it is |
+|---|---|
+| `../AUDIT-2026-09-08.md` | An independent audit of the whole project, read from first principles against its own claims, with every finding and how it was resolved. The two serious ones — a ratings snapshot that was never reloaded, and endgame fouling parameters attributed to the wrong team — are worth knowing about before changing either area. |
+
 ## Mirrored to the Claude project
 
 All of the above are mirrored into the project (`claude/…`) so a fresh session
@@ -41,10 +48,14 @@ rather than working files, and the artifact is updated from the project.
 python3 scripts/build_source_bundle.py
 ```
 
-It walks `src/`, `scripts/` and `tests/`, stamps the commit it was built from,
-and writes `cbbwp-source.md`. This used to be an inline snippet pasted into this
-README, which is exactly why the bundle had quietly fallen three files behind
-the code before anyone noticed.
+It walks `src/`, `scripts/` and `tests/`, adds `web/index.html` and the CI
+workflow, stamps the commit it was built from, and writes `cbbwp-source.md`.
+This used to be an inline snippet pasted into this README, which is exactly why
+the bundle had quietly fallen three files behind the code before anyone noticed.
+
+It also includes **itself** now. It used to skip `build_source_bundle.py`, which
+meant the one artifact whose whole purpose is "rebuild the project from the docs
+alone" could not rebuild the thing that rebuilds it.
 
 **Keep EXPLAIN.md current.** When a number changes, change it there too — it is
 the document people will actually read.

@@ -7,7 +7,7 @@ count as an improvement. If you come back to this in a year, start here.*
 
 | | |
 |---|---|
-| Git tag | `checkpoint-2026-09-02` |
+| Git tag | `checkpoint-2026-09-02` — the moment this was frozen. It contains `registry/v2`, not `v3`: the tag predates the rules bump. The **booster inside it is the same bytes** as what ships today. |
 | Shipped model | `registry/v3`, sha256 `2d4bf58134fa2e64`, LightGBM, 2.62 MB |
 | State rules | **v3** (`STATE_RULES_VERSION = 3` in `schemas.py`) |
 | Features | 11, order is part of the contract |
@@ -81,6 +81,7 @@ changing only the weighting moves the headline by 17%.
 python3 -m venv .venv && source .venv/bin/activate
 pip install polars pyarrow lightgbm scikit-learn pytest numpy certifi
 python3 scripts/fetch_data.py        # ~527 MB
+python3 scripts/fetch_data.py --verify   # inputs match data_checksums.json
 python3 scripts/build_games.py
 python3 scripts/build_team_stats.py
 python3 scripts/build_dataset.py
@@ -88,6 +89,22 @@ python3 scripts/fit_models.py        # needs ~6 GB RAM
 python3 scripts/publish_model.py v3
 python3 -m pytest -q
 ```
+
+**Check the inputs before concluding anything about the outputs.**
+`data_checksums.json` records the sha256 of every hoopR parquet this model was
+built from, and it is committed. hoopR is a live repository that can be rebuilt
+upstream at any time, so `--verify` is the difference between "the refit does not
+reproduce" and "the refit does not reproduce *because the inputs changed*" —
+which is otherwise a very expensive thing to discover late. `--record` rewrites
+the file when new data is genuinely what you want.
+
+**`publish_model.py` refuses to overwrite an existing version.** A registry
+directory is a name a running deployment loads; two different models under one
+name makes every number ever recorded against it ambiguous. Publish a new
+version, or pass `--force` if replacing one is genuinely what you mean.
+`--from` names the artifact explicitly (it defaults to `artifacts/gbm_v1.txt`,
+which is whatever `fit_models.py` wrote last), and the manifest records that
+path and its modification time so a published artifact can be traced back.
 
 Session 3 rebuilt this on a different machine and got sha `2d4bf58134fa2e64`
 **bit-identically**, so the seed pinning holds across machines. `fit_models.py`
