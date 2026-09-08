@@ -37,7 +37,12 @@ def main() -> None:
               for s in TEST_SEASONS]
     te = (pl.concat(frames)
           .select(FEATURE_NAMES + [c for c in
-                  ["home_win", "game_seconds_remaining", "espn_wp", "game_id", "season"]
+                  ["home_win", "game_seconds_remaining", "espn_wp", "game_id",
+                   # `seq` is carried so downstream scripts can join back to the
+                   # state rows by identity instead of by position. Without it
+                   # calibrate_and_eval.py can only check that the row COUNTS
+                   # match before pairing probabilities with margins.
+                   "seq", "season"]
                   if c not in FEATURE_NAMES])
           .collect())
     X = te.select(FEATURE_NAMES).to_numpy().astype(np.float32)
@@ -76,7 +81,8 @@ def main() -> None:
         p_lr=p_lr, p_gbm=p_gbm,
         secs=te["game_seconds_remaining"].to_numpy(),
         espn=te["espn_wp"].to_numpy().astype(np.float64),
-        game_id=te["game_id"].to_numpy(), season=te["season"].to_numpy())
+        game_id=te["game_id"].to_numpy(), seq=te["seq"].to_numpy(),
+        season=te["season"].to_numpy())
     print(f"wrote {OUT}  ({len(te):,} rows, {OUT.stat().st_size/1e6:.1f} MB)")
 
 

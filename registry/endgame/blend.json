@@ -1,14 +1,15 @@
 {
   "handoff_seconds": 60.0,
-  "gamma": 6.0,
-  "alpha": 0.75,
+  "gamma": 8.0,
+  "alpha": 0.8,
   "beta": 0.05,
-  "w_max": 0.2,
+  "w_max": 0.30000000000000004,
   "table": "registry/endgame/e1",
   "model": "registry/v2",
   "tuned_on_season": 2024,
-  "tune_log_loss_inside_60s": 0.12084164240883108,
-  "tune_baseline_model_only": 0.12198951369594463,
-  "tune_table_only": 0.13864755298433643,
+  "tune_log_loss_inside_60s": 0.12138237731068025,
+  "tune_baseline_model_only": 0.12229312197954076,
+  "tune_baseline_model_only_unclamped": 0.12198951369594463,
+  "tune_table_only": 0.13378185164888776,
   "n_tune_rows": 103554
 }

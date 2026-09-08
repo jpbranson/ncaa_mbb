@@ -25,6 +25,8 @@ if not files:
 unknown = collections.Counter()
 problems = 0
 n_synth = 0
+total_inversions = 0
+total_bad_clocks = 0
 for f in files:
     payload = json.loads(f.read_text())
     synthetic = espn.is_synthetic_payload(payload)
@@ -33,6 +35,14 @@ for f in files:
     events, h = espn.parse_summary(payload)
     ctx = PregameContext(h.game_id, h.home_team_id, h.away_team_id, h.neutral_site)
     states = build_states(events, ctx)
+
+    # Two feed-shape signals the adapter deliberately reports rather than
+    # repairs. Neither is fatal on its own, so they do not fail the run -- but
+    # they are the evidence somebody needs when a number looks wrong later.
+    inversions = espn.chronological_inversions(events)
+    bad_clocks = espn.clock_parse_failures(raw_plays)
+    total_inversions += inversions
+    total_bad_clocks += bad_clocks
 
     for p in raw_plays:
         t = p.get("type") or {}
@@ -58,6 +68,8 @@ for f in files:
     problems += 0 if ok else 1
     print(f"{'ok  ' if ok else 'BAD '}{f.name:<28} {h.away_name} @ {h.home_name}  "
           f"{h.status}  {len(events):,} plays, {len(states):,} states"
+          + (f"   [{inversions} out of clock order]" if inversions else "")
+          + (f"   [{bad_clocks} unparseable clock(s)]" if bad_clocks else "")
           + ("   [REBUILT FROM hoopR - not evidence about ESPN]" if synthetic else ""))
 
 # A payload rebuilt from hoopR carries hoopR's own type ids, and the model's type
@@ -70,6 +82,22 @@ if n_synth:
         print("Every payload here is a rebuild, so the unknown-play-type check below\n"
               "CANNOT FAIL and proves nothing about what ESPN is sending. Record real\n"
               "payloads with scripts/record_espn_fixtures.py on a night with games.")
+
+if total_inversions or total_bad_clocks:
+    print("\nFEED SHAPE SIGNALS (reported, never silently repaired):")
+    if total_inversions:
+        print(f"  {total_inversions:,} play(s) sit earlier in game time than the "
+              "play before them.\n"
+              "  The adapter preserves the feed's order; an unreliable key cannot "
+              "fix a bad\n  feed, only corrupt a good one. See EXPLAIN 8.8b.")
+    if total_bad_clocks:
+        print(f"  {total_bad_clocks:,} play(s) carry a clock string this build "
+              "cannot parse.\n"
+              "  Those are scored as 0:00, and a 0:00 in the second half lets the "
+              "endgame\n  clamp publish near-certainty. Check the feed's clock "
+              "format before going live.")
+else:
+    print("\nno feed-shape problems - every play parses and the order is chronological")
 
 if unknown:
     print("\nPLAY TYPES THE MODEL HAS NEVER SEEN "

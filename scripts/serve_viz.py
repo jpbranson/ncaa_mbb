@@ -36,6 +36,7 @@ Endpoints (all JSON except `/`):
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import pathlib
 import sys
@@ -51,7 +52,7 @@ sys.path.insert(0, str(ROOT / "src"))
 from cbbwp.adapters.espn import (EspnClient, is_synthetic_payload,  # noqa: E402
                                  parse_summary)
 from cbbwp.config import Settings                           # noqa: E402
-from cbbwp.live_context import LiveContextProvider          # noqa: E402
+from cbbwp.live_context import ReloadingContextProvider     # noqa: E402
 from cbbwp.serve import WinProbabilityService               # noqa: E402
 
 PAGE = ROOT / "web" / "index.html"
@@ -80,19 +81,35 @@ class Scorer:
 
     def __init__(self, cfg: Settings):
         self.svc = WinProbabilityService(cfg.registry, cfg.model_version)
-        self.ctx = LiveContextProvider.load(cfg.context_path)
-        self.cache: dict[int, dict] = {}
+        self.ctx = ReloadingContextProvider(cfg.context_path)
+        # game_id -> (fingerprint of the plays it was scored from, result)
+        self.cache: dict[int, tuple[str, dict]] = {}
         self.lock = threading.Lock()
 
     def summary_of(self, path: pathlib.Path) -> dict:
         return json.loads(path.read_text())
 
+    @staticmethod
+    def fingerprint(payload: dict) -> str:
+        """What a scored game is a function of: the plays, exactly.
+
+        Keying the cache on the game id alone made `/api/fetch/<id>` a no-op on
+        the second call -- it would pull a fresh payload from ESPN, archive it,
+        and then hand back the scored version of the payload it had seen first,
+        silently discarding every play added since. That is precisely wrong for
+        the one case the fetch button exists to serve: a game still in progress.
+        """
+        return hashlib.sha256(
+            json.dumps(payload.get("plays") or [], sort_keys=True,
+                       separators=(",", ":")).encode()).hexdigest()
+
     def score(self, game_id: int, payload: dict) -> dict:
         """One archived payload -> everything the page needs to draw the game."""
+        fp = self.fingerprint(payload)
         with self.lock:
             hit = self.cache.get(game_id)
-        if hit is not None:
-            return hit
+        if hit is not None and hit[0] == fp:
+            return hit[1]
 
         events, header = parse_summary(payload)
         pctx = self.ctx.context_for(game_id, header.home_team_id,
@@ -138,7 +155,7 @@ class Scorer:
             "plays": plays,
         }
         with self.lock:
-            self.cache[game_id] = out
+            self.cache[game_id] = (fp, out)
         return out
 
     def brief(self, game_id: int, path: pathlib.Path) -> dict:

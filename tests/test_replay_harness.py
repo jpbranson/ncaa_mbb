@@ -57,7 +57,14 @@ def test_incremental_polling_matches_full_replay(svc, game):
         assert live[row["seq"]] == pytest.approx(row["home_win_prob"], abs=1e-12), row["seq"]
 
 
-def test_out_of_order_and_duplicate_events_are_absorbed(svc, game):
+def test_arrival_order_does_not_change_the_answer(svc, game):
+    """`build_states` is a pure function of the event SET, ordered by seq.
+
+    Renamed 2026-09-08: this used to be called "...and duplicate events are
+    absorbed" while testing nothing of the sort. Duplicates now have their own
+    test below, which pins what actually happens rather than what the old name
+    asserted.
+    """
     events, home_id, away_id = game
     ctx = PregameContext(events[0].game_id, home_id, away_id, pregame_exp_margin=1.5)
     clean = svc.score_game(events, ctx)
@@ -65,6 +72,32 @@ def test_out_of_order_and_duplicate_events_are_absorbed(svc, game):
     shuffled = list(events)
     random.Random(7).shuffle(shuffled)
     assert svc.score_game(shuffled, ctx) == clean
+
+
+def test_a_duplicated_event_repeats_its_state_and_disturbs_nothing_else(svc, game):
+    """What a repeated play actually does, stated rather than assumed.
+
+    The live adapter renumbers densely over the feed's array, so it cannot emit
+    a duplicate today. If a future feed or adapter ever did, the failure mode
+    worth knowing is that the state is REPEATED, not that the game is corrupted:
+    every other seq keeps exactly the probability it had. The poller reads
+    rows[-1] and the API keys history by seq, so a repeat is inert downstream.
+    """
+    events, home_id, away_id = game
+    ctx = PregameContext(events[0].game_id, home_id, away_id, pregame_exp_margin=1.5)
+    clean = svc.score_game(events, ctx)
+
+    mid = len(events) // 2
+    doubled = list(events[:mid]) + [events[mid]] + list(events[mid:])
+    got = svc.score_game(doubled, ctx)
+
+    assert len(got) == len(clean) + 1
+    assert [r["seq"] for r in got].count(events[mid].seq) == 2
+    by_seq = {}
+    for r in got:
+        by_seq.setdefault(r["seq"], r["home_win_prob"])
+    for r in clean:
+        assert by_seq[r["seq"]] == pytest.approx(r["home_win_prob"], abs=1e-12)
 
 
 def test_probabilities_are_bounded_and_finite(svc, game):

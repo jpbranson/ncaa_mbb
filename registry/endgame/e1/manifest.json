@@ -1,8 +1,8 @@
 {
   "version": "e1",
   "state_rules_version": 2,
-  "built": "2026-09-02T16:06:27Z",
-  "sha256_16": "5ee6ed660768e3ba",
+  "built": "2026-09-08T16:37:09Z",
+  "sha256_16": "ef41c4a74af1be04",
   "seasons_used": [
     2016,
     2017,
@@ -36,33 +36,33 @@
   "foul_max": 10,
   "ft_bucket_means": [
     0.6687238101760424,
-    0.7109406711464303,
+    0.7109406711464302,
     0.7497375620081773
   ],
   "monotonicity_before": {
-    "margin_min_increment": -0.006552480252652683,
-    "margin_violations": 98,
-    "own_ft_bucket_min_increment": -8.205384588537076e-06,
-    "own_ft_bucket_violations": 6543,
-    "opp_ft_bucket_max_increment": 2.3010668702694304e-06,
-    "opp_ft_bucket_violations": 6270,
-    "own_fouls_max_increment": 0.006927830437375715,
-    "opp_fouls_min_increment": -0.020784587910606223,
+    "margin_min_increment": -5.592580850103148e-05,
+    "margin_violations": 4199,
+    "own_ft_bucket_min_increment": 0.0,
+    "own_ft_bucket_violations": 0,
+    "opp_ft_bucket_max_increment": 0.0,
+    "opp_ft_bucket_violations": 0,
+    "own_fouls_max_increment": 0.021165205498930334,
+    "opp_fouls_min_increment": -0.07526328300949525,
     "possession_min_advantage": 0.0,
     "possession_violations": 0
   },
   "monotonicity_after": {
     "margin_min_increment": 0.0,
     "margin_violations": 0,
-    "own_ft_bucket_min_increment": -8.205384588537076e-06,
-    "own_ft_bucket_violations": 6543,
-    "opp_ft_bucket_max_increment": 2.3010668702694304e-06,
-    "opp_ft_bucket_violations": 6270,
-    "own_fouls_max_increment": 0.006927830437375715,
-    "opp_fouls_min_increment": -0.020784587910606223,
+    "own_ft_bucket_min_increment": 0.0,
+    "own_ft_bucket_violations": 0,
+    "opp_ft_bucket_max_increment": 0.0,
+    "opp_ft_bucket_violations": 0,
+    "own_fouls_max_increment": 0.021165205498930334,
+    "opp_fouls_min_increment": -0.07526328300949525,
     "possession_min_advantage": 0.0,
     "possession_violations": 0
   },
-  "isotonic_max_correction": 0.006552480252652683,
+  "isotonic_max_correction": 5.592580850103148e-05,
   "note": "V[t, m, fo, fd, bo, bd] = P(the team WITH THE BALL wins)."
 }

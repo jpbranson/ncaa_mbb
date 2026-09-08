@@ -19,7 +19,14 @@ INCLUDE = [
     ("README.md", "markdown"),
 ]
 TREES = [("src/cbbwp", "py"), ("scripts", "py"), ("tests", "py")]
-SKIP = {"__pycache__", "build_source_bundle.py"}
+# This script INCLUDES ITSELF. It used to be skipped, which meant the one
+# artifact whose entire purpose is "rebuild the project from the docs alone"
+# could not rebuild the thing that rebuilds it.
+SKIP = {"__pycache__"}
+# The web page and the CI workflow are source too: the viz is a shipped entry
+# point and tests/test_viz.py runs the page's own functions, and a recovered
+# copy with no workflow silently stops running the tests on every push.
+INCLUDE_EXTRA = [("web/index.html", "html"), (".github/workflows/tests.yml", "yaml")]
 
 
 def files() -> list[tuple[Path, str]]:
@@ -29,6 +36,7 @@ def files() -> list[tuple[Path, str]]:
             if any(part in SKIP for part in p.parts) or p.name in SKIP:
                 continue
             out.append((p, lang))
+    out += [(ROOT / n, lang) for n, lang in INCLUDE_EXTRA if (ROOT / n).exists()]
     return out
 
 

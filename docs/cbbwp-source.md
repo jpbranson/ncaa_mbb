@@ -1,5 +1,5 @@
 # `cbbwp` source bundle
-Complete source. Regenerated 2026-09-03 14:44 from the `ncaa_mbb` working folder, at commit `251959e`.
+Complete source. Regenerated 2026-09-08 11:46 from the `ncaa_mbb` working folder, at commit `28ec0ee`.
 
 State rules v2, model v2. This bundle is a mirror for disaster recovery; the folder is the source of truth (it also holds the data, the fitted model and the git history). Regenerate with `python3 scripts/build_source_bundle.py` whenever the source changes.
 
@@ -19,7 +19,12 @@ name = "cbbwp"
 version = "0.2.0"
 description = "College basketball live win probability model"
 requires-python = ">=3.10"
-dependencies = ["numpy", "polars", "scikit-learn", "lightgbm"]
+# pyarrow is not optional in practice: polars needs it to read the hoopR parquet
+# files, which is the first step of every pipeline here.
+dependencies = ["numpy", "polars", "pyarrow", "scikit-learn", "lightgbm"]
+
+[project.optional-dependencies]
+dev = ["pytest"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
@@ -115,7 +120,7 @@ python3 scripts/serve_viz.py              # then open http://127.0.0.1:8811
 ```
 
 A small web app, standard library and one HTML file — no build step, no CDN,
-Bootstrap 3 / Shiny styling written by hand. Two tabs: **Live** draws whatever
+plain text and one chart. Two views: **Live** draws whatever
 `serve_live.py` is tracking; **Replay** loads any past game and gives you
 play/pause, speed, step forward and back, and a scrubber. Any ESPN game id can
 be fetched and archived from the app itself.
@@ -208,7 +213,7 @@ scripts/           the pipeline, the poller, the smoke test, the replay
                    server, the viz app, the monitor
 web/               the viz app's single page (no build step, no CDN)
 deploy/            macOS LaunchAgents, Dockerfile, compose
-tests/             110 tests
+tests/             121 tests
 docs/              the project docs, kept alongside the code
 data/, artifacts/, registry/   built locally; not source
 ```
@@ -292,7 +297,7 @@ from typing import Any, Iterable, List, Optional, Sequence
 
 from ..schemas import Event, PregameContext
 from ..schemas import HALF_SECONDS, OT_SECONDS
-from ..state import clock_to_seconds, game_seconds_remaining
+from ..state import clock_to_seconds, game_seconds_remaining, parse_clock
 
 SITE_API = "https://site.api.espn.com/apis/site/v2/sports/basketball/mens-college-basketball"
 SCOREBOARD_URL = SITE_API + "/scoreboard"
@@ -413,6 +418,26 @@ def chronological_inversions(events: Sequence[Event]) -> int:
                 + (OT_SECONDS - e.clock_seconds))
     t = [elapsed(e) for e in events]
     return sum(1 for i in range(1, len(t)) if t[i] < t[i - 1])
+
+
+def clock_parse_failures(plays: Sequence[dict]) -> int:
+    """Plays carrying a clock string this code cannot read.
+
+    Zero on every real ESPN payload measured so far. A non-zero count is the
+    same class of signal as an unknown play-type id: the feed has changed shape,
+    and states are being built on a clock of 0 that nobody measured. In the
+    second half that fabricated 0 means "the game is over" to `endgame.apply`,
+    which will then clamp the published probability to near-certainty.
+
+    A play with NO clock at all is not counted: ESPN sends administrative rows
+    that way and always has. Only a present-but-unreadable value counts.
+    """
+    n = 0
+    for p in plays:
+        raw = str((p.get("clock") or {}).get("displayValue") or "").strip()
+        if raw and parse_clock(raw) is None:
+            n += 1
+    return n
 
 
 def events_from_plays(plays: Sequence[dict], game_id: int) -> List[Event]:
@@ -797,18 +822,38 @@ from .schemas import STATE_RULES_VERSION
 
 
 class LiveStore:
-    """Latest state per game, plus a bounded tail of history."""
+    """Latest state per game, plus a bounded tail of history.
 
-    def __init__(self, history: int = 240):
+    Bounded in BOTH directions. The history per game was always capped; the
+    number of games was not, so a process left up for a season accumulated every
+    game it had ever seen and `/games` answered with all of them rather than
+    with tonight's slate. A Division I slate peaks around 350 games, so the
+    default here is a slate and change.
+    """
+
+    def __init__(self, history: int = 240, max_games: int = 512):
         self._lock = threading.Lock()
         self._latest: dict[int, dict] = {}
         self._history: dict[int, collections.deque] = {}
+        self._seen: dict[int, float] = {}
         self._history_len = history
+        self._max_games = max_games
         self._updates = 0
+        self._evicted = 0
         self._last_update: Optional[float] = None
+
+    def _evict_locked(self) -> None:
+        """Drop the least recently updated games. Caller holds the lock."""
+        while len(self._latest) > self._max_games:
+            oldest = min(self._seen, key=self._seen.get)
+            self._latest.pop(oldest, None)
+            self._history.pop(oldest, None)
+            self._seen.pop(oldest, None)
+            self._evicted += 1
 
     def update(self, row: dict) -> None:
         gid = int(row["game_id"])
+        now = time.time()
         with self._lock:
             self._latest[gid] = row
             d = self._history.get(gid)
@@ -817,8 +862,10 @@ class LiveStore:
             d.append({k: row[k] for k in
                       ("seq", "period", "game_seconds_remaining", "margin",
                        "home_win_prob") if k in row})
+            self._seen[gid] = now
             self._updates += 1
-            self._last_update = time.time()
+            self._last_update = now
+            self._evict_locked()
 
     def games(self) -> list[dict]:
         with self._lock:
@@ -836,7 +883,7 @@ class LiveStore:
     def stats(self) -> dict:
         with self._lock:
             return {"games_tracked": len(self._latest), "updates": self._updates,
-                    "last_update": self._last_update}
+                    "evicted": self._evicted, "last_update": self._last_update}
 
 
 def _iso(ts: Optional[float]) -> Optional[str]:
@@ -905,6 +952,7 @@ def make_handler(store: LiveStore, meta: dict,
                     "data_age_days": None if dage is None else round(dage, 2),
                     "games_tracked": s["games_tracked"],
                     "updates": s["updates"],
+                    "evicted": s["evicted"],
                     "last_update": _iso(s["last_update"]),
                 }))
 
@@ -1124,8 +1172,15 @@ def max_points_remaining(seconds_remaining: np.ndarray) -> np.ndarray:
     return poss * MAX_POINTS_PER_POSSESSION
 
 
-def apply(p, margin, seconds_remaining, is_ot=None):
-    """Clamp probabilities that the rules have already decided."""
+def apply(p, margin, seconds_remaining):
+    """Clamp probabilities that the rules have already decided.
+
+    No `is_ot`: overtime needs no special case here. `game_seconds_remaining`
+    already restarts its own clock for each overtime period (state.py), so
+    "time expired" and "cannot catch up" mean the same thing inside an overtime
+    as they do in regulation. The parameter used to exist, was never passed and
+    was never read.
+    """
     p = np.array(p, dtype=np.float64, copy=True)
     margin = np.asarray(margin)
     t = np.asarray(seconds_remaining, dtype=np.float64)
@@ -1760,8 +1815,11 @@ from __future__ import annotations
 import datetime as _dt
 import json
 import pathlib
+import sys
+import threading
+import time
 from dataclasses import dataclass
-from typing import Dict
+from typing import Dict, Optional
 
 from .schemas import PregameContext
 
@@ -1888,6 +1946,125 @@ class LiveContextProvider:
 
     def known(self, team_id: int) -> bool:
         return team_id in self.ratings
+
+
+class ReloadingContextProvider:
+    """A `LiveContextProvider` that re-reads its file when it changes on disk.
+
+    The deployment is a poller that runs for weeks and a SEPARATE daily job that
+    rebuilds the snapshot (`deploy/install_macos.sh` installs exactly that pair).
+    Loading once at startup made that composition silently useless: the running
+    process served launch-day ratings for the rest of the season, and `/health`
+    watched `ratings_age_days` climb past its own staleness threshold - reporting
+    503 and advising a rebuild that cron had already done, to a process that was
+    never going to read it.
+
+    So the freshness of the ratings is a property of the FILE, and every reader
+    goes through here. Delegates the whole `LiveContextProvider` surface, so it
+    is a drop-in for it.
+
+    Thread-safe: the poller reads from the asyncio loop and the API from its own
+    HTTP threads. Reads take the lock only long enough to copy a reference; the
+    provider itself is never mutated after construction, so callers can use the
+    snapshot they got without holding anything.
+    """
+
+    # Stat the file at most this often. A stat is microseconds, but the poller
+    # asks once per game per poll and there is no reason to make it more often
+    # than the rebuild job could possibly produce a new file.
+    CHECK_INTERVAL_SECONDS = 5.0
+
+    def __init__(self, path: str | pathlib.Path,
+                 check_interval: float = CHECK_INTERVAL_SECONDS,
+                 on_reload=None):
+        self.path = pathlib.Path(path)
+        self._check_interval = check_interval
+        self._on_reload = on_reload
+        self._lock = threading.Lock()
+        self._provider: LiveContextProvider = LiveContextProvider.load(self.path)
+        self._mtime: Optional[float] = self._stat_mtime()
+        self._last_check = time.monotonic()
+        self.reloads = 0
+        self.reload_failures = 0
+
+    def _stat_mtime(self) -> Optional[float]:
+        try:
+            return self.path.stat().st_mtime
+        except OSError:
+            return None
+
+    @property
+    def current(self) -> LiveContextProvider:
+        """The freshest snapshot, reloading first if the file has changed."""
+        now = time.monotonic()
+        with self._lock:
+            if now - self._last_check < self._check_interval:
+                return self._provider
+            self._last_check = now
+            mtime = self._stat_mtime()
+            if mtime is None or mtime == self._mtime:
+                return self._provider
+            try:
+                # A snapshot rewritten in place can be read half-written. The
+                # writer renames into place (build_live_context.py), so this is
+                # belt and braces -- but a torn read must never take down a live
+                # feed, and the previous ratings are a perfectly good answer.
+                fresh = LiveContextProvider.load(self.path)
+            except Exception as e:                      # noqa: BLE001
+                self.reload_failures += 1
+                print(f"warning: could not reload {self.path} "
+                      f"({type(e).__name__}: {e}); keeping the previous ratings",
+                      file=sys.stderr, flush=True)
+                # Do NOT record the mtime: retry on the next check, because the
+                # file is probably mid-write rather than permanently broken.
+                return self._provider
+            self._provider = fresh
+            self._mtime = mtime
+            self.reloads += 1
+            cb = self._on_reload
+        if cb is not None:
+            try:
+                cb(fresh)
+            except Exception:                           # noqa: BLE001
+                pass
+        return fresh
+
+    # -- the LiveContextProvider surface, all delegated to `current` ---------
+    def context_for(self, game_id: int, home_team_id: int, away_team_id: int,
+                    neutral_site: bool = False) -> PregameContext:
+        return self.current.context_for(game_id, home_team_id, away_team_id,
+                                        neutral_site)
+
+    def known(self, team_id: int) -> bool:
+        return self.current.known(team_id)
+
+    @property
+    def season(self) -> int:
+        return self.current.season
+
+    @property
+    def generated(self) -> str:
+        return self.current.generated
+
+    @property
+    def latest_game_date(self) -> str:
+        return self.current.latest_game_date
+
+    @property
+    def age_days(self) -> float:
+        return self.current.age_days
+
+    @property
+    def data_age_days(self) -> float | None:
+        return self.current.data_age_days
+
+    @property
+    def data_is_stale(self) -> bool:
+        return self.current.data_is_stale
+
+    @property
+    def is_stale(self) -> bool:
+        return self.current.is_stale
 ```
 
 ## `src/cbbwp/monitor.py`
@@ -2221,6 +2398,43 @@ def season_pregame_margins(games: pl.DataFrame, prior: Dict[int, float], lam: fl
     return joined, final_ratings, final_hca
 
 
+def season_end_ratings(season_games: pl.DataFrame, prior: Dict[int, float],
+                       lam: float | None = None) -> tuple[Dict[int, float], float]:
+    """End-of-season ratings for one season, given the prior carried into it.
+
+    Exactly the fit `season_pregame_margins` performs for its own return value,
+    lifted out so the live snapshot can reuse it instead of writing a second,
+    subtly different version. The team list is that season's teams, which is
+    what makes a team that stopped playing drop out of the carry.
+    """
+    teams = sorted(set(season_games["home_id"].to_list())
+                   | set(season_games["away_id"].to_list()))
+    return _fit_ridge(season_games, teams, prior, lam)
+
+
+def carried_prior(games: pl.DataFrame, before_season: int,
+                  lam: float | None = None) -> Dict[int, float]:
+    """The prior `build_all_seasons` would carry into `before_season`.
+
+    THE POINT OF THIS FUNCTION is that the live path used to build its prior
+    from a SINGLE previous season fit against an empty prior, while training
+    chains every season from 2016 and applies CARRYOVER at each boundary. Same
+    ridge fit, different prior - so `pregame_exp_margin` served live was not the
+    quantity the model was trained on. Measured on the real data, the two
+    disagreed by 1.3 points sd (max 6.8) over the first fortnight of November,
+    which is exactly when the pregame term carries the most weight.
+
+    `tests/test_ratings_parity.py` holds the two definitions together.
+    """
+    prior: Dict[int, float] = {}
+    for s in sorted(x for x in games["season"].unique().to_list()
+                    if x < before_season):
+        final, _ = season_end_ratings(games.filter(pl.col("season") == s),
+                                      prior, lam)
+        prior = {t: v * CARRYOVER for t, v in final.items()}
+    return prior
+
+
 def build_all_seasons(games: pl.DataFrame, lam: float | None = None) -> pl.DataFrame:
     """Walk seasons in order, carrying each season's ratings into the next."""
     prior: Dict[int, float] = {}
@@ -2356,6 +2570,7 @@ feature builders the training pipeline used, then a pinned model artifact.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import pathlib
 import pickle
@@ -2396,6 +2611,23 @@ class WinProbabilityService:
                 "data. Refit, or pin the code version that matches the artifact."
             )
         kind = self.manifest["kind"]
+        # The manifest has always recorded a hash of the artifact; nothing ever
+        # checked it, so it was a note for humans rather than a guarantee.
+        # Checking it turns a truncated copy, an interrupted rsync or an edited
+        # model file into a startup failure that names its own cause, instead of
+        # a service that silently serves different numbers than the ones this
+        # version was measured at.
+        expected = self.manifest.get("sha256")
+        if expected:
+            artifact = self.dir / ("model.txt" if kind == "lightgbm" else "model.pkl")
+            actual = hashlib.sha256(artifact.read_bytes()).hexdigest()
+            if not actual.startswith(expected):
+                raise RuntimeError(
+                    f"model {version} does not match its manifest: {artifact.name} "
+                    f"hashes to {actual[:len(expected)]}, manifest says {expected}. "
+                    "The artifact has changed since it was published - restore it "
+                    "or republish, but do not serve it."
+                )
         if kind == "lightgbm":
             import lightgbm as lgb
             self.model = lgb.Booster(model_file=str(self.dir / "model.txt"))
@@ -2463,8 +2695,10 @@ FOUL_TYPES = {"PersonalFoul", "Technical Foul"}
 #   "other"  -> the other team has the ball
 #   "carry"  -> unchanged from the previous state
 #   "unknown"-> 0.5
-# NOTE: this list is NO LONGER used to decide possession - see _possession_after.
-# It is kept only for documentation of what the field-goal types look like.
+# NOTE: `_MADE_SHOT_TYPES` is NO LONGER used to decide possession - see
+# `_possession_after`, which keys made field goals on the feed's scoring and
+# shooting flags. It is kept only to document what the field-goal types look
+# like. `_TURNOVER_MARKER` below IS still load-bearing (see `_possession_after`).
 _MADE_SHOT_TYPES = {"JumpShot", "LayUpShot", "DunkShot", "TipShot"}
 _TURNOVER_MARKER = "Turnover"
 
@@ -2472,18 +2706,40 @@ TEAM_TIMEOUT_TYPES = {"ShortTimeOut", "RegularTimeOut", "TeamTimeOut", "Timeout"
 OFFICIAL_TIMEOUT_TYPES = {"OfficialTVTimeOut", "MediaTimeOut"}
 
 
-def clock_to_seconds(display: str) -> int:
-    """'19:48' -> 1188.  '0:23.4' -> 23.  Returns 0 on anything unparseable."""
+def parse_clock(display: str) -> Optional[int]:
+    """'19:48' -> 1188.  '0:23.4' -> 23.  None if it does not parse at all.
+
+    `clock_to_seconds` folds two different facts into 0: "this play carries no
+    clock" (normal - ESPN sends administrative rows that way) and "this clock
+    string is a shape this code does not understand" (a feed change). The second
+    is worth knowing about, because a fabricated 0 in the SECOND HALF reads as
+    `game_seconds_remaining == 0`, and the endgame clamp then publishes 0.999
+    with ten minutes left on the real clock.
+
+    Nothing downstream of the adapters changes behaviour on this - see
+    `adapters/espn.clock_parse_failures`, which counts it and reports it the way
+    unknown play types are reported. Carrying the previous clock forward instead
+    would change what a GameState MEANS and so requires a STATE_RULES_VERSION
+    bump and a refit; that is a deliberate decision, not a bug fix.
+    """
     if not display:
-        return 0
+        return None
     s = display.strip()
+    if not s:
+        return None
     try:
         if ":" in s:
             mm, ss = s.split(":", 1)
             return int(mm) * 60 + int(float(ss))
         return int(float(s))
     except (ValueError, TypeError):
-        return 0
+        return None
+
+
+def clock_to_seconds(display: str) -> int:
+    """'19:48' -> 1188.  '0:23.4' -> 23.  Returns 0 on anything unparseable."""
+    v = parse_clock(display)
+    return 0 if v is None else v
 
 
 def period_length(period: int) -> int:
@@ -2873,12 +3129,19 @@ def main() -> None:
         inside = d["secs"] <= HANDOFF
         y, sec = d["y"][inside], d["secs"][inside]
         pm, pt = d["p_model"][inside], d["p_table"][inside]
+        margin_in = d["margin"][inside]
+        # Tune against the objective --test will measure: the clamped blend
+        # versus the clamped model. Optimising the unclamped blend chose
+        # parameters for a quantity nothing ever reports.
+        clamped = lambda p: apply_rules(p, margin_in, sec)
+        pm_shipped = clamped(pm)
         best = None
         for gamma in (1.0, 1.5, 2.0, 3.0, 4.0, 6.0, 8.0):
             for w_max in np.arange(0.05, 0.85, 0.05):
                 for alpha in np.arange(0.7, 1.35, 0.05):
                     for beta in (-0.05, 0.0, 0.05):
-                        ll = log_loss(y, blend(pm, pt, sec, gamma, alpha, beta, w_max))
+                        ll = log_loss(y, clamped(
+                            blend(pm, pt, sec, gamma, alpha, beta, w_max)))
                         if best is None or ll < best[0]:
                             best = (ll, gamma, float(alpha), beta, float(w_max))
         ll, gamma, alpha, beta, w_max = best
@@ -2887,7 +3150,8 @@ def main() -> None:
             "w_max": w_max,
             "table": a.table, "model": a.model, "tuned_on_season": TUNE_SEASON,
             "tune_log_loss_inside_60s": ll,
-            "tune_baseline_model_only": log_loss(y, pm),
+            "tune_baseline_model_only": log_loss(y, pm_shipped),
+            "tune_baseline_model_only_unclamped": log_loss(y, pm),
             "tune_table_only": log_loss(y, pt),
             "n_tune_rows": int(inside.sum()),
         }
@@ -2912,14 +3176,23 @@ def main() -> None:
 
     p_blend_raw = blend(d["p_model"], d["p_table"], d["secs"], cfg["gamma"], cfg["alpha"], cfg["beta"], cfg["w_max"])
     p_blend = apply_rules(p_blend_raw, d["margin"], d["secs"])
-    p_model = d["p_model"]
+    # The baseline has to be what actually SHIPS, and what ships is the model
+    # WITH these clamps -- serve.py applies them on every prediction. Comparing a
+    # clamped blend against an unclamped model measured the clamps and the table
+    # together and credited the whole difference to the table. Corrected
+    # 2026-09-08; both numbers are reported so the older figure stays explicable.
+    p_model_unclamped = d["p_model"]
+    p_model = apply_rules(p_model_unclamped, d["margin"], d["secs"])
 
     inside = d["secs"] <= HANDOFF
     ok = np.isfinite(d["espn"])
     res = {
         "config_sha256_16": cfg_hash, "config": cfg, "seasons": TEST_SEASONS,
         "criterion_1_log_loss_under_60s": {
+            # `model_only` is the shipped path: model + rule clamps.
             "model_only": log_loss(d["y"][inside], p_model[inside]),
+            "model_only_unclamped": log_loss(d["y"][inside],
+                                             p_model_unclamped[inside]),
             "blended": log_loss(d["y"][inside], p_blend[inside]),
             "table_only": log_loss(d["y"][inside], d["p_table"][inside]),
             "espn": log_loss(d["y"][inside & ok], d["espn"][inside & ok]),
@@ -2927,6 +3200,7 @@ def main() -> None:
         },
         "criterion_2_ece_under_60s": {
             "model_only": ece(d["y"][inside], p_model[inside]),
+            "model_only_unclamped": ece(d["y"][inside], p_model_unclamped[inside]),
             "blended": ece(d["y"][inside], p_blend[inside]),
         },
     }
@@ -3272,7 +3546,7 @@ import sys, pathlib, json, datetime, argparse
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "src"))
 import numpy as np
 import polars as pl
-from cbbwp.ratings import _fit_ridge, CARRYOVER
+from cbbwp.ratings import _fit_ridge, carried_prior
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 LEAGUE_FT, PRIOR_FTA, LEAGUE_PPM = 0.700, 40.0, 3.45
@@ -3285,13 +3559,16 @@ a = ap.parse_args()
 
 games = pl.read_parquet(ROOT / "data/proc/games.parquet")
 season = a.season or int(games["season"].max())
-prev = season - 1 if season - 1 != 2020 else season - 2
 
-# --- 1. ratings: fit this season's completed games, prior = last season's ----
-prev_g = games.filter(pl.col("season") == prev)
-teams_prev = sorted(set(prev_g["home_id"].to_list()) | set(prev_g["away_id"].to_list()))
-prev_ratings, _ = _fit_ridge(prev_g, teams_prev, {})
-prior = {t: v * CARRYOVER for t, v in prev_ratings.items()}
+# --- 1. ratings: fit this season's completed games, prior = every season before
+#
+# The prior is CHAINED from the first season in the file, applying CARRYOVER at
+# each boundary, because that is what the training pipeline does
+# (cbbwp.ratings.build_all_seasons). This used to fit the single previous season
+# against an empty prior, which put the live pregame term on a different scale
+# from the one the model was fit on -- 1.3 points sd out in early November, when
+# that term matters most. See cbbwp.ratings.carried_prior.
+prior = carried_prior(games, season)
 
 cur = games.filter(pl.col("season") == season)
 teams = sorted(set(cur["home_id"].to_list()) | set(cur["away_id"].to_list()) | set(prior))
@@ -3343,7 +3620,12 @@ out = {
 }
 dest = pathlib.Path(a.out)
 dest.parent.mkdir(parents=True, exist_ok=True)
-dest.write_text(json.dumps(out))
+# Write-then-rename, because a long-running poller reloads this file whenever it
+# changes (cbbwp.live_context.ReloadingContextProvider). Writing in place would
+# give that reader a window in which the file is half a JSON document.
+tmp = dest.with_suffix(dest.suffix + ".tmp")
+tmp.write_text(json.dumps(out))
+tmp.replace(dest)
 print(f"wrote {dest}  ({len(ratings)} ratings, {len(ft_pct)} ft, {len(ppm)} ppm)")
 print(f"  newest completed game: {latest_game_date or 'none yet (preseason)'}")
 ```
@@ -3533,6 +3815,86 @@ if __name__ == "__main__":
     main()
 ```
 
+## `scripts/build_source_bundle.py`
+
+```py
+"""Regenerate docs/cbbwp-source.md, the disaster-recovery source bundle.
+
+The bundle is a mirror: the folder plus its git history is the source of truth.
+It exists so the whole project can be rebuilt from the project docs alone if a
+machine is lost. That only works if it is regenerated when the source changes,
+which is why this is a script and not a manual paste.
+"""
+from __future__ import annotations
+
+import subprocess
+import time
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+OUT = ROOT / "docs" / "cbbwp-source.md"
+
+INCLUDE = [
+    ("pyproject.toml", "toml"),
+    ("README.md", "markdown"),
+]
+TREES = [("src/cbbwp", "py"), ("scripts", "py"), ("tests", "py")]
+# This script INCLUDES ITSELF. It used to be skipped, which meant the one
+# artifact whose entire purpose is "rebuild the project from the docs alone"
+# could not rebuild the thing that rebuilds it.
+SKIP = {"__pycache__"}
+# The web page and the CI workflow are source too: the viz is a shipped entry
+# point and tests/test_viz.py runs the page's own functions, and a recovered
+# copy with no workflow silently stops running the tests on every push.
+INCLUDE_EXTRA = [("web/index.html", "html"), (".github/workflows/tests.yml", "yaml")]
+
+
+def files() -> list[tuple[Path, str]]:
+    out = [(ROOT / n, lang) for n, lang in INCLUDE if (ROOT / n).exists()]
+    for tree, lang in TREES:
+        for p in sorted((ROOT / tree).rglob("*.py")):
+            if any(part in SKIP for part in p.parts) or p.name in SKIP:
+                continue
+            out.append((p, lang))
+    out += [(ROOT / n, lang) for n, lang in INCLUDE_EXTRA if (ROOT / n).exists()]
+    return out
+
+
+def main() -> None:
+    try:
+        head = subprocess.run(["git", "rev-parse", "--short", "HEAD"], cwd=ROOT,
+                              capture_output=True, text=True).stdout.strip()
+    except Exception:
+        head = "unknown"
+    parts = [
+        "# `cbbwp` source bundle",
+        # The absolute path is deliberately not recorded: this bundle is copied
+        # between machines, and a path from whichever one last regenerated it is
+        # noise at best and misleading at worst.
+        f"Complete source. Regenerated {time.strftime('%Y-%m-%d %H:%M')} from the "
+        f"`{ROOT.name}` working folder, at commit `{head}`.",
+        "",
+        "State rules v2, model v2. This bundle is a mirror for disaster recovery; the "
+        "folder is the source of truth (it also holds the data, the fitted model and the "
+        "git history). Regenerate with `python3 scripts/build_source_bundle.py` whenever "
+        "the source changes.",
+        "",
+        "See `cbbwp-EXPLAIN.md` for what every piece does and why.",
+        "",
+        "---",
+        "",
+    ]
+    for path, lang in files():
+        rel = path.relative_to(ROOT)
+        parts += [f"## `{rel}`", "", f"```{lang}", path.read_text().rstrip(), "```", ""]
+    OUT.write_text("\n".join(parts))
+    print(f"wrote {OUT} — {len(files())} files, {OUT.stat().st_size/1000:.0f} KB")
+
+
+if __name__ == "__main__":
+    main()
+```
+
 ## `scripts/build_team_stats.py`
 
 ```py
@@ -3631,11 +3993,32 @@ with open(ROOT / "artifacts/calibrator_v1.pkl", "wb") as f:
 
 raw = te["p_gbm"]
 calibrated = cal.transform(raw, secs)
-# endgame overrides need the margin, recovered from the saved feature column
+# The endgame overrides need the margin, which test_preds.npz does not carry, so
+# it is re-read from the states files. Those rows are matched to the predictions
+# BY GAME AND SEQ, not by position: a length check alone would let any future
+# change in concat or collect ordering line every probability up against the
+# wrong margin, silently, and the clamps would then fire on the wrong rows.
 import polars as pl
-margin = pl.concat([pl.scan_parquet(ROOT / f"data/proc/states/states_{s}.parquet")
-                    .select("margin") for s in (2025, 2026)], how="diagonal").collect()["margin"].to_numpy()
-assert len(margin) == len(y)
+states = pl.concat([pl.scan_parquet(ROOT / f"data/proc/states/states_{s}.parquet")
+                    .select("game_id", "seq", "margin") for s in (2025, 2026)],
+                   how="diagonal").collect()
+assert len(states) == len(y), (
+    f"{len(states):,} state rows for {len(y):,} predictions -- the states files "
+    "and test_preds.npz were not built from the same dataset")
+if "seq" in te.files:
+    order = pl.DataFrame({"game_id": te["game_id"], "seq": te["seq"],
+                          "_i": np.arange(len(y))})
+    joined = order.join(states, on=["game_id", "seq"], how="left").sort("_i")
+    assert joined["margin"].null_count() == 0, "some predictions have no state row"
+    margin = joined["margin"].to_numpy()
+else:
+    # Older test_preds.npz files carry game_id but not seq. Verify what can be
+    # verified -- that the games line up in the same order -- rather than
+    # assuming the row order matches.
+    assert np.array_equal(states["game_id"].to_numpy(), te["game_id"]), (
+        "state rows are not in the same game order as test_preds.npz; rebuild "
+        "with scripts/rebuild_test_preds.py so the margins can be aligned")
+    margin = states["margin"].to_numpy()
 final = endgame.apply(calibrated, margin, secs)
 
 rows = {
@@ -3668,7 +4051,7 @@ np.savez_compressed(ROOT / "artifacts/final_preds.npz", y=y, p=final, secs=secs,
 ## `scripts/calibration_monitor.py`
 
 ```py
-"""Weekly calibration drift check. Exit code 1 means "look at this".
+r"""Weekly calibration drift check. Exit code 1 means "look at this".
 
 Two sources, same check:
 
@@ -3745,7 +4128,18 @@ def from_live(args):
                 rows.append(json.loads(line))
     if not rows:
         raise SystemExit("live files are empty")
-    live = pl.DataFrame(rows).select(
+    # Rehearsal rows are tagged at the source (live_poller.decorate). Tagging
+    # them is only worth anything if the consumer that grades the model actually
+    # looks: a replayed archive would otherwise be scored as if it were a night
+    # of real games, and counted twice alongside the backtest.
+    replayed = [r for r in rows if r.get("replay")]
+    if replayed:
+        print(f"note: {len(replayed):,} replay rows skipped (rehearsal, not live)",
+              file=sys.stderr)
+        rows = [r for r in rows if not r.get("replay")]
+    if not rows:
+        raise SystemExit("every live row was tagged as a replay; nothing to check")
+    live = pl.DataFrame(rows, infer_schema_length=None).select(
         "game_id", "home_win_prob", "game_seconds_remaining")
     games = pl.read_parquet(ROOT / "data/proc/games.parquet").select(
         "game_id", "home_win")
@@ -3826,6 +4220,8 @@ if not files:
 unknown = collections.Counter()
 problems = 0
 n_synth = 0
+total_inversions = 0
+total_bad_clocks = 0
 for f in files:
     payload = json.loads(f.read_text())
     synthetic = espn.is_synthetic_payload(payload)
@@ -3834,6 +4230,14 @@ for f in files:
     events, h = espn.parse_summary(payload)
     ctx = PregameContext(h.game_id, h.home_team_id, h.away_team_id, h.neutral_site)
     states = build_states(events, ctx)
+
+    # Two feed-shape signals the adapter deliberately reports rather than
+    # repairs. Neither is fatal on its own, so they do not fail the run -- but
+    # they are the evidence somebody needs when a number looks wrong later.
+    inversions = espn.chronological_inversions(events)
+    bad_clocks = espn.clock_parse_failures(raw_plays)
+    total_inversions += inversions
+    total_bad_clocks += bad_clocks
 
     for p in raw_plays:
         t = p.get("type") or {}
@@ -3859,6 +4263,8 @@ for f in files:
     problems += 0 if ok else 1
     print(f"{'ok  ' if ok else 'BAD '}{f.name:<28} {h.away_name} @ {h.home_name}  "
           f"{h.status}  {len(events):,} plays, {len(states):,} states"
+          + (f"   [{inversions} out of clock order]" if inversions else "")
+          + (f"   [{bad_clocks} unparseable clock(s)]" if bad_clocks else "")
           + ("   [REBUILT FROM hoopR - not evidence about ESPN]" if synthetic else ""))
 
 # A payload rebuilt from hoopR carries hoopR's own type ids, and the model's type
@@ -3871,6 +4277,22 @@ if n_synth:
         print("Every payload here is a rebuild, so the unknown-play-type check below\n"
               "CANNOT FAIL and proves nothing about what ESPN is sending. Record real\n"
               "payloads with scripts/record_espn_fixtures.py on a night with games.")
+
+if total_inversions or total_bad_clocks:
+    print("\nFEED SHAPE SIGNALS (reported, never silently repaired):")
+    if total_inversions:
+        print(f"  {total_inversions:,} play(s) sit earlier in game time than the "
+              "play before them.\n"
+              "  The adapter preserves the feed's order; an unreliable key cannot "
+              "fix a bad\n  feed, only corrupt a good one. See EXPLAIN 8.8b.")
+    if total_bad_clocks:
+        print(f"  {total_bad_clocks:,} play(s) carry a clock string this build "
+              "cannot parse.\n"
+              "  Those are scored as 0:00, and a 0:00 in the second half lets the "
+              "endgame\n  clamp publish near-certainty. Check the feed's clock "
+              "format before going live.")
+else:
+    print("\nno feed-shape problems - every play parses and the order is chronological")
 
 if unknown:
     print("\nPLAY TYPES THE MODEL HAS NEVER SEEN "
@@ -4025,9 +4447,15 @@ def annotate(df: pl.DataFrame) -> pl.DataFrame:
 
     # A trip is a run of free throws by one team at one dead ball.
     ft = pl.col("isft")
-    prev_i = pl.when(ft).then(pl.col("i")).otherwise(None).forward_fill().over("game_id").shift(1)
-    prev_team = pl.when(ft).then(pl.col("team_id")).otherwise(None).forward_fill().over("game_id").shift(1)
-    prev_sec = pl.when(ft).then(pl.col("sec")).otherwise(None).forward_fill().over("game_id").shift(1)
+    # `.shift(1)` must be INSIDE the per-game window, not after it. Outside, the
+    # first free throw of a game compares itself against the last free throw of
+    # the previous game in the frame -- which happens to be harmless today only
+    # because the `(i - prev_i) > 8` guard catches it (i is a season-global row
+    # index, so the gap across a game boundary is enormous). That is an accident,
+    # not a property, and it would break the moment `i` became per-game.
+    prev_i = pl.when(ft).then(pl.col("i")).otherwise(None).forward_fill().shift(1).over("game_id")
+    prev_team = pl.when(ft).then(pl.col("team_id")).otherwise(None).forward_fill().shift(1).over("game_id")
+    prev_sec = pl.when(ft).then(pl.col("sec")).otherwise(None).forward_fill().shift(1).over("game_id")
     new_trip = ft & (
         prev_i.is_null()
         | (pl.col("team_id") != prev_team)
@@ -4065,11 +4493,14 @@ def _nk(frame: pl.DataFrame, col: str = "scoring_play") -> dict:
     return {"n": int(len(frame)), "k": int(frame[col].sum()) if len(frame) else 0}
 
 
-def trip_kind() -> pl.Expr:
+def trip_kind(andone: str = "andone", n_shots: str = "n_shots",
+              opp_fouls: str = "opp_fouls") -> pl.Expr:
+    """Classify a free-throw trip. Column names are arguments so the inputs can
+    be resolved PER TRIP rather than per row -- see `count_season`."""
     return (
-        pl.when(pl.col("andone")).then(pl.lit("and_one"))
-        .when(pl.col("n_shots") >= 3).then(pl.lit("shooting_3"))
-        .when((pl.col("opp_fouls") >= BONUS_FOULS) & (pl.col("opp_fouls") < DOUBLE_BONUS_FOULS))
+        pl.when(pl.col(andone)).then(pl.lit("and_one"))
+        .when(pl.col(n_shots) >= 3).then(pl.lit("shooting_3"))
+        .when((pl.col(opp_fouls) >= BONUS_FOULS) & (pl.col(opp_fouls) < DOUBLE_BONUS_FOULS))
         .then(pl.lit("one_and_one"))
         .otherwise(pl.lit("two_shot"))
     )
@@ -4082,8 +4513,18 @@ def count_season(df: pl.DataFrame) -> dict:
     ft = df.filter(pl.col("isft")).with_columns(
         pl.col("i").rank("ordinal").over(["game_id", "trip"]).alias("shot_no")
     )
-    sizes = ft.group_by(["game_id", "trip"]).agg(pl.len().alias("n_shots"))
-    ft = ft.join(sizes, on=["game_id", "trip"], how="left").with_columns(trip_kind().alias("kind"))
+    # A trip has ONE kind. Classifying per row let a single trip call its first
+    # shot `and_one` and its second `two_shot`, splitting one trip's shots
+    # across two free-throw-rate cells and quietly contaminating both. Both
+    # inputs are therefore resolved per trip: `andone` is a property of the
+    # whole trip, and the bonus state is read at the trip's first shot.
+    sizes = ft.group_by(["game_id", "trip"]).agg([
+        pl.len().alias("n_shots"),
+        pl.col("andone").any().alias("trip_andone"),
+        pl.col("opp_fouls").sort_by("i").first().alias("trip_opp_fouls"),
+    ])
+    ft = ft.join(sizes, on=["game_id", "trip"], how="left").with_columns(
+        trip_kind("trip_andone", "n_shots", "trip_opp_fouls").alias("kind"))
 
     windows = {
         "all_game": pl.lit(True),
@@ -4358,16 +4799,42 @@ def runs_for_season(season: int) -> pl.DataFrame:
     )
     d = st.join(pbp, on=["game_id", "seq"], how="inner").sort(["game_id", "seq"])
 
-    # A run is a maximal stretch with the same possession value. 0.5 (jump ball,
-    # genuinely unknown) is carried forward rather than treated as its own run.
+    # A run is a maximal stretch during which ONE team had the ball. 0.5 (jump
+    # ball, genuinely unknown) is carried forward rather than treated as its own
+    # run.
     d = d.with_columns(pl.col("possession").replace(0.5, None).forward_fill().over("game_id"))
+
+    # Segment on the possession DURING each event, which is the state the
+    # PREVIOUS event left behind -- not `possession`, which is the state AFTER
+    # this one.
+    #
+    # This is the difference between measuring endgame fouling and measuring its
+    # mirror image. `state._possession_after` flips possession on every MADE free
+    # throw, so segmenting on the after-value cut each made free-throw trip out
+    # of the fouled team's run and pasted it onto the head of the FOULING team's
+    # next run. `fouled_to_line` below - the single most important parameter in
+    # the simulator, the one that makes an endgame an endgame - was therefore
+    # recorded against the team that committed the foul rather than the team that
+    # shot the free throws.
+    #
+    # The result was inverted and obviously so, once looked at: in the last ten
+    # seconds it had a TRAILING offence reaching the line 71-84% of the time and
+    # a LEADING offence 10-18%, when in real basketball it is the trailing
+    # defence that fouls the leading ball-handler. Fixed 2026-09-08.
     d = d.with_columns(
-        (pl.col("possession") != pl.col("possession").shift(1).over("game_id"))
+        pl.col("possession").shift(1).over("game_id").alias("poss_during")
+    )
+    # An unknown possession at the start of the window is not guessed at. These
+    # rows used to fall through the `otherwise` branch below and be recorded
+    # silently as the away team's.
+    d = d.filter(pl.col("poss_during").is_not_null())
+    d = d.with_columns(
+        (pl.col("poss_during") != pl.col("poss_during").shift(1).over("game_id"))
         .fill_null(True).cast(pl.Int32).cum_sum().over("game_id").alias("run")
     )
     g = d.group_by(["game_id", "run"]).agg(
         [
-            pl.first("possession").alias("off_is_home"),
+            pl.first("poss_during").alias("off_is_home"),
             pl.first("margin").alias("margin_start"),
             pl.first("game_seconds_remaining").alias("t_start"),
             pl.last("game_seconds_remaining").alias("t_end"),
@@ -4543,8 +5010,33 @@ for r in calibration_table(y, d["p_gbm"]):
 
 The only reachable source: raw.githubusercontent.com. Re-run is idempotent;
 existing files are skipped unless --force.
+
+    python3 scripts/fetch_data.py                  # everything, ~527 MB
+    python3 scripts/fetch_data.py --seasons 2025   # one season
+    python3 scripts/fetch_data.py --record         # write CHECKSUMS.json
+    python3 scripts/fetch_data.py --verify         # check what is already here
+
+**On checksums.** Every claim this project makes about reproducing a model bit
+for bit rests on the inputs being the same bytes, and hoopR is a live repository
+that can be rebuilt upstream at any time. `--record` writes the sha256 of each
+file to `data_checksums.json`; after that, a normal run verifies each file it
+downloads against that record and says so loudly when they disagree. Without it
+"rebuilt byte-identically" is only checkable against a machine that still has
+the original download.
+
+That file lives at the repository root, and is COMMITTED, on purpose: under
+`data/` it would be gitignored along with everything else there, which would
+leave it useful only on the machine that wrote it - exactly the situation it
+exists to fix.
 """
-import argparse, pathlib, sys, urllib.request, time
+import argparse
+import hashlib
+import json
+import pathlib
+import shutil
+import sys
+import time
+import urllib.request
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 SEASONS = [2016, 2017, 2018, 2019, 2021, 2022, 2023, 2024, 2025, 2026]
@@ -4552,28 +5044,117 @@ BASE = "https://raw.githubusercontent.com/sportsdataverse/hoopR-mbb-data/main/mb
 PBP = BASE + "/pbp/parquet/play_by_play_{y}.parquet"
 SCHED = BASE + "/schedules/parquet/mbb_schedule_{y}.parquet"
 
+# A stalled socket on a 90 MB download used to hang the whole fetch forever.
+TIMEOUT_SECONDS = 120
+CHECKSUMS = ROOT / "data_checksums.json"
 
-def get(url: str, dest: pathlib.Path, force: bool) -> None:
+
+def sha256(path: pathlib.Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def load_checksums() -> dict:
+    if CHECKSUMS.exists():
+        return json.loads(CHECKSUMS.read_text())
+    return {}
+
+
+def get(url: str, dest: pathlib.Path, force: bool, known: dict) -> bool:
+    """Download `dest` unless it is already there. Returns True if it is usable."""
     if dest.exists() and not force:
         print(f"  skip {dest.name} ({dest.stat().st_size/1e6:.0f} MB)")
-        return
+        return True
     dest.parent.mkdir(parents=True, exist_ok=True)
     t0 = time.time()
     tmp = dest.with_suffix(".part")
-    urllib.request.urlretrieve(url, tmp)
+    try:
+        # urlretrieve has no timeout parameter, so a stalled connection hangs
+        # indefinitely. urlopen does.
+        with urllib.request.urlopen(url, timeout=TIMEOUT_SECONDS) as r, \
+                tmp.open("wb") as out:
+            shutil.copyfileobj(r, out)
+    except Exception as e:                              # noqa: BLE001
+        tmp.unlink(missing_ok=True)
+        print(f"  FAIL {dest.name} -- {type(e).__name__}: {e}", file=sys.stderr)
+        return False
+
+    digest = sha256(tmp)
+    expected = known.get(dest.name)
+    if expected and digest != expected:
+        tmp.unlink(missing_ok=True)
+        print(f"  FAIL {dest.name} -- sha256 {digest[:16]} does not match the "
+              f"recorded {expected[:16]}.\n"
+              "       hoopR rebuilt this file upstream. That is not necessarily "
+              "wrong, but it\n"
+              "       means a refit will not reproduce the pinned model. Delete "
+              "the entry in\n"
+              f"       {CHECKSUMS.name} and re-record if the new data is what you want.",
+              file=sys.stderr)
+        return False
+
     tmp.rename(dest)
-    print(f"  got  {dest.name} ({dest.stat().st_size/1e6:.0f} MB, {time.time()-t0:.0f}s)")
+    print(f"  got  {dest.name} ({dest.stat().st_size/1e6:.0f} MB, "
+          f"{time.time()-t0:.0f}s, sha256 {digest[:16]})")
+    return True
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--seasons", type=int, nargs="*", default=SEASONS)
+    ap.add_argument("--force", action="store_true")
+    ap.add_argument("--record", action="store_true",
+                    help="write data/raw/CHECKSUMS.json for what is on disk")
+    ap.add_argument("--verify", action="store_true",
+                    help="check files already on disk against CHECKSUMS.json")
+    a = ap.parse_args()
+
+    known = load_checksums()
+
+    if a.verify:
+        if not known:
+            raise SystemExit(f"no {CHECKSUMS} to verify against -- run --record first")
+        bad = 0
+        for name, expected in sorted(known.items()):
+            p = next(ROOT.joinpath("data/raw").rglob(name), None)
+            if p is None:
+                print(f"  MISSING {name}")
+                bad += 1
+                continue
+            actual = sha256(p)
+            ok = actual == expected
+            print(f"  {'ok  ' if ok else 'BAD '}{name}  {actual[:16]}")
+            bad += 0 if ok else 1
+        print(f"\n{len(known) - bad}/{len(known)} files match")
+        return 1 if bad else 0
+
+    failures = 0
+    for y in a.seasons:
+        print(y)
+        failures += not get(PBP.format(y=y), ROOT / f"data/raw/pbp/pbp_{y}.parquet",
+                            a.force, known)
+        failures += not get(SCHED.format(y=y), ROOT / f"data/raw/sched/sched_{y}.parquet",
+                            a.force, known)
+
+    if a.record:
+        rec = {}
+        for p in sorted(ROOT.joinpath("data/raw").rglob("*.parquet")):
+            rec[p.name] = sha256(p)
+        CHECKSUMS.parent.mkdir(parents=True, exist_ok=True)
+        CHECKSUMS.write_text(json.dumps(rec, indent=2, sort_keys=True))
+        print(f"\nrecorded {len(rec)} checksums in {CHECKSUMS}")
+
+    if failures:
+        print(f"\n{failures} download(s) failed", file=sys.stderr)
+    return 1 if failures else 0
 
 
 if __name__ == "__main__":
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--seasons", type=int, nargs="*", default=SEASONS)
-    ap.add_argument("--force", action="store_true")
-    a = ap.parse_args()
-    for y in a.seasons:
-        print(y)
-        get(PBP.format(y=y), ROOT / f"data/raw/pbp/pbp_{y}.parquet", a.force)
-        get(SCHED.format(y=y), ROOT / f"data/raw/sched/sched_{y}.parquet", a.force)
+    raise SystemExit(main())
 ```
 
 ## `scripts/fit_models.py`
@@ -4715,9 +5296,10 @@ from typing import Dict, Optional
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "src"))
 
-from cbbwp.adapters.espn import (EspnClient, parse_summary, scoreboard_games,
-                                 STATUS_FINAL, STATUS_PRE)
-from cbbwp.live_context import LiveContextProvider
+from cbbwp.adapters.espn import (EspnClient, chronological_inversions,
+                                 clock_parse_failures, parse_summary,
+                                 scoreboard_games, STATUS_FINAL, STATUS_PRE)
+from cbbwp.live_context import ReloadingContextProvider
 from cbbwp.serve import WinProbabilityService
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -4741,6 +5323,24 @@ MAX_CONCURRENT_FETCHES = 8
 ERROR_BACKOFF = (5.0, 15.0, 45.0, 90.0)   # per consecutive failure
 
 
+def default_out_path(live_dir: pathlib.Path, day: str,
+                     is_replay: bool) -> pathlib.Path:
+    """Where emitted rows go when the caller did not name a file.
+
+    A dry run against scripts/replay_server.py must never write into the live
+    record. The JSONL is appended to and never rewritten, so simulated states
+    put there would sit in the durable record permanently.
+
+    Both entry points (this module and serve_live.py) route through here, so
+    they cannot disagree about it -- the diversion used to live only in
+    serve_live.py, which left `python3 scripts/live_poller.py` under
+    CBBWP_ESPN_BASE writing replay rows straight into data/live/.
+    """
+    if is_replay:
+        return live_dir.parent / "replay" / f"wp_{day}.jsonl"
+    return live_dir / f"wp_{day}.jsonl"
+
+
 class Poller:
     def __init__(self, svc: WinProbabilityService, ctx: LiveContextProvider,
                  client: EspnClient, out_path: pathlib.Path, quiet: bool = False,
@@ -4759,6 +5359,8 @@ class Poller:
         self.sem = asyncio.Semaphore(MAX_CONCURRENT_FETCHES)
         self.watchers: Dict[int, asyncio.Task] = {}
         self.last_emitted: Dict[int, tuple] = {}
+        self.inversions: Dict[int, int] = {}
+        self.bad_clocks: Dict[int, int] = {}
         self.stopping = asyncio.Event()
         out_path.parent.mkdir(parents=True, exist_ok=True)
         self._fh = out_path.open("a", buffering=1)
@@ -4778,7 +5380,35 @@ class Poller:
         async with self.sem:
             return await asyncio.to_thread(self.client.scoreboard, date)
 
-    def emit(self, row: dict, header) -> None:
+    def decorate(self, row: dict, header, inversions: int = 0,
+                 bad_clocks: int = 0) -> dict:
+        """Stamp a scored row with the provenance every durable row must carry.
+
+        One place, so a row written by the single-poll path cannot be missing
+        the tags a row written by the watch loop has. The smoke test's step 7
+        used to write rows with no timestamp, no status and -- in replay mode --
+        no `replay` flag, into the same file as the real feed.
+        """
+        out = dict(row)
+        out["ts"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        out["home_team_id"] = header.home_team_id
+        out["away_team_id"] = header.away_team_id
+        out["status"] = header.status
+        # A simulated row must never be mistakable for a real one. The JSONL is
+        # the record of truth, and it is appended to, so an untagged dry run
+        # would leave fake states in the durable record permanently.
+        if self.client.is_replay:
+            out["replay"] = True
+        # Evidence, in the durable record, that the feed arrived out of clock
+        # order. The adapter deliberately does not repair disorder, so the only
+        # honest thing to do with it is carry it forward.
+        if inversions:
+            out["feed_inversions"] = int(inversions)
+        if bad_clocks:
+            out["feed_bad_clocks"] = int(bad_clocks)
+        return out
+
+    def _write(self, row: dict) -> None:
         self._fh.write(json.dumps(row) + "\n")
         if self.sink is not None:
             try:
@@ -4787,6 +5417,9 @@ class Poller:
                 # A failing view must never take down the feed.
                 print(f"sink failed ({type(e).__name__}: {e})",
                       file=sys.stderr, flush=True)
+
+    def emit(self, row: dict, header) -> None:
+        self._write(row)
         if self.quiet:
             return
         secs = row["game_seconds_remaining"]
@@ -4816,6 +5449,31 @@ class Poller:
                 await self._sleep(wait)
                 continue
 
+            # The adapter preserves the feed's array order and does NOT repair
+            # disorder, so this is the only place anybody would ever find out
+            # that ESPN sent one. Report it once per game, and again only if it
+            # gets worse.
+            inversions = chronological_inversions(events) if events else 0
+            if inversions and self.inversions.get(game_id, 0) < inversions:
+                print(f"[{game_id}] WARNING: {inversions} play(s) arrived out of "
+                      "clock order; states are built in the feed's own order "
+                      "and are NOT rearranged (see adapters/espn.py)",
+                      file=sys.stderr, flush=True)
+            self.inversions[game_id] = max(self.inversions.get(game_id, 0),
+                                           inversions)
+
+            # A clock the adapter cannot read becomes 0, and a 0 in the second
+            # half means "game over" to the endgame clamp. Say so loudly rather
+            # than publishing a confident number built on a fabricated clock.
+            bad_clocks = clock_parse_failures(summary.get("plays") or [])
+            if bad_clocks and self.bad_clocks.get(game_id, 0) < bad_clocks:
+                print(f"[{game_id}] WARNING: {bad_clocks} play(s) carry a clock "
+                      "this build cannot parse; they are being scored as 0:00 "
+                      "-- the feed format may have changed",
+                      file=sys.stderr, flush=True)
+            self.bad_clocks[game_id] = max(self.bad_clocks.get(game_id, 0),
+                                           bad_clocks)
+
             if events:
                 pctx = self.ctx.context_for(
                     game_id, header.home_team_id, header.away_team_id,
@@ -4823,22 +5481,12 @@ class Poller:
                 rows = self.svc.score_game(events, pctx)
                 if rows:
                     last = rows[-1]
-                    key = (last["seq"], round(last["home_win_prob"], 6))
+                    key = (last["seq"], round(last["home_win_prob"], 6),
+                           header.status)
                     if self.last_emitted.get(game_id) != key:
                         self.last_emitted[game_id] = key
-                        last = dict(last)
-                        last["ts"] = datetime.datetime.now(
-                            datetime.timezone.utc).isoformat()
-                        last["home_team_id"] = header.home_team_id
-                        last["away_team_id"] = header.away_team_id
-                        last["status"] = header.status
-                        # A simulated row must never be mistakable for a real
-                        # one. The JSONL is the record of truth, and it is
-                        # appended to, so an untagged dry run would leave fake
-                        # states in the durable record permanently.
-                        if self.client.is_replay:
-                            last["replay"] = True
-                        self.emit(last, header)
+                        self.emit(self.decorate(last, header, inversions,
+                                                bad_clocks), header)
                     secs = last["game_seconds_remaining"]
                 else:
                     secs = None
@@ -4850,6 +5498,8 @@ class Poller:
                     print(f"[{game_id}] final: {header.away_name} "
                           f"{header.away_score} @ {header.home_name} "
                           f"{header.home_score}", flush=True)
+                self.last_emitted.pop(game_id, None)
+                self.inversions.pop(game_id, None)
                 return
             await self._sleep(poll_interval(secs, header.is_live))
 
@@ -4912,13 +5562,19 @@ class Poller:
         if not self.ctx.known(header.away_team_id):
             print(f"  note: away team id {header.away_team_id} not in the ratings "
                   "snapshot; using league average")
+        inversions = chronological_inversions(events)
+        if inversions:
+            print(f"  WARNING: {inversions} play(s) arrived out of clock order")
+        bad_clocks = clock_parse_failures(summary.get("plays") or [])
+        if bad_clocks:
+            print(f"  WARNING: {bad_clocks} play(s) carry an unparseable clock")
         for r in rows[-10:]:
             mm, ss = divmod(int(r["game_seconds_remaining"]), 60)
             print(f"  P{r['period']} {mm:>2}:{ss:02d}  margin {r['margin']:>+4}  "
                   f"home {r['home_win_prob']:.4f}")
-            self._fh.write(json.dumps(r) + "\n")
-            if self.sink is not None:
-                self.sink(r)
+            # Through decorate/_write, so a single-poll row carries the same
+            # provenance -- timestamp, status, replay tag -- as a watched one.
+            self._write(self.decorate(r, header, inversions, bad_clocks))
 
     def close(self) -> None:
         self._fh.close()
@@ -4944,15 +5600,23 @@ def main() -> int:
         print(f"no ratings snapshot at {ctx_path}\n"
               "  run: python3 scripts/build_live_context.py", file=sys.stderr)
         return 2
-    ctx = LiveContextProvider.load(ctx_path)
+    ctx = ReloadingContextProvider(ctx_path)
     if ctx.is_stale:
         print(f"warning: ratings snapshot is {ctx.age_days:.1f} days old; "
               "re-run scripts/build_live_context.py", file=sys.stderr)
 
     svc = WinProbabilityService(a.registry, a.version)
     day = a.date or datetime.datetime.now().strftime("%Y%m%d")
-    out = pathlib.Path(a.out) if a.out else ROOT / f"data/live/wp_{day}.jsonl"
-    poller = Poller(svc, ctx, EspnClient(), out, quiet=a.quiet,
+    client = EspnClient()
+    # An explicit --out is honoured as given; otherwise a replay run is diverted
+    # away from the live record. See default_out_path.
+    out = (pathlib.Path(a.out) if a.out
+           else default_out_path(ROOT / "data" / "live", day, client.is_replay))
+    if client.is_replay:
+        print(f"*** REPLAY MODE -- reading {client.base_url}, NOT ESPN.\n"
+              f"*** Rows are tagged \"replay\": true and written to {out}",
+              file=sys.stderr, flush=True)
+    poller = Poller(svc, ctx, client, out, quiet=a.quiet,
                     fixture_dir=pathlib.Path(a.fixture_dir) if a.fixture_dir else None)
 
     loop = asyncio.new_event_loop()
@@ -4978,25 +5642,89 @@ if __name__ == "__main__":
 ## `scripts/publish_model.py`
 
 ```py
-"""Write an immutable, pinned model artifact into the registry."""
-import sys, pathlib, json, shutil, hashlib, datetime
+"""Write an immutable, pinned model artifact into the registry.
+
+    python3 scripts/publish_model.py v3
+    python3 scripts/publish_model.py v3 --from artifacts/gbm_v1.txt
+    python3 scripts/publish_model.py v2 --force        # deliberate re-publish
+
+Two things this refuses to do, because "immutable and pinned" has to be enforced
+somewhere or it is only a description:
+
+  * overwrite an existing version without --force. A registry directory is what
+    a running deployment loads by name; silently replacing one means the same
+    version string refers to two different models, and every number ever
+    recorded against it becomes ambiguous.
+  * publish a source file it cannot find, or one whose hash it cannot record.
+
+The version label is just a label: it does NOT constrain which fit gets copied.
+`--from` is explicit so the binding between a label and a particular fit is at
+least visible in the shell history, and the manifest records the source path and
+the file's modification time so a published artifact can be traced back.
+"""
+import argparse
+import datetime
+import hashlib
+import json
+import pathlib
+import shutil
+import sys
+
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "src"))
-from cbbwp.schemas import FEATURE_NAMES, STATE_RULES_VERSION
+from cbbwp.schemas import FEATURE_NAMES, STATE_RULES_VERSION  # noqa: E402
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
-version = sys.argv[1] if len(sys.argv) > 1 else "v1"
-dest = ROOT / "registry" / version
+
+ap = argparse.ArgumentParser(description=__doc__,
+                             formatter_class=argparse.RawDescriptionHelpFormatter)
+ap.add_argument("version", nargs="?", default="v1", help="registry version to write")
+ap.add_argument("--from", dest="source", default=str(ROOT / "artifacts/gbm_v1.txt"),
+                help="the fitted booster to publish (default: artifacts/gbm_v1.txt)")
+ap.add_argument("--force", action="store_true",
+                help="replace an existing registry version (it is meant to be immutable)")
+ap.add_argument("--notes", default="", help="free text recorded in the manifest")
+a = ap.parse_args()
+
+src = pathlib.Path(a.source)
+if not src.exists():
+    raise SystemExit(f"no such model file: {src}\n"
+                     "  run scripts/fit_models.py first, or pass --from")
+
+dest = ROOT / "registry" / a.version
+model_path = dest / "model.txt"
+if model_path.exists() and not a.force:
+    existing = hashlib.sha256(model_path.read_bytes()).hexdigest()[:16]
+    incoming = hashlib.sha256(src.read_bytes()).hexdigest()[:16]
+    if existing == incoming:
+        print(f"{a.version} already holds this exact model ({existing}); nothing to do")
+        raise SystemExit(0)
+    raise SystemExit(
+        f"refusing to overwrite registry/{a.version}\n"
+        f"  it holds {existing}, you are publishing {incoming}\n"
+        "  A version is a name a deployment loads; two models under one name makes\n"
+        "  every recorded number against it ambiguous. Publish a new version, or\n"
+        "  pass --force if replacing it is genuinely what you mean.")
+
 dest.mkdir(parents=True, exist_ok=True)
-shutil.copy(ROOT / "artifacts/gbm_v1.txt", dest / "model.txt")
-digest = hashlib.sha256((dest / "model.txt").read_bytes()).hexdigest()[:16]
-(dest / "manifest.json").write_text(json.dumps({
-    "version": version, "kind": "lightgbm", "features": FEATURE_NAMES,
+shutil.copy(src, model_path)
+digest = hashlib.sha256(model_path.read_bytes()).hexdigest()[:16]
+manifest = {
+    "version": a.version, "kind": "lightgbm", "features": FEATURE_NAMES,
     "state_rules_version": STATE_RULES_VERSION,
-    "sha256": digest, "created": datetime.datetime.now(datetime.UTC).isoformat(),
+    "sha256": digest,
+    "created": datetime.datetime.now(datetime.UTC).isoformat(),
+    # Provenance: which file this came from, and when that file was written.
+    # Without it, "publish_model.py v3" records nothing about WHICH fit it took.
+    "source_path": str(src.relative_to(ROOT)) if src.is_relative_to(ROOT) else str(src),
+    "source_mtime": datetime.datetime.fromtimestamp(
+        src.stat().st_mtime, datetime.UTC).isoformat(),
     "train_seasons": [2016, 2017, 2018, 2019, 2021, 2022, 2023],
     "calibration_season": 2024, "test_seasons": [2025, 2026],
-}, indent=2))
-print("published", dest, digest)
+}
+if a.notes:
+    manifest["notes"] = a.notes
+(dest / "manifest.json").write_text(json.dumps(manifest, indent=2))
+print("published", dest, digest, "from", src)
 ```
 
 ## `scripts/rebuild_test_preds.py`
@@ -5041,7 +5769,12 @@ def main() -> None:
               for s in TEST_SEASONS]
     te = (pl.concat(frames)
           .select(FEATURE_NAMES + [c for c in
-                  ["home_win", "game_seconds_remaining", "espn_wp", "game_id", "season"]
+                  ["home_win", "game_seconds_remaining", "espn_wp", "game_id",
+                   # `seq` is carried so downstream scripts can join back to the
+                   # state rows by identity instead of by position. Without it
+                   # calibrate_and_eval.py can only check that the row COUNTS
+                   # match before pairing probabilities with margins.
+                   "seq", "season"]
                   if c not in FEATURE_NAMES])
           .collect())
     X = te.select(FEATURE_NAMES).to_numpy().astype(np.float32)
@@ -5080,7 +5813,8 @@ def main() -> None:
         p_lr=p_lr, p_gbm=p_gbm,
         secs=te["game_seconds_remaining"].to_numpy(),
         espn=te["espn_wp"].to_numpy().astype(np.float64),
-        game_id=te["game_id"].to_numpy(), season=te["season"].to_numpy())
+        game_id=te["game_id"].to_numpy(), seq=te["seq"].to_numpy(),
+        season=te["season"].to_numpy())
     print(f"wrote {OUT}  ({len(te):,} rows, {OUT.stat().st_size/1e6:.1f} MB)")
 
 
@@ -5534,11 +6268,11 @@ sys.path.insert(0, str(ROOT / "src"))
 from cbbwp.adapters.espn import EspnClient          # noqa: E402
 from cbbwp.api import LiveStore, serve_in_thread    # noqa: E402
 from cbbwp.config import Settings                   # noqa: E402
-from cbbwp.live_context import LiveContextProvider  # noqa: E402
+from cbbwp.live_context import ReloadingContextProvider  # noqa: E402
 from cbbwp.serve import WinProbabilityService       # noqa: E402
 
 sys.path.insert(0, str(ROOT / "scripts"))
-from live_poller import Poller                      # noqa: E402
+from live_poller import Poller, default_out_path    # noqa: E402
 
 
 def main() -> int:
@@ -5559,7 +6293,13 @@ def main() -> int:
               "  run: python3 scripts/build_live_context.py --season <year>",
               file=sys.stderr)
         return 2
-    ctx = LiveContextProvider.load(cfg.context_path)
+    # Reloading, not load-once: the ratings snapshot is rebuilt by a separate
+    # daily job while this process stays up for weeks. See ReloadingContextProvider.
+    ctx = ReloadingContextProvider(
+        cfg.context_path,
+        on_reload=lambda p: print(
+            f"ratings snapshot reloaded: generated {p.generated}, "
+            f"{len(p.ratings)} teams", flush=True))
     if ctx.data_is_stale:
         print(f"warning: ratings were fit on stale data -- newest completed game is "
               f"{ctx.data_age_days:.1f} days old.\n"
@@ -5575,15 +6315,14 @@ def main() -> int:
     svc = WinProbabilityService(cfg.registry, cfg.model_version)
 
     day = a.date or datetime.datetime.now().strftime("%Y%m%d")
-    out = cfg.live_dir / f"wp_{day}.jsonl"
 
     # A dry run against scripts/replay_server.py is a rehearsal, not a night of
     # basketball. Say so loudly, and default its output somewhere separate, so
-    # simulated states cannot silently accumulate in the real record.
+    # simulated states cannot silently accumulate in the real record. The rule
+    # itself lives in live_poller.default_out_path, so both entry points share it.
     client = EspnClient()
+    out = default_out_path(cfg.live_dir, day, client.is_replay)
     if client.is_replay:
-        if cfg.live_dir == pathlib.Path(cfg.root) / "data" / "live":
-            out = pathlib.Path(cfg.root) / "data" / "replay" / f"wp_{day}.jsonl"
         print(f"\n*** REPLAY MODE -- reading {client.base_url}, NOT ESPN.\n"
               f"*** Rows are tagged \"replay\": true and written to {out}\n",
               flush=True)
@@ -5667,6 +6406,7 @@ Endpoints (all JSON except `/`):
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import pathlib
 import sys
@@ -5682,7 +6422,7 @@ sys.path.insert(0, str(ROOT / "src"))
 from cbbwp.adapters.espn import (EspnClient, is_synthetic_payload,  # noqa: E402
                                  parse_summary)
 from cbbwp.config import Settings                           # noqa: E402
-from cbbwp.live_context import LiveContextProvider          # noqa: E402
+from cbbwp.live_context import ReloadingContextProvider     # noqa: E402
 from cbbwp.serve import WinProbabilityService               # noqa: E402
 
 PAGE = ROOT / "web" / "index.html"
@@ -5711,19 +6451,35 @@ class Scorer:
 
     def __init__(self, cfg: Settings):
         self.svc = WinProbabilityService(cfg.registry, cfg.model_version)
-        self.ctx = LiveContextProvider.load(cfg.context_path)
-        self.cache: dict[int, dict] = {}
+        self.ctx = ReloadingContextProvider(cfg.context_path)
+        # game_id -> (fingerprint of the plays it was scored from, result)
+        self.cache: dict[int, tuple[str, dict]] = {}
         self.lock = threading.Lock()
 
     def summary_of(self, path: pathlib.Path) -> dict:
         return json.loads(path.read_text())
 
+    @staticmethod
+    def fingerprint(payload: dict) -> str:
+        """What a scored game is a function of: the plays, exactly.
+
+        Keying the cache on the game id alone made `/api/fetch/<id>` a no-op on
+        the second call -- it would pull a fresh payload from ESPN, archive it,
+        and then hand back the scored version of the payload it had seen first,
+        silently discarding every play added since. That is precisely wrong for
+        the one case the fetch button exists to serve: a game still in progress.
+        """
+        return hashlib.sha256(
+            json.dumps(payload.get("plays") or [], sort_keys=True,
+                       separators=(",", ":")).encode()).hexdigest()
+
     def score(self, game_id: int, payload: dict) -> dict:
         """One archived payload -> everything the page needs to draw the game."""
+        fp = self.fingerprint(payload)
         with self.lock:
             hit = self.cache.get(game_id)
-        if hit is not None:
-            return hit
+        if hit is not None and hit[0] == fp:
+            return hit[1]
 
         events, header = parse_summary(payload)
         pctx = self.ctx.context_for(game_id, header.home_team_id,
@@ -5750,6 +6506,11 @@ class Scorer:
                 "away": ev.away_score,
                 "type": ev.event_type,
                 "text": ev.text,
+                # Which side the feed credits the play to; None for the clock,
+                # officials and anything else that belongs to neither.
+                "team": ("home" if ev.team_id == header.home_team_id
+                         else "away" if ev.team_id == header.away_team_id
+                         else None),
             })
         out = {
             "game_id": game_id,
@@ -5764,7 +6525,7 @@ class Scorer:
             "plays": plays,
         }
         with self.lock:
-            self.cache[game_id] = out
+            self.cache[game_id] = (fp, out)
         return out
 
     def brief(self, game_id: int, path: pathlib.Path) -> dict:
@@ -5970,6 +6731,7 @@ tell "not validated yet" from "validated and broken".
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import pathlib
 import subprocess
@@ -6048,6 +6810,13 @@ def main() -> int:
     # 3 --- the offline test suite still passes ----------------------------
     if a.no_tests:
         record("3 offline test suite", SKIP, "--no-tests")
+    elif importlib.util.find_spec("pytest") is None:
+        # The serving image deliberately ships without pytest. "pytest is not
+        # installed here" is not "the test suite fails", and reporting it as a
+        # FAIL sends whoever runs this in a container hunting a broken suite.
+        record("3 offline test suite", SKIP,
+               "pytest is not installed in this interpreter -- run the suite on "
+               "the host, or pip install pytest")
     else:
         try:
             r = subprocess.run([sys.executable, "-m", "pytest", "-q"], cwd=ROOT,
@@ -6535,8 +7304,45 @@ def test_time_expired_is_decided_by_the_scoreboard(table):
 
 @needs_table
 def test_a_made_basket_never_lowers_your_win_probability(table):
-    """Criterion 3, exhaustively -- every state, not a sample."""
+    """Criterion 3, exhaustively -- every state, not a sample.
+
+    Note what this can and cannot fail on. `build_endgame_table.py` isotonically
+    projects the solved table along the margin axis before publishing it, so
+    margin-monotonicity of the PUBLISHED array is true by construction. Keeping
+    the check is still worth it -- it catches a projection that did not run, or
+    an axis order that moved -- but the honest signal about the model is the
+    size of the correction that projection had to make, which is asserted in
+    `test_the_isotonic_projection_barely_had_to_do_anything` below.
+    """
     assert np.diff(table, axis=1).min() >= -1e-6
+
+
+@needs_table
+def test_the_isotonic_projection_barely_had_to_do_anything(manifest):
+    """The claim the published table's own monotonicity cannot make.
+
+    Parameters are estimated from finite samples, so a cell can land a fraction
+    below its neighbour and projecting is honest. A LARGE correction would mean
+    something different: that the solver is producing a shape the projection is
+    hiding. The manifest records both numbers, so bound them here rather than
+    trusting a check that cannot fail.
+    """
+    moved = manifest["isotonic_max_correction"]
+    assert moved < 0.02, (
+        f"the projection moved a cell by {moved:.4f}; that is no longer noise "
+        "in the parameter estimates, it is the model disagreeing with itself")
+
+    before = manifest["monotonicity_before"]
+    after = manifest["monotonicity_after"]
+    # The projection must fix margin monotonicity...
+    assert before["margin_violations"] > 0, (
+        "no pre-projection violations recorded -- has the manifest stopped "
+        "reporting the raw solve? Then this bound is measuring nothing.")
+    assert after["margin_violations"] == 0
+    # ...and it must not be papering over a violated possession invariant,
+    # which nothing projects and which would be a real modelling error.
+    assert before["possession_violations"] == 0
+    assert after["possession_violations"] == 0
 
 
 @needs_table
@@ -7016,7 +7822,8 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "src"))
 from cbbwp.api import LiveStore, serve_in_thread            # noqa: E402
 from cbbwp.config import Settings                            # noqa: E402
 from cbbwp.live_context import (DATA_STALE_AFTER_DAYS,        # noqa: E402
-                                 LiveContextProvider)
+                                 LiveContextProvider,
+                                 ReloadingContextProvider)
 from cbbwp.schemas import STATE_RULES_VERSION                # noqa: E402
 
 
@@ -7090,6 +7897,85 @@ def test_preseason_snapshot_with_no_games_reports_unknown_not_stale():
     c = _ctx("")
     assert c.data_age_days is None
     assert c.data_is_stale is False
+
+
+# --- the ratings snapshot is reloaded, not read once at startup --------------
+#
+# The deployment is a poller that stays up for weeks plus a SEPARATE daily job
+# that rebuilds the snapshot (deploy/install_macos.sh installs exactly that
+# pair). Loading once made that composition silently useless: the process served
+# launch-day ratings all season, and /health watched ratings_age_days climb past
+# its own threshold, reporting 503 and advising a rebuild cron had already done.
+def _snapshot(path: pathlib.Path, rating: float, generated: str | None = None,
+              mtime: float | None = None) -> None:
+    path.write_text(json.dumps({
+        "generated": generated or dt.datetime.now(dt.timezone.utc).isoformat(),
+        "latest_game_date": "",
+        "season": 2027,
+        "hca": 3.4,
+        "ratings": {"1": rating},
+        "ft_pct": {}, "ppm": {},
+    }))
+    if mtime is not None:
+        import os
+        os.utime(path, (mtime, mtime))
+
+
+def test_a_rebuilt_snapshot_is_picked_up_without_a_restart(tmp_path):
+    p = tmp_path / "context.json"
+    _snapshot(p, 5.0, mtime=1_000_000.0)
+    ctx = ReloadingContextProvider(p, check_interval=0.0)
+    assert ctx.context_for(1, 1, 404).pregame_exp_margin == pytest.approx(5.0 + 3.4)
+
+    # The daily job rewrites the file underneath the running process.
+    _snapshot(p, 9.0, mtime=2_000_000.0)
+    assert ctx.context_for(1, 1, 404).pregame_exp_margin == pytest.approx(9.0 + 3.4)
+    assert ctx.reloads == 1
+
+
+def test_health_freshness_follows_the_file_not_the_process(tmp_path):
+    """The 503-after-three-days symptom, stated directly."""
+    p = tmp_path / "context.json"
+    old = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=30)).isoformat()
+    _snapshot(p, 1.0, generated=old, mtime=1_000_000.0)
+    ctx = ReloadingContextProvider(p, check_interval=0.0)
+    assert ctx.age_days > 29 and ctx.is_stale
+
+    _snapshot(p, 1.0, mtime=2_000_000.0)          # cron rebuilds it
+    assert ctx.age_days < 1, "a rebuilt snapshot still reports as stale"
+    assert not ctx.is_stale
+
+
+def test_a_torn_or_broken_snapshot_keeps_the_previous_ratings(tmp_path, capsys):
+    """A half-written file must never take down a live feed.
+
+    The writer renames into place, so this is belt and braces -- but the
+    previous ratings are a perfectly good answer and an exception here would
+    kill the poll loop mid-game.
+    """
+    p = tmp_path / "context.json"
+    _snapshot(p, 4.0, mtime=1_000_000.0)
+    ctx = ReloadingContextProvider(p, check_interval=0.0)
+
+    p.write_text('{"ratings": {"1": 9.0')                 # truncated mid-write
+    import os
+    os.utime(p, (2_000_000.0, 2_000_000.0))
+    assert ctx.context_for(1, 1, 404).pregame_exp_margin == pytest.approx(4.0 + 3.4)
+    assert ctx.reload_failures == 1
+    assert "could not reload" in capsys.readouterr().err
+
+    # ...and the retry succeeds once the writer finishes.
+    _snapshot(p, 7.0, mtime=3_000_000.0)
+    assert ctx.context_for(1, 1, 404).pregame_exp_margin == pytest.approx(7.0 + 3.4)
+
+
+def test_an_unchanged_file_is_not_reloaded(tmp_path):
+    p = tmp_path / "context.json"
+    _snapshot(p, 2.0, mtime=1_000_000.0)
+    ctx = ReloadingContextProvider(p, check_interval=0.0)
+    for _ in range(5):
+        ctx.context_for(1, 1, 404)
+    assert ctx.reloads == 0
 
 
 # --- the API ----------------------------------------------------------------
@@ -7251,10 +8137,21 @@ def test_a_gap_that_is_only_significant_because_of_duplication_is_not_an_alert()
     # 400 games, each 40 states. A 2.5pp gap over 400 games is noise; the same
     # gap over 16,000 "independent" states looks like a 5-sigma event.
     y, p, s, g = clustered_synth(400, 40, 90, 0.725, 0.70, seed=3)
-    assert not monitor.check(y, p, s, game_ids=g).ok or True   # may or may not fire
-    naive_z = abs(monitor.check(y, p, s).bins[0].z)
-    clust_z = abs(monitor.check(y, p, s, game_ids=g).bins[0].z)
+    naive = monitor.check(y, p, s)
+    clustered = monitor.check(y, p, s, game_ids=g)
+    naive_z = abs(naive.bins[0].z)
+    clust_z = abs(clustered.bins[0].z)
     assert naive_z > clust_z * 3
+    # The point of the whole exercise: treating states as independent turns a
+    # 2.5-point gap into "significant", and correcting for clustering does not.
+    # (This line used to read `assert not clustered.ok or True`, which is
+    # vacuously true and asserted nothing at all.)
+    assert naive_z > monitor.Z_ALERT
+    assert clust_z < monitor.Z_ALERT
+    assert clustered.ok
+    # ...and the naive report has to say out loud that it is optimistic.
+    assert not naive.clustered
+    assert any("independent" in n for n in naive.notes)
 
 
 def test_real_drift_still_fires_when_clustered():
@@ -7477,6 +8374,188 @@ def test_a_made_free_throw_still_flips():
     assert s[-1].possession == 0.0
 ```
 
+## `tests/test_ratings_parity.py`
+
+```py
+"""The live ratings snapshot must be on the scale the model was trained on.
+
+`build_live_context.py` and `ratings.build_all_seasons` both fit the same ridge
+model, which made it easy to believe they agreed. They did not: training chains
+a prior season over season from 2016 with CARRYOVER at every boundary, and the
+live snapshot used to fit the single previous season against an EMPTY prior.
+
+Same fit, different prior, so `pregame_exp_margin` served live was not the
+quantity the model learned - by 1.3 points sd over the first fortnight of
+November, which is exactly when the pregame term carries the most weight and the
+score has not yet absorbed it.
+
+These tests hold the two definitions together.
+"""
+import pathlib
+import sys
+
+import polars as pl
+import pytest
+
+ROOT = pathlib.Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "src"))
+
+from cbbwp.ratings import (CARRYOVER, _fit_ridge, carried_prior,  # noqa: E402
+                           season_end_ratings, season_pregame_margins)
+
+GAMES = ROOT / "data/proc/games.parquet"
+
+
+# --------------------------------------------------------------------------
+# Synthetic: no data download needed
+# --------------------------------------------------------------------------
+def _synthetic(seasons=(2016, 2017, 2018), teams=6, per_pair=1) -> pl.DataFrame:
+    """A few seasons of round-robin results with a stable talent ordering."""
+    rows = []
+    gid = 0
+    for si, season in enumerate(seasons):
+        day = 0
+        for rep in range(per_pair):
+            for h in range(teams):
+                for a in range(teams):
+                    if h == a:
+                        continue
+                    gid += 1
+                    day += 1
+                    # Team k is k points better than team 0, plus a home edge.
+                    margin = (h - a) * 2 + 3
+                    rows.append({
+                        "game_id": gid,
+                        "season": season,
+                        # one game per day keeps the as-of refit deterministic
+                        "date": pl.datetime(2000 + si, 11, 1).item() if False else None,
+                        "_day": day,
+                        "home_id": h,
+                        "away_id": a,
+                        "margin": margin,
+                        "neutral_site": False,
+                    })
+    df = pl.DataFrame(rows).drop("date")
+    # Build real datetimes from the per-season day counter.
+    return df.with_columns(
+        date=pl.datetime(2000, 1, 1).dt.offset_by(
+            pl.format("{}d", pl.col("_day") + 400 * (pl.col("season") - 2016)))
+    ).drop("_day")
+
+
+def test_carried_prior_chains_every_season_not_just_the_last():
+    games = _synthetic()
+    chained = carried_prior(games, 2018)
+
+    # What the old live path did: the single previous season, empty prior.
+    prev = games.filter(pl.col("season") == 2017)
+    solo, _ = season_end_ratings(prev, {})
+    single = {t: v * CARRYOVER for t, v in solo.items()}
+
+    assert set(chained) == set(single)
+    # The chain has seen 2016 as well, so it cannot be the same numbers.
+    assert any(abs(chained[t] - single[t]) > 1e-9 for t in chained), (
+        "carried_prior produced the single-season prior; the chain is not running")
+
+
+def test_carried_prior_matches_the_chain_build_all_seasons_walks():
+    """The two definitions of "the prior entering season N" must not drift.
+
+    `build_all_seasons` chains inline as it goes; `carried_prior` reconstructs
+    the same value for one season. This asserts they agree, which is the whole
+    reason the live snapshot is allowed to call the cheap one.
+    """
+    games = _synthetic()
+
+    prior = {}
+    for season in sorted(games["season"].unique().to_list()):
+        if season == 2018:
+            break
+        sg = games.filter(pl.col("season") == season)
+        _, final, _ = season_pregame_margins(sg, prior)
+        prior = {t: v * CARRYOVER for t, v in final.items()}
+
+    reconstructed = carried_prior(games, 2018)
+    assert set(reconstructed) == set(prior)
+    for t in prior:
+        assert reconstructed[t] == pytest.approx(prior[t], abs=1e-9), t
+
+
+def test_an_empty_history_is_an_empty_prior():
+    games = _synthetic()
+    assert carried_prior(games, 2016) == {}
+
+
+# --------------------------------------------------------------------------
+# Against the real data: does the snapshot reproduce the offline term?
+# --------------------------------------------------------------------------
+@pytest.mark.skipif(not GAMES.exists(),
+                    reason="games.parquet not built yet (scripts/build_games.py)")
+def test_the_live_prior_tracks_the_offline_pregame_margin_in_november():
+    """Early season is where the prior is the whole answer, so measure there.
+
+    Reproduces what `build_live_context.py` does -- chain the prior, fit the
+    completed games so far -- and compares the pregame margin it would serve
+    against the `pregame_exp_margin` the training pipeline actually stored for
+    the games that came next.
+
+    Measured RELATIVE to the old single-season prior, and over several cutoffs,
+    on purpose. The absolute error is dominated by something that is not skew:
+    the offline column refits every 7 game-days, so a cutoff landing just before
+    a refit is compared against ratings up to a week staler than the ones being
+    tested, and the absolute number swings between 0.3 and 4.8 points with the
+    cutoff alone. The comparison against the old prior is unaffected by that,
+    because both sides carry the identical lag.
+    """
+    import datetime
+
+    games = pl.read_parquet(GAMES)
+    season = int(games["season"].max())
+    cur = games.filter(pl.col("season") == season).sort("date")
+    teams = sorted(set(cur["home_id"].to_list()) | set(cur["away_id"].to_list()))
+    start = cur["date"].min()
+
+    def mae(fit_g, nxt, prior):
+        r, hca = _fit_ridge(fit_g, teams,
+                            {t: v for t, v in prior.items() if t in set(teams)})
+        errs = []
+        for h, a, neu, off in zip(nxt["home_id"], nxt["away_id"],
+                                  nxt["neutral_site"], nxt["pregame_exp_margin"]):
+            if off is None:
+                continue
+            errs.append(abs(r.get(h, 0.0) - r.get(a, 0.0)
+                            + (0.0 if neu else hca) - off))
+        return sum(errs) / len(errs) if errs else None
+
+    chained_prior_ = carried_prior(games, season)
+    prev_season = max(s for s in games["season"].unique().to_list() if s < season)
+    solo, _ = season_end_ratings(games.filter(pl.col("season") == prev_season), {})
+    single_prior = {t: v * CARRYOVER for t, v in solo.items()}
+
+    chained, single = [], []
+    for days in (7, 14, 21, 28):
+        cutoff = start + datetime.timedelta(days=days)
+        fit_g = cur.filter(pl.col("date") < cutoff)
+        nxt = cur.filter(pl.col("date") >= cutoff).head(400)
+        if fit_g.height < 100 or nxt.height < 50:
+            continue
+        c, s = mae(fit_g, nxt, chained_prior_), mae(fit_g, nxt, single_prior)
+        if c is None or s is None:
+            continue
+        chained.append(c)
+        single.append(s)
+        # The regression guard: reverting to the single-season prior must fail
+        # this, at every cutoff, not just on average.
+        assert c < s, (
+            f"+{days}d: chained prior ({c:.3f}) is no better than the "
+            f"single-season one ({s:.3f}) -- has build_live_context stopped "
+            "chaining? See cbbwp.ratings.carried_prior")
+
+    if len(chained) < 2:
+        pytest.skip("not enough early-season games in this file")
+    assert sum(chained) / len(chained) < sum(single) / len(single)
+```
+
 ## `tests/test_replay_harness.py`
 
 ```py
@@ -7539,7 +8618,14 @@ def test_incremental_polling_matches_full_replay(svc, game):
         assert live[row["seq"]] == pytest.approx(row["home_win_prob"], abs=1e-12), row["seq"]
 
 
-def test_out_of_order_and_duplicate_events_are_absorbed(svc, game):
+def test_arrival_order_does_not_change_the_answer(svc, game):
+    """`build_states` is a pure function of the event SET, ordered by seq.
+
+    Renamed 2026-09-08: this used to be called "...and duplicate events are
+    absorbed" while testing nothing of the sort. Duplicates now have their own
+    test below, which pins what actually happens rather than what the old name
+    asserted.
+    """
     events, home_id, away_id = game
     ctx = PregameContext(events[0].game_id, home_id, away_id, pregame_exp_margin=1.5)
     clean = svc.score_game(events, ctx)
@@ -7547,6 +8633,32 @@ def test_out_of_order_and_duplicate_events_are_absorbed(svc, game):
     shuffled = list(events)
     random.Random(7).shuffle(shuffled)
     assert svc.score_game(shuffled, ctx) == clean
+
+
+def test_a_duplicated_event_repeats_its_state_and_disturbs_nothing_else(svc, game):
+    """What a repeated play actually does, stated rather than assumed.
+
+    The live adapter renumbers densely over the feed's array, so it cannot emit
+    a duplicate today. If a future feed or adapter ever did, the failure mode
+    worth knowing is that the state is REPEATED, not that the game is corrupted:
+    every other seq keeps exactly the probability it had. The poller reads
+    rows[-1] and the API keys history by seq, so a repeat is inert downstream.
+    """
+    events, home_id, away_id = game
+    ctx = PregameContext(events[0].game_id, home_id, away_id, pregame_exp_margin=1.5)
+    clean = svc.score_game(events, ctx)
+
+    mid = len(events) // 2
+    doubled = list(events[:mid]) + [events[mid]] + list(events[mid:])
+    got = svc.score_game(doubled, ctx)
+
+    assert len(got) == len(clean) + 1
+    assert [r["seq"] for r in got].count(events[mid].seq) == 2
+    by_seq = {}
+    for r in got:
+        by_seq.setdefault(r["seq"], r["home_win_prob"])
+    for r in clean:
+        assert by_seq[r["seq"]] == pytest.approx(r["home_win_prob"], abs=1e-12)
 
 
 def test_probabilities_are_bounded_and_finite(svc, game):
@@ -7831,6 +8943,17 @@ def test_the_caption_belongs_to_the_probability_beside_it(scored):
         assert p["margin"] == p["home"] - p["away"], f"play {p['seq']} misaligned"
 
 
+def test_every_play_is_credited_to_a_side_or_to_nobody(scored):
+    """The page labels each play with its team, so the side must be resolved
+    here against the header's ids, never guessed from text."""
+    teams = [p["team"] for p in scored["plays"]]
+    assert set(teams) <= {"home", "away", None}
+    assert "home" in teams and "away" in teams
+    for p in scored["plays"]:
+        if p["type"] in ("JumpShot", "LayUpShot", "MadeFreeThrow"):
+            assert p["team"] in ("home", "away"), f"play {p['seq']} has a shot with no side"
+
+
 REG, OT = 1200, 300
 
 
@@ -8005,4 +9128,632 @@ def test_overtime_lands_after_regulation_on_the_page():
     ms = _moments_under_node(plays)
     assert [m["seqs"][0] for m in ms] == [1, 2, 3, 4, 5, 6]
     assert [m["elapsed"] for m in ms] == [2340, 2400, 2400, 2690, 2700, 3000]
+```
+
+## `web/index.html`
+
+```html
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>cbbwp — win probability</title>
+<style>
+/* Plain on purpose. The subject is a number moving through a basketball game;
+   the page is text, one chart and one table, and nothing that exists only to
+   look finished. No cards, shadows, badges, motion or tooltips. */
+:root { --ink: #111; --faint: #777; --rule: #ccc; --grid: #e4e4e4;
+        --primary: #111; --danger: #b1261f; }
+html { color-scheme: light; }
+body {
+  margin: 0; padding: 2rem 1.25rem 3rem; color: var(--ink); background: #fff;
+  font: 15px/1.45 "Helvetica Neue", Helvetica, Arial, sans-serif;
+  font-variant-numeric: tabular-nums;
+}
+.page { max-width: 820px; }
+h1 { font-size: 1.5rem; font-weight: normal; margin: 0 0 .25rem; }
+h1 small { font-size: 1rem; color: var(--faint); margin-left: .5rem; }
+h2 { font-size: 1rem; font-weight: bold; margin: 1.75rem 0 .5rem; }
+a { color: var(--ink); }
+.faint { color: var(--faint); }
+.modes { margin: 0 0 1.5rem; }
+.modes a.on { font-weight: bold; text-decoration: none; }
+ul.games { list-style: none; margin: 0 0 1rem; padding: 0; }
+ul.games li { margin: 0 0 .2rem; }
+ul.games li a { text-decoration: none; }
+ul.games li a:hover { text-decoration: underline; }
+ul.games li.on a { font-weight: bold; }
+.fetch { margin: 0 0 1rem; }
+input, select, button {
+  font: inherit; color: inherit; background: #fff; border: 1px solid var(--rule);
+  padding: .15rem .5rem; margin: 0;
+}
+input[type=text] { width: 9em; }
+button:disabled { color: var(--faint); }
+input[type=range] { border: 0; padding: 0; width: 100%; accent-color: var(--ink); }
+input[type=checkbox] { accent-color: var(--ink); }
+.score { font-size: 1.25rem; margin: 0 0 .25rem; }
+.score b { font-weight: normal; }
+.wp { margin: 0 0 1rem; }
+svg { display: block; width: 100%; height: auto; margin: 0 0 .75rem; }
+.controls { display: flex; flex-wrap: wrap; gap: .4rem .6rem; align-items: center; }
+.controls .grow { flex: 1; min-width: 12em; }
+.controls label { white-space: nowrap; }
+table { border-collapse: collapse; width: 100%; margin: .5rem 0 0; }
+td { padding: .3rem .6rem .3rem 0; border-top: 1px solid var(--grid); vertical-align: top; }
+td.type { white-space: nowrap; color: var(--faint); }
+td.num { text-align: right; white-space: nowrap; }
+tr:first-child td { border-top: 0; }
+.up { color: var(--ink); } .down { color: var(--danger); } .flat { color: var(--faint); }
+.note { margin: .75rem 0 0; font-style: italic; }
+.err { color: var(--danger); }
+.foot { margin: 2rem 0 0; color: var(--faint); font-size: .9rem; }
+</style>
+</head>
+<body>
+<div class="page">
+  <h1>cbbwp <small id="modelmeta">loading…</small></h1>
+
+  <p class="modes">
+    <a id="tab-replay" class="on" href="#replay">Replay</a> ·
+    <a id="tab-live" href="#live">Live</a>
+  </p>
+
+  <h2 id="listhead">Archived games</h2>
+  <ul class="games" id="list"></ul>
+  <p class="fetch" id="fetchbox">
+    Fetch from ESPN by game id:
+    <input id="gid" type="text" inputmode="numeric">
+    <button id="fetchbtn">Fetch</button>
+    <span class="err" id="fetcherr"></span>
+  </p>
+
+  <p id="stage-empty" class="faint">Pick a game.</p>
+
+  <div id="stage-game" hidden>
+    <p class="score">
+      <span id="awayname">—</span> <b id="awayscore">0</b>,
+      <span id="homename">—</span> <b id="homescore">0</b>
+      <span class="faint">· <span id="clock">—</span> <span id="periodlbl">—</span></span>
+    </p>
+    <p class="wp">Home win probability <b id="wpnum">50.0%</b></p>
+
+    <svg id="chart" viewBox="0 0 900 240" preserveAspectRatio="none"
+         role="img" aria-label="Win probability over the course of the game"></svg>
+
+    <div id="transport">
+      <div class="controls">
+        <button id="first">|&lt;</button>
+        <button id="back">&lt;</button>
+        <button id="playpause">Play</button>
+        <button id="fwd">&gt;</button>
+        <button id="last">&gt;|</button>
+        <select id="speed">
+          <option value="1">1× real time</option>
+          <option value="5">5×</option>
+          <option value="15">15×</option>
+          <option value="60" selected>60×</option>
+          <option value="240">240×</option>
+          <option value="0">fastest</option>
+        </select>
+        <label><input type="checkbox" id="spoil" checked> show ending</label>
+      </div>
+      <div class="controls" style="margin-top:.5rem">
+        <input type="range" id="scrub" class="grow" min="0" max="0" value="0">
+        <span class="faint" id="pos">0 / 0</span>
+      </div>
+    </div>
+
+    <h2><span id="momenthead">—</span> <span class="faint" id="momentsub"></span></h2>
+    <table><tbody id="momentrows"></tbody></table>
+    <div id="momentfoot"></div>
+
+    <p class="foot">Space plays, arrows step, home and end jump. Plays at one
+    clock are one moment, shown in clock order. Nothing is interpolated.</p>
+  </div>
+</div>
+<script>
+"use strict";
+const $ = id => document.getElementById(id);
+// -- pure: begin  (tests/test_viz.py runs this block under node, without a DOM)
+const REG = 1200, OT = 300;
+
+let mode = "replay";
+let game = null;          // {moments: [...], periods, nplays}
+let idx = 0;              // which MOMENT is showing
+let timer = null, liveTimer = null, liveGid = null;
+
+/* ---------- time ------------------------------------------------------- */
+
+// `secs` is seconds left in REGULATION, and each overtime restarts its own
+// clock (state.py: game_seconds_remaining). One rule for replayed plays and
+// live states, so both charts share an x axis.
+function elapsed(m) {
+  return m.period <= 2 ? 2 * REG - m.secs
+                       : 2 * REG + (m.period - 3) * OT + (OT - m.secs);
+}
+function totalSeconds(g) {
+  const per = g.periods || 2;
+  return per <= 2 ? 2 * REG : 2 * REG + (per - 2) * OT;
+}
+function mmss(sec) {
+  sec = Math.max(0, sec);
+  return Math.floor(sec / 60) + ":" + String(Math.floor(sec % 60)).padStart(2, "0");
+}
+function periodLabel(p) {
+  return p <= 2 ? (p === 1 ? "1st half" : "2nd half") : (p === 3 ? "OT" : "OT" + (p - 2));
+}
+function pct(x) { return (x * 100).toFixed(1) + "%"; }
+function esc(s) {
+  return String(s).replace(/[&<>"]/g, c =>
+    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+}
+
+/* ---------- moments ---------------------------------------------------- */
+
+// A basketball clock stops, and ESPN emits every substitution, foul and free
+// throw at the same displayed time -- one archived game is 482 plays but only
+// 247 distinct moments, with clusters as long as 14. Stepping through those one
+// at a time is mostly stepping through paperwork.
+//
+// Consecutive plays only. Merging non-adjacent plays that happen to share a
+// clock would hide the fact that something else happened in between.
+//
+// The moments are then STEPPED in game-clock order, whatever order the feed
+// supplied them in. The feed has been chronological on every real payload
+// measured (EXPLAIN 8.8b), but this page is where a disordered one would show
+// up, as a playhead that jumps forward and then back. The clock is the axis the
+// reader is watching, so it is the axis stepping follows. Nothing about the
+// numbers changes: every probability is still the one the model produced
+// walking the feed in the feed's own order, and a moment that sat out of clock
+// order in the feed says so (see `displaced` and the warning in render()).
+function buildMoments(plays) {
+  const out = [];
+  let prevWp = null;
+  for (const p of plays) {
+    // The change each play made, against the play the model saw just BEFORE
+    // it. That is a fact about feed order, so it is fixed here, before the sort.
+    p.prevWp = prevWp === null ? p.wp : prevWp;
+    prevWp = p.wp;
+    const last = out[out.length - 1];
+    if (last && last.period === p.period && last.secs === p.secs) last.plays.push(p);
+    else out.push({ period: p.period, secs: p.secs, clock: p.clock, plays: [p] });
+  }
+  for (const m of out) {
+    // The state AFTER the whole moment is the last play's state: that is what
+    // the model produced once it had seen all of them.
+    const l = m.plays[m.plays.length - 1];
+    m.wp = l.wp; m.margin = l.margin; m.home = l.home; m.away = l.away; m.seq = l.seq;
+    if (m.clock === undefined || m.clock === null) {
+      m.clock = m.period <= 1 ? m.secs - REG : m.secs;
+    }
+  }
+  // A moment is displaced if the feed put it after something later on the
+  // clock, or before something earlier. Decided against its feed neighbours,
+  // so it has to be decided before the sort.
+  out.forEach((m, i) => {
+    const before = out[i - 1], after = out[i + 1];
+    m.displaced = before && elapsed(m) < elapsed(before) ? { after: before.seq }
+                : after && elapsed(m) > elapsed(after) ? { before: after.plays[0].seq }
+                : null;
+  });
+  // Array.prototype.sort is stable, so moments the feed already had in order
+  // keep their relative order, and a disordered feed comes out chronological.
+  out.sort((a, b) => elapsed(a) - elapsed(b));
+  return out;
+}
+// -- pure: end
+
+/* ---------- chart ------------------------------------------------------ */
+
+function drawChart() {
+  const svg = $("chart");
+  if (!game) { svg.innerHTML = ""; return; }
+  const W = 900, H = 240, L = 34, R = 6, T = 8, B = 20;
+  const total = totalSeconds(game);
+  const x = s => L + (s / total) * (W - L - R);
+  const y = p => T + (1 - p) * (H - T - B);
+  const out = [];
+
+  const font = 'font-size="11" font-family="Helvetica Neue,Helvetica,Arial,sans-serif" fill="#777"';
+  for (const p of [0, 0.25, 0.5, 0.75, 1]) {
+    out.push(`<line x1="${L}" x2="${W - R}" y1="${y(p)}" y2="${y(p)}"
+      stroke="${p === 0.5 ? '#999' : 'var(--grid)'}" stroke-width="1"/>`);
+    if (p > 0 && p < 1) out.push(`<text x="${L - 5}" y="${y(p) + 4}" ${font}
+      text-anchor="end">${p * 100}</text>`);
+  }
+  // The line is the home team's probability, so the top of the plot is theirs
+  // and the bottom is the visitors'. Say so, in the corners.
+  out.push(`<text x="${L + 5}" y="${T + 13}" ${font}>${esc($("homename").textContent)}</text>`);
+  out.push(`<text x="${L + 5}" y="${H - B - 5}" ${font}>${esc($("awayname").textContent)}</text>`);
+  const per = game.periods || 2;
+  for (let k = 1; k < per; k++) {
+    const s = k <= 1 ? REG : 2 * REG + (k - 2) * OT;
+    out.push(`<line x1="${x(s)}" x2="${x(s)}" y1="${T}" y2="${H - B}"
+      stroke="#999" stroke-width="1" stroke-dasharray="2 3"/>`);
+  }
+
+  // buildMoments() sorted these into game-time order, so index order is x order
+  // and the prefix up to the playhead is exactly the part of the game seen so far.
+  const pts = game.moments.map(m => [x(elapsed(m)), y(m.wp)]);
+  const d = q => q.map((p, i) => (i ? "L" : "M") + p[0].toFixed(1) + " " + p[1].toFixed(1)).join(" ");
+  if ($("spoil").checked) {
+    out.push(`<path d="${d(pts)}" fill="none" stroke="#c8c8c8" stroke-width="1"/>`);
+  }
+  const seen = pts.slice(0, idx + 1);
+  if (seen.length > 1) {
+    out.push(`<path d="${d(seen)}" fill="none" stroke="var(--ink)"
+      stroke-width="1.5" stroke-linejoin="round"/>`);
+  }
+  const cur = pts[idx];
+  if (cur) {
+    out.push(`<line x1="${cur[0]}" x2="${cur[0]}" y1="${T}" y2="${H - B}"
+      stroke="var(--danger)" stroke-width="1"/>`);
+    out.push(`<circle cx="${cur[0]}" cy="${cur[1]}" r="3" fill="var(--danger)"/>`);
+  }
+  out.push(`<text x="${L}" y="${H - 5}" ${font}>tip</text>`);
+  out.push(`<text x="${W - R}" y="${H - 5}" ${font} text-anchor="end">final</text>`);
+  svg.innerHTML = out.join("");
+}
+
+/* ---------- render ----------------------------------------------------- */
+
+function render() {
+  if (!game) return;
+  const m = game.moments[idx];
+  const prev = idx > 0 ? game.moments[idx - 1] : null;
+
+  $("homescore").textContent = m.home;
+  $("awayscore").textContent = m.away;
+  $("clock").textContent = mmss(m.clock);
+  $("periodlbl").textContent = periodLabel(m.period);
+
+  $("wpnum").textContent = pct(m.wp);
+
+  $("momenthead").textContent =
+    `${periodLabel(m.period)}, ${mmss(m.clock)}, ${m.away}–${m.home}`;
+  $("momentsub").textContent = m.plays.length > 1
+    ? `${m.plays.length} plays at this clock` : "";
+
+  // Each play keeps its own probability, so a moment that moves the number
+  // shows WHICH play moved it: a free-throw trip is several plays at one clock
+  // and only the makes shift anything. The change is measured against the play
+  // the model saw just before it (prevWp, fixed in feed order), which is the
+  // chronologically previous moment except where the feed was disordered.
+  $("momentrows").innerHTML = m.plays.map(p => {
+    const dd = p.wp - p.prevWp;
+    const cls = dd > 0.0005 ? "up" : dd < -0.0005 ? "down" : "flat";
+    const sign = dd > 0.0005 ? "+" : dd < -0.0005 ? "−" : "";
+    const team = p.team === "home" ? $("homename").textContent
+               : p.team === "away" ? $("awayname").textContent : "";
+    return `<tr>
+      <td class="type">${esc(team)}</td>
+      <td class="type">${esc(p.type || "—")}</td>
+      <td>${esc(p.text || "(no description in the feed)")}</td>
+      <td class="num">${pct(p.wp)}
+        <span class="${cls}">${sign}${Math.abs(dd * 100).toFixed(1)}</span></td>
+    </tr>`;
+  }).join("");
+
+  const total = m.wp - m.plays[0].prevWp;
+  $("momentfoot").innerHTML =
+    `<p class="faint">Moment ${idx + 1} of ${game.moments.length},
+     plays ${m.plays[0].seq}–${m.plays[m.plays.length - 1].seq} of ${game.nplays}.
+     Margin ${m.margin > 0 ? "+" : ""}${m.margin}${
+       prev ? `, ${total >= 0 ? "+" : "−"}${Math.abs(total * 100).toFixed(1)} across this moment` : ""}.
+     </p>`
+    + (m.displaced
+        ? `<p class="note">The feed did not deliver this moment in clock order: it
+           arrived ${m.displaced.after !== undefined
+             ? `after play ${m.displaced.after}, which is later on the clock`
+             : `before play ${m.displaced.before}, which is earlier on the clock`}.
+           It is shown at its own clock time; its probabilities are still the
+           model's, computed in the order the feed sent the plays (EXPLAIN 8.8b).</p>`
+        : "");
+
+  $("scrub").value = idx;
+  $("pos").textContent = `${idx + 1} / ${game.moments.length}`;
+  $("back").disabled = $("first").disabled = idx === 0;
+  $("fwd").disabled = $("last").disabled = idx >= game.moments.length - 1;
+  drawChart();
+}
+
+/* ---------- transport -------------------------------------------------- */
+
+function stop() {
+  if (timer) { clearTimeout(timer); timer = null; }
+  $("playpause").textContent = "Play";
+}
+function atEnd() { return !game || idx >= game.moments.length - 1; }
+function step(n) {
+  if (!game) return;
+  idx = Math.max(0, Math.min(game.moments.length - 1, idx + n));
+  render();
+}
+function tick() {
+  if (atEnd()) { stop(); return; }
+  const speed = Number($("speed").value);
+  const a = game.moments[idx], b = game.moments[idx + 1];
+  idx += 1; render();
+  if (atEnd()) { stop(); return; }
+  // Real game time between moments, compressed by the speed factor. Clamped so
+  // a stopped clock does not stall and a long gap does not look like a freeze.
+  const delay = speed === 0 ? 16
+    : Math.min(2500, Math.max(90, (Math.max(0, elapsed(b) - elapsed(a)) * 1000) / speed));
+  timer = setTimeout(tick, delay);
+}
+function playPause() {
+  if (!game) return;
+  if (timer) { stop(); return; }
+  if (atEnd()) { idx = 0; render(); }
+  $("playpause").textContent = "Pause";
+  timer = setTimeout(tick, 80);
+}
+
+/* ---------- loading ---------------------------------------------------- */
+
+async function loadGame(gid) {
+  stop();
+  $("stage-empty").textContent = "loading…";
+  $("stage-empty").hidden = false; $("stage-game").hidden = true;
+  try {
+    const r = await fetch("/api/game/" + gid);
+    const j = await r.json();
+    if (!r.ok) throw new Error(j.error || r.statusText);
+    game = j;
+    game.moments = buildMoments(j.plays);
+    game.nplays = j.plays.length;
+    idx = 0;
+    $("homename").textContent = j.home_name;
+    $("awayname").textContent = j.away_name;
+    $("scrub").max = game.moments.length - 1;
+    $("modelmeta").textContent =
+      `model ${j.model_version} · state rules v${j.state_rules_version} · `
+      + `${j.plays.length} plays in ${game.moments.length} moments`
+      + (j.synthetic ? " · REBUILT FROM hoopR, not an ESPN recording" : "");
+    $("stage-empty").hidden = true; $("stage-game").hidden = false;
+    $("transport").hidden = false;
+    document.querySelectorAll("#list li").forEach(el =>
+      el.classList.toggle("on", Number(el.dataset.gid) === Number(gid)));
+    render();
+  } catch (e) {
+    $("stage-empty").textContent = "could not load that game: " + e.message;
+  }
+}
+
+async function loadList() {
+  const j = await (await fetch("/api/games")).json();
+  const box = $("list");
+  if (!j.games.length) {
+    box.innerHTML = `<li class="faint">No archived games yet. Run
+      scripts/archive_replay_games.py, or fetch one below.</li>`;
+    return;
+  }
+  box.innerHTML = j.games.map(g => g.error
+    ? `<li class="faint">${g.game_id}: ${esc(g.error)}</li>`
+    : `<li data-gid="${g.game_id}"><a href="#${g.game_id}">${esc(g.away_name)} at ${
+         esc(g.home_name)}</a> <span class="faint">${g.away_score}–${g.home_score}${
+         g.periods > 2 ? ", OT" : ""}, ${g.plays} plays${
+         g.synthetic ? ", rebuilt from hoopR" : ""}</span></li>`).join("");
+  box.querySelectorAll("#list li[data-gid] a").forEach(el =>
+    el.onclick = e => { e.preventDefault(); loadGame(el.parentNode.dataset.gid); });
+}
+
+/* ---------- live ------------------------------------------------------- */
+
+async function pollLive() {
+  const j = await (await fetch("/api/live")).json();
+  const box = $("list");
+  if (j.offline || !j.games || !j.games.length) {
+    box.innerHTML = `<li class="faint">${j.offline
+      ? "No live feed running. Start scripts/serve_live.py."
+      : "Live feed is up, but no games are in progress."}</li>`;
+    return;
+  }
+  box.innerHTML = j.games.map(g => `
+    <li class="${g.game_id === liveGid ? "on" : ""}" data-gid="${g.game_id}">
+      <a href="#${g.game_id}">game ${g.game_id}${g.replay ? " (replay)" : ""}</a>
+      <span class="faint">P${g.period}, ${mmss(g.game_seconds_remaining)} left,
+        margin ${g.margin > 0 ? "+" : ""}${g.margin}, home ${pct(g.home_win_prob)}</span>
+    </li>`).join("");
+  box.querySelectorAll("#list li[data-gid] a").forEach(el =>
+    el.onclick = e => { e.preventDefault();
+                        liveGid = Number(el.parentNode.dataset.gid); loadLiveGame(); });
+  if (liveGid !== null) loadLiveGame();
+}
+
+async function loadLiveGame() {
+  if (liveGid === null) return;
+  const j = await (await fetch("/api/live/" + liveGid)).json();
+  if (j.offline || !j.game) return;
+  const g = j.game;
+  // One row per poll: what was actually known at each moment, not a smooth
+  // after-the-fact curve.
+  const hist = (g.history || []).concat(
+    (g.history || []).some(h => h.seq === g.seq) ? [] : [g]);
+  const plays = hist.map(h => ({
+    seq: h.seq, period: h.period, secs: h.game_seconds_remaining,
+    clock: h.period <= 1 ? h.game_seconds_remaining - REG : h.game_seconds_remaining,
+    margin: h.margin, wp: h.home_win_prob, home: "", away: "",
+    type: "poll", text: `state after play ${h.seq}`,
+  }));
+  game = { game_id: g.game_id, periods: Math.max(2, ...plays.map(p => p.period)),
+           moments: buildMoments(plays), nplays: plays.length };
+  idx = game.moments.length - 1;
+  $("homename").textContent = j.home_name || ("home " + g.home_team_id);
+  $("awayname").textContent = j.away_name || ("away " + g.away_team_id);
+  $("homescore").textContent = (g.margin > 0 ? "+" : "") + g.margin;
+  $("awayscore").textContent = "";
+  const perClock = g.period <= 1 ? g.game_seconds_remaining - REG : g.game_seconds_remaining;
+  $("clock").textContent = mmss(perClock);
+  $("periodlbl").textContent = periodLabel(g.period) + (g.replay ? ", replay" : "") + ", live";
+  $("wpnum").textContent = pct(g.home_win_prob);
+  $("momenthead").textContent = `${g.status}, play ${g.seq}`;
+  $("momentsub").textContent = `${hist.length} polls recorded`;
+  $("momentrows").innerHTML = `<tr><td>The poller re-scores the whole game every
+    poll, so this is the model's current answer rather than an increment.</td>
+    <td class="num">${pct(g.home_win_prob)}</td></tr>`;
+  $("momentfoot").innerHTML = `<p class="faint">Margin
+    ${g.margin > 0 ? "+" : ""}${g.margin}.</p>`;
+  $("modelmeta").textContent =
+    `model ${j.model_version} · state rules v${j.state_rules_version} · live`;
+  $("stage-empty").hidden = true; $("stage-game").hidden = false;
+  $("transport").hidden = true;
+  drawChart();
+}
+
+/* ---------- wiring ----------------------------------------------------- */
+
+function setMode(next) {
+  mode = next; stop();
+  if (liveTimer) { clearInterval(liveTimer); liveTimer = null; }
+  $("tab-replay").classList.toggle("on", next === "replay");
+  $("tab-live").classList.toggle("on", next === "live");
+  $("fetchbox").hidden = next !== "replay";
+  $("listhead").textContent = next === "replay" ? "Archived games" : "Live now";
+  $("stage-game").hidden = true;
+  $("stage-empty").hidden = false;
+  if (next === "replay") {
+    liveGid = null; $("transport").hidden = false; loadList();
+    $("stage-empty").textContent = "Pick a game.";
+  } else {
+    $("stage-empty").textContent = "Live games appear above as the poller finds them.";
+    pollLive(); liveTimer = setInterval(pollLive, 5000);
+  }
+}
+
+$("playpause").onclick = playPause;
+$("fwd").onclick = () => { stop(); step(1); };
+$("back").onclick = () => { stop(); step(-1); };
+$("first").onclick = () => { stop(); idx = 0; render(); };
+$("last").onclick = () => { stop(); idx = game.moments.length - 1; render(); };
+$("scrub").oninput = e => { stop(); idx = Number(e.target.value); render(); };
+$("spoil").onchange = drawChart;
+$("speed").onchange = () => { if (timer) { clearTimeout(timer); timer = setTimeout(tick, 40); } };
+$("tab-replay").onclick = e => { e.preventDefault(); setMode("replay"); };
+$("tab-live").onclick = e => { e.preventDefault(); setMode("live"); };
+
+$("fetchbtn").onclick = async () => {
+  const gid = $("gid").value.trim();
+  const err = $("fetcherr");
+  err.textContent = "";
+  if (!/^\d+$/.test(gid)) { err.textContent = "Game id must be digits."; return; }
+  $("fetchbtn").disabled = true; $("fetchbtn").textContent = "…";
+  try {
+    const r = await fetch("/api/fetch/" + gid);
+    const j = await r.json();
+    if (!r.ok) throw new Error(j.error || r.statusText);
+    await loadList(); await loadGame(gid);
+  } catch (e) {
+    err.textContent = e.message;
+  } finally {
+    $("fetchbtn").disabled = false; $("fetchbtn").textContent = "Fetch";
+  }
+};
+
+document.addEventListener("keydown", e => {
+  if (mode !== "replay" || !game) return;
+  if (e.target.tagName === "INPUT" && e.target.type !== "range") return;
+  if (e.key === " ") { e.preventDefault(); playPause(); }
+  else if (e.key === "ArrowRight") { e.preventDefault(); stop(); step(1); }
+  else if (e.key === "ArrowLeft") { e.preventDefault(); stop(); step(-1); }
+  else if (e.key === "Home") { stop(); idx = 0; render(); }
+  else if (e.key === "End") { stop(); idx = game.moments.length - 1; render(); }
+});
+
+setMode("replay");
+</script>
+</body>
+</html>
+```
+
+## `.github/workflows/tests.yml`
+
+```yaml
+name: tests
+
+# The project's whole safety story is "the tests catch train/serve skew", and
+# until now they ran only when somebody remembered to run them. The parity tests
+# in particular are the thing standing between a refactor and a silently
+# different model, so they belong on every push.
+#
+# Two jobs, because the suite splits cleanly in two:
+#
+#   fast  - no downloaded data. Everything that needs a parquet skips itself, so
+#           this still covers the adapters, the state rules, the endgame clamps,
+#           the monitor, the API, the config surface and the page's own stepping
+#           logic under node. Runs on every push.
+#   full  - fetches ONE season of hoopR play-by-play (~63 MB, not the whole
+#           527 MB) which is all the parity and replay-harness tests actually
+#           open. Runs on a schedule and on demand, and is cached.
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  schedule:
+    - cron: "0 6 * * 1"        # Monday morning, before anyone looks
+  workflow_dispatch:
+
+jobs:
+  fast:
+    name: "offline suite (py${{ matrix.python }})"
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.10 is the floor the checkpoint was built on; 3.12 is the drift check.
+        python: ["3.10", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+      - name: install
+        run: pip install numpy polars pyarrow lightgbm scikit-learn pytest
+      - name: pytest
+        run: python -m pytest -q
+      - name: the model artifact in the registry still loads and matches its manifest
+        run: |
+          python - <<'PY'
+          import pathlib, sys
+          sys.path.insert(0, "src")
+          from cbbwp.serve import WinProbabilityService
+          svc = WinProbabilityService(pathlib.Path("registry"), "v2")
+          print("loaded", svc.version, svc.manifest["sha256"])
+          PY
+
+  full:
+    name: "with one season of play-by-play"
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: install
+        run: pip install numpy polars pyarrow lightgbm scikit-learn pytest
+      - name: cache the play-by-play
+        uses: actions/cache@v4
+        with:
+          path: data/raw
+          key: hoopr-2025-v1
+      - name: fetch 2025 only
+        run: python scripts/fetch_data.py --seasons 2025
+      - name: pytest, including the parity and replay-harness tests
+        run: python -m pytest -q
+      - name: fail if the parity tests silently skipped
+        # A green run that skipped the very tests this job exists for is worse
+        # than a red one, because it reads as coverage that is not there.
+        run: |
+          python -m pytest tests/test_parity.py tests/test_replay_harness.py \
+            tests/test_possession_truth.py -q --no-header -rs 2>&1 | tee out.txt
+          if grep -qi "skipped" out.txt; then
+            echo "::error::parity tests skipped -- the data fetch did not land"
+            exit 1
+          fi
 ```

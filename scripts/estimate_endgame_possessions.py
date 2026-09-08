@@ -54,16 +54,42 @@ def runs_for_season(season: int) -> pl.DataFrame:
     )
     d = st.join(pbp, on=["game_id", "seq"], how="inner").sort(["game_id", "seq"])
 
-    # A run is a maximal stretch with the same possession value. 0.5 (jump ball,
-    # genuinely unknown) is carried forward rather than treated as its own run.
+    # A run is a maximal stretch during which ONE team had the ball. 0.5 (jump
+    # ball, genuinely unknown) is carried forward rather than treated as its own
+    # run.
     d = d.with_columns(pl.col("possession").replace(0.5, None).forward_fill().over("game_id"))
+
+    # Segment on the possession DURING each event, which is the state the
+    # PREVIOUS event left behind -- not `possession`, which is the state AFTER
+    # this one.
+    #
+    # This is the difference between measuring endgame fouling and measuring its
+    # mirror image. `state._possession_after` flips possession on every MADE free
+    # throw, so segmenting on the after-value cut each made free-throw trip out
+    # of the fouled team's run and pasted it onto the head of the FOULING team's
+    # next run. `fouled_to_line` below - the single most important parameter in
+    # the simulator, the one that makes an endgame an endgame - was therefore
+    # recorded against the team that committed the foul rather than the team that
+    # shot the free throws.
+    #
+    # The result was inverted and obviously so, once looked at: in the last ten
+    # seconds it had a TRAILING offence reaching the line 71-84% of the time and
+    # a LEADING offence 10-18%, when in real basketball it is the trailing
+    # defence that fouls the leading ball-handler. Fixed 2026-09-08.
     d = d.with_columns(
-        (pl.col("possession") != pl.col("possession").shift(1).over("game_id"))
+        pl.col("possession").shift(1).over("game_id").alias("poss_during")
+    )
+    # An unknown possession at the start of the window is not guessed at. These
+    # rows used to fall through the `otherwise` branch below and be recorded
+    # silently as the away team's.
+    d = d.filter(pl.col("poss_during").is_not_null())
+    d = d.with_columns(
+        (pl.col("poss_during") != pl.col("poss_during").shift(1).over("game_id"))
         .fill_null(True).cast(pl.Int32).cum_sum().over("game_id").alias("run")
     )
     g = d.group_by(["game_id", "run"]).agg(
         [
-            pl.first("possession").alias("off_is_home"),
+            pl.first("poss_during").alias("off_is_home"),
             pl.first("margin").alias("margin_start"),
             pl.first("game_seconds_remaining").alias("t_start"),
             pl.last("game_seconds_remaining").alias("t_end"),

@@ -32,11 +32,11 @@ sys.path.insert(0, str(ROOT / "src"))
 from cbbwp.adapters.espn import EspnClient          # noqa: E402
 from cbbwp.api import LiveStore, serve_in_thread    # noqa: E402
 from cbbwp.config import Settings                   # noqa: E402
-from cbbwp.live_context import LiveContextProvider  # noqa: E402
+from cbbwp.live_context import ReloadingContextProvider  # noqa: E402
 from cbbwp.serve import WinProbabilityService       # noqa: E402
 
 sys.path.insert(0, str(ROOT / "scripts"))
-from live_poller import Poller                      # noqa: E402
+from live_poller import Poller, default_out_path    # noqa: E402
 
 
 def main() -> int:
@@ -57,7 +57,13 @@ def main() -> int:
               "  run: python3 scripts/build_live_context.py --season <year>",
               file=sys.stderr)
         return 2
-    ctx = LiveContextProvider.load(cfg.context_path)
+    # Reloading, not load-once: the ratings snapshot is rebuilt by a separate
+    # daily job while this process stays up for weeks. See ReloadingContextProvider.
+    ctx = ReloadingContextProvider(
+        cfg.context_path,
+        on_reload=lambda p: print(
+            f"ratings snapshot reloaded: generated {p.generated}, "
+            f"{len(p.ratings)} teams", flush=True))
     if ctx.data_is_stale:
         print(f"warning: ratings were fit on stale data -- newest completed game is "
               f"{ctx.data_age_days:.1f} days old.\n"
@@ -73,15 +79,14 @@ def main() -> int:
     svc = WinProbabilityService(cfg.registry, cfg.model_version)
 
     day = a.date or datetime.datetime.now().strftime("%Y%m%d")
-    out = cfg.live_dir / f"wp_{day}.jsonl"
 
     # A dry run against scripts/replay_server.py is a rehearsal, not a night of
     # basketball. Say so loudly, and default its output somewhere separate, so
-    # simulated states cannot silently accumulate in the real record.
+    # simulated states cannot silently accumulate in the real record. The rule
+    # itself lives in live_poller.default_out_path, so both entry points share it.
     client = EspnClient()
+    out = default_out_path(cfg.live_dir, day, client.is_replay)
     if client.is_replay:
-        if cfg.live_dir == pathlib.Path(cfg.root) / "data" / "live":
-            out = pathlib.Path(cfg.root) / "data" / "replay" / f"wp_{day}.jsonl"
         print(f"\n*** REPLAY MODE -- reading {client.base_url}, NOT ESPN.\n"
               f"*** Rows are tagged \"replay\": true and written to {out}\n",
               flush=True)

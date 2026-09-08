@@ -17,8 +17,11 @@ from __future__ import annotations
 import datetime as _dt
 import json
 import pathlib
+import sys
+import threading
+import time
 from dataclasses import dataclass
-from typing import Dict
+from typing import Dict, Optional
 
 from .schemas import PregameContext
 
@@ -145,3 +148,122 @@ class LiveContextProvider:
 
     def known(self, team_id: int) -> bool:
         return team_id in self.ratings
+
+
+class ReloadingContextProvider:
+    """A `LiveContextProvider` that re-reads its file when it changes on disk.
+
+    The deployment is a poller that runs for weeks and a SEPARATE daily job that
+    rebuilds the snapshot (`deploy/install_macos.sh` installs exactly that pair).
+    Loading once at startup made that composition silently useless: the running
+    process served launch-day ratings for the rest of the season, and `/health`
+    watched `ratings_age_days` climb past its own staleness threshold - reporting
+    503 and advising a rebuild that cron had already done, to a process that was
+    never going to read it.
+
+    So the freshness of the ratings is a property of the FILE, and every reader
+    goes through here. Delegates the whole `LiveContextProvider` surface, so it
+    is a drop-in for it.
+
+    Thread-safe: the poller reads from the asyncio loop and the API from its own
+    HTTP threads. Reads take the lock only long enough to copy a reference; the
+    provider itself is never mutated after construction, so callers can use the
+    snapshot they got without holding anything.
+    """
+
+    # Stat the file at most this often. A stat is microseconds, but the poller
+    # asks once per game per poll and there is no reason to make it more often
+    # than the rebuild job could possibly produce a new file.
+    CHECK_INTERVAL_SECONDS = 5.0
+
+    def __init__(self, path: str | pathlib.Path,
+                 check_interval: float = CHECK_INTERVAL_SECONDS,
+                 on_reload=None):
+        self.path = pathlib.Path(path)
+        self._check_interval = check_interval
+        self._on_reload = on_reload
+        self._lock = threading.Lock()
+        self._provider: LiveContextProvider = LiveContextProvider.load(self.path)
+        self._mtime: Optional[float] = self._stat_mtime()
+        self._last_check = time.monotonic()
+        self.reloads = 0
+        self.reload_failures = 0
+
+    def _stat_mtime(self) -> Optional[float]:
+        try:
+            return self.path.stat().st_mtime
+        except OSError:
+            return None
+
+    @property
+    def current(self) -> LiveContextProvider:
+        """The freshest snapshot, reloading first if the file has changed."""
+        now = time.monotonic()
+        with self._lock:
+            if now - self._last_check < self._check_interval:
+                return self._provider
+            self._last_check = now
+            mtime = self._stat_mtime()
+            if mtime is None or mtime == self._mtime:
+                return self._provider
+            try:
+                # A snapshot rewritten in place can be read half-written. The
+                # writer renames into place (build_live_context.py), so this is
+                # belt and braces -- but a torn read must never take down a live
+                # feed, and the previous ratings are a perfectly good answer.
+                fresh = LiveContextProvider.load(self.path)
+            except Exception as e:                      # noqa: BLE001
+                self.reload_failures += 1
+                print(f"warning: could not reload {self.path} "
+                      f"({type(e).__name__}: {e}); keeping the previous ratings",
+                      file=sys.stderr, flush=True)
+                # Do NOT record the mtime: retry on the next check, because the
+                # file is probably mid-write rather than permanently broken.
+                return self._provider
+            self._provider = fresh
+            self._mtime = mtime
+            self.reloads += 1
+            cb = self._on_reload
+        if cb is not None:
+            try:
+                cb(fresh)
+            except Exception:                           # noqa: BLE001
+                pass
+        return fresh
+
+    # -- the LiveContextProvider surface, all delegated to `current` ---------
+    def context_for(self, game_id: int, home_team_id: int, away_team_id: int,
+                    neutral_site: bool = False) -> PregameContext:
+        return self.current.context_for(game_id, home_team_id, away_team_id,
+                                        neutral_site)
+
+    def known(self, team_id: int) -> bool:
+        return self.current.known(team_id)
+
+    @property
+    def season(self) -> int:
+        return self.current.season
+
+    @property
+    def generated(self) -> str:
+        return self.current.generated
+
+    @property
+    def latest_game_date(self) -> str:
+        return self.current.latest_game_date
+
+    @property
+    def age_days(self) -> float:
+        return self.current.age_days
+
+    @property
+    def data_age_days(self) -> float | None:
+        return self.current.data_age_days
+
+    @property
+    def data_is_stale(self) -> bool:
+        return self.current.data_is_stale
+
+    @property
+    def is_stale(self) -> bool:
+        return self.current.is_stale

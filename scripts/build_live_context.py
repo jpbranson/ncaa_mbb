@@ -10,7 +10,7 @@ import sys, pathlib, json, datetime, argparse
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "src"))
 import numpy as np
 import polars as pl
-from cbbwp.ratings import _fit_ridge, CARRYOVER
+from cbbwp.ratings import _fit_ridge, carried_prior
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 LEAGUE_FT, PRIOR_FTA, LEAGUE_PPM = 0.700, 40.0, 3.45
@@ -23,13 +23,16 @@ a = ap.parse_args()
 
 games = pl.read_parquet(ROOT / "data/proc/games.parquet")
 season = a.season or int(games["season"].max())
-prev = season - 1 if season - 1 != 2020 else season - 2
 
-# --- 1. ratings: fit this season's completed games, prior = last season's ----
-prev_g = games.filter(pl.col("season") == prev)
-teams_prev = sorted(set(prev_g["home_id"].to_list()) | set(prev_g["away_id"].to_list()))
-prev_ratings, _ = _fit_ridge(prev_g, teams_prev, {})
-prior = {t: v * CARRYOVER for t, v in prev_ratings.items()}
+# --- 1. ratings: fit this season's completed games, prior = every season before
+#
+# The prior is CHAINED from the first season in the file, applying CARRYOVER at
+# each boundary, because that is what the training pipeline does
+# (cbbwp.ratings.build_all_seasons). This used to fit the single previous season
+# against an empty prior, which put the live pregame term on a different scale
+# from the one the model was fit on -- 1.3 points sd out in early November, when
+# that term matters most. See cbbwp.ratings.carried_prior.
+prior = carried_prior(games, season)
 
 cur = games.filter(pl.col("season") == season)
 teams = sorted(set(cur["home_id"].to_list()) | set(cur["away_id"].to_list()) | set(prior))
@@ -81,6 +84,11 @@ out = {
 }
 dest = pathlib.Path(a.out)
 dest.parent.mkdir(parents=True, exist_ok=True)
-dest.write_text(json.dumps(out))
+# Write-then-rename, because a long-running poller reloads this file whenever it
+# changes (cbbwp.live_context.ReloadingContextProvider). Writing in place would
+# give that reader a window in which the file is half a JSON document.
+tmp = dest.with_suffix(dest.suffix + ".tmp")
+tmp.write_text(json.dumps(out))
+tmp.replace(dest)
 print(f"wrote {dest}  ({len(ratings)} ratings, {len(ft_pct)} ft, {len(ppm)} ppm)")
 print(f"  newest completed game: {latest_game_date or 'none yet (preseason)'}")

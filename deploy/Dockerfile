@@ -19,10 +19,14 @@ RUN apt-get update \
  && apt-get install -y --no-install-recommends libgomp1 curl \
  && rm -rf /var/lib/apt/lists/*
 
+# Dependencies come from pyproject.toml rather than a second hand-written list
+# that can drift from it. src/ is copied first because the build needs it; the
+# `dev` extra brings pytest, so smoke_live.py's offline suite can run in here
+# instead of reporting a missing-pytest failure that looks like a broken suite.
 COPY pyproject.toml ./
-RUN pip install --no-cache-dir numpy polars lightgbm scikit-learn
-
 COPY src/ ./src/
+RUN pip install --no-cache-dir ".[dev]"
+
 COPY scripts/ ./scripts/
 COPY tests/ ./tests/
 

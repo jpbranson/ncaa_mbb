@@ -138,12 +138,17 @@ classifying trips on foul count in a season that has no such text.
 
 **The table works and beats ESPN alone.** On 2024, out of sample, knowing the
 score, clock, possession, fouls and free-throw ability but **nothing about how
-good either team is**: log loss 0.1384 against ESPN's 0.1518 on the same rows.
+good either team is**: log loss 0.1338 against ESPN's 0.1518 on the same rows.
 
-**The blend does not clear the bar.** Tested once on 2025–2026: 0.124624 →
-0.124130, a **0.40%** relative gain against a pre-registered 1%. Criteria 2–5 all
-pass (ECE improves, monotonicity exact, handoff invisible at 0.0007, 0.000068 ms
+**The blend does not clear the bar.** Tested once on 2025–2026: 0.124812 →
+0.124022, a **0.63%** relative gain against a pre-registered 1%. Criteria 2–5 all
+pass (ECE improves, monotonicity exact, handoff invisible at 1e-16, 0.000038 ms
 per state). Per the plan's own rule, it does not ship.
+
+*(Both figures re-measured 2026-09-08 after the audit found the fouling
+parameters attributed to the wrong team and the blend compared against an
+unclamped baseline. The table improved; the verdict did not change. See
+`cbbwp-endgame-results.md`.)*
 
 **The plan's blend shape was also wrong.** It assumed the simulator's weight
 should rise to 1.0 by 0:00. The model is at its *best* at 0:00 (0.0859 in the

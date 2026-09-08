@@ -1,0 +1,85 @@
+name: tests
+
+# The project's whole safety story is "the tests catch train/serve skew", and
+# until now they ran only when somebody remembered to run them. The parity tests
+# in particular are the thing standing between a refactor and a silently
+# different model, so they belong on every push.
+#
+# Two jobs, because the suite splits cleanly in two:
+#
+#   fast  - no downloaded data. Everything that needs a parquet skips itself, so
+#           this still covers the adapters, the state rules, the endgame clamps,
+#           the monitor, the API, the config surface and the page's own stepping
+#           logic under node. Runs on every push.
+#   full  - fetches ONE season of hoopR play-by-play (~63 MB, not the whole
+#           527 MB) which is all the parity and replay-harness tests actually
+#           open. Runs on a schedule and on demand, and is cached.
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  schedule:
+    - cron: "0 6 * * 1"        # Monday morning, before anyone looks
+  workflow_dispatch:
+
+jobs:
+  fast:
+    name: "offline suite (py${{ matrix.python }})"
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.10 is the floor the checkpoint was built on; 3.12 is the drift check.
+        python: ["3.10", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+      - name: install
+        run: pip install numpy polars pyarrow lightgbm scikit-learn pytest
+      - name: pytest
+        run: python -m pytest -q
+      - name: the model artifact in the registry still loads and matches its manifest
+        run: |
+          python - <<'PY'
+          import pathlib, sys
+          sys.path.insert(0, "src")
+          from cbbwp.serve import WinProbabilityService
+          svc = WinProbabilityService(pathlib.Path("registry"), "v2")
+          print("loaded", svc.version, svc.manifest["sha256"])
+          PY
+
+  full:
+    name: "with one season of play-by-play"
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: install
+        run: pip install numpy polars pyarrow lightgbm scikit-learn pytest
+      - name: cache the play-by-play
+        uses: actions/cache@v4
+        with:
+          path: data/raw
+          key: hoopr-2025-v1
+      - name: fetch 2025 only
+        run: python scripts/fetch_data.py --seasons 2025
+      - name: pytest, including the parity and replay-harness tests
+        run: python -m pytest -q
+      - name: fail if the parity tests silently skipped
+        # A green run that skipped the very tests this job exists for is worse
+        # than a red one, because it reads as coverage that is not there.
+        run: |
+          python -m pytest tests/test_parity.py tests/test_replay_harness.py \
+            tests/test_possession_truth.py -q --no-header -rs 2>&1 | tee out.txt
+          if grep -qi "skipped" out.txt; then
+            echo "::error::parity tests skipped -- the data fetch did not land"
+            exit 1
+          fi

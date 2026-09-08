@@ -21,7 +21,8 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "src"))
 from cbbwp.api import LiveStore, serve_in_thread            # noqa: E402
 from cbbwp.config import Settings                            # noqa: E402
 from cbbwp.live_context import (DATA_STALE_AFTER_DAYS,        # noqa: E402
-                                 LiveContextProvider)
+                                 LiveContextProvider,
+                                 ReloadingContextProvider)
 from cbbwp.schemas import STATE_RULES_VERSION                # noqa: E402
 
 
@@ -95,6 +96,85 @@ def test_preseason_snapshot_with_no_games_reports_unknown_not_stale():
     c = _ctx("")
     assert c.data_age_days is None
     assert c.data_is_stale is False
+
+
+# --- the ratings snapshot is reloaded, not read once at startup --------------
+#
+# The deployment is a poller that stays up for weeks plus a SEPARATE daily job
+# that rebuilds the snapshot (deploy/install_macos.sh installs exactly that
+# pair). Loading once made that composition silently useless: the process served
+# launch-day ratings all season, and /health watched ratings_age_days climb past
+# its own threshold, reporting 503 and advising a rebuild cron had already done.
+def _snapshot(path: pathlib.Path, rating: float, generated: str | None = None,
+              mtime: float | None = None) -> None:
+    path.write_text(json.dumps({
+        "generated": generated or dt.datetime.now(dt.timezone.utc).isoformat(),
+        "latest_game_date": "",
+        "season": 2027,
+        "hca": 3.4,
+        "ratings": {"1": rating},
+        "ft_pct": {}, "ppm": {},
+    }))
+    if mtime is not None:
+        import os
+        os.utime(path, (mtime, mtime))
+
+
+def test_a_rebuilt_snapshot_is_picked_up_without_a_restart(tmp_path):
+    p = tmp_path / "context.json"
+    _snapshot(p, 5.0, mtime=1_000_000.0)
+    ctx = ReloadingContextProvider(p, check_interval=0.0)
+    assert ctx.context_for(1, 1, 404).pregame_exp_margin == pytest.approx(5.0 + 3.4)
+
+    # The daily job rewrites the file underneath the running process.
+    _snapshot(p, 9.0, mtime=2_000_000.0)
+    assert ctx.context_for(1, 1, 404).pregame_exp_margin == pytest.approx(9.0 + 3.4)
+    assert ctx.reloads == 1
+
+
+def test_health_freshness_follows_the_file_not_the_process(tmp_path):
+    """The 503-after-three-days symptom, stated directly."""
+    p = tmp_path / "context.json"
+    old = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=30)).isoformat()
+    _snapshot(p, 1.0, generated=old, mtime=1_000_000.0)
+    ctx = ReloadingContextProvider(p, check_interval=0.0)
+    assert ctx.age_days > 29 and ctx.is_stale
+
+    _snapshot(p, 1.0, mtime=2_000_000.0)          # cron rebuilds it
+    assert ctx.age_days < 1, "a rebuilt snapshot still reports as stale"
+    assert not ctx.is_stale
+
+
+def test_a_torn_or_broken_snapshot_keeps_the_previous_ratings(tmp_path, capsys):
+    """A half-written file must never take down a live feed.
+
+    The writer renames into place, so this is belt and braces -- but the
+    previous ratings are a perfectly good answer and an exception here would
+    kill the poll loop mid-game.
+    """
+    p = tmp_path / "context.json"
+    _snapshot(p, 4.0, mtime=1_000_000.0)
+    ctx = ReloadingContextProvider(p, check_interval=0.0)
+
+    p.write_text('{"ratings": {"1": 9.0')                 # truncated mid-write
+    import os
+    os.utime(p, (2_000_000.0, 2_000_000.0))
+    assert ctx.context_for(1, 1, 404).pregame_exp_margin == pytest.approx(4.0 + 3.4)
+    assert ctx.reload_failures == 1
+    assert "could not reload" in capsys.readouterr().err
+
+    # ...and the retry succeeds once the writer finishes.
+    _snapshot(p, 7.0, mtime=3_000_000.0)
+    assert ctx.context_for(1, 1, 404).pregame_exp_margin == pytest.approx(7.0 + 3.4)
+
+
+def test_an_unchanged_file_is_not_reloaded(tmp_path):
+    p = tmp_path / "context.json"
+    _snapshot(p, 2.0, mtime=1_000_000.0)
+    ctx = ReloadingContextProvider(p, check_interval=0.0)
+    for _ in range(5):
+        ctx.context_for(1, 1, 404)
+    assert ctx.reloads == 0
 
 
 # --- the API ----------------------------------------------------------------

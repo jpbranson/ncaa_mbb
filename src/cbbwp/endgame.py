@@ -19,8 +19,15 @@ def max_points_remaining(seconds_remaining: np.ndarray) -> np.ndarray:
     return poss * MAX_POINTS_PER_POSSESSION
 
 
-def apply(p, margin, seconds_remaining, is_ot=None):
-    """Clamp probabilities that the rules have already decided."""
+def apply(p, margin, seconds_remaining):
+    """Clamp probabilities that the rules have already decided.
+
+    No `is_ot`: overtime needs no special case here. `game_seconds_remaining`
+    already restarts its own clock for each overtime period (state.py), so
+    "time expired" and "cannot catch up" mean the same thing inside an overtime
+    as they do in regulation. The parameter used to exist, was never passed and
+    was never read.
+    """
     p = np.array(p, dtype=np.float64, copy=True)
     margin = np.asarray(margin)
     t = np.asarray(seconds_remaining, dtype=np.float64)

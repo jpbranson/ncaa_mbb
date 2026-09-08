@@ -147,26 +147,43 @@ seconds remaining. `p_fouled_to_line` = the possession reached the line without
 the offence taking a shot, which is what "they fouled to stop the clock" looks
 like in a feed that does not label intent.
 
+> **Re-measured 2026-09-08.** The numbers first published in this section were
+> the mirror image of these, because possession runs were segmented on the
+> possession *after* each event and a made free throw flips possession — so a
+> free-throw trip was credited to the team that committed the foul rather than
+> the team that shot it. The table below is the corrected measurement; the
+> reading of it has changed accordingly. See `AUDIT-2026-09-08.md` H2.
+
 | Offence's margin | t = 0–9s | 10–19s | 20–29s | 30–39s | 50–59s |
 |---|---|---|---|---|---|
-| +1 | 0.241 | 0.314 | 0.350 | 0.312 | 0.245 |
-| +2 | 0.329 | 0.357 | 0.367 | 0.333 | 0.234 |
-| +3 | 0.180 | 0.343 | 0.374 | 0.334 | 0.294 |
-| +5 | 0.140 | 0.300 | 0.341 | 0.359 | 0.328 |
-| +8 or more | 0.082 | 0.166 | 0.198 | 0.236 | 0.250 |
-| **−3** | **0.714** | **0.692** | 0.555 | 0.387 | 0.250 |
+| +1 | 0.569 | 0.776 | 0.682 | 0.485 | 0.313 |
+| +2 | 0.591 | 0.821 | 0.740 | 0.552 | 0.327 |
+| +3 | 0.540 | 0.839 | 0.755 | 0.631 | 0.447 |
+| +5 | 0.428 | 0.853 | 0.846 | 0.797 | 0.611 |
+| +8 or more | 0.053 | 0.439 | 0.469 | 0.470 | 0.452 |
+| −1 | 0.246 | 0.306 | 0.319 | 0.320 | 0.300 |
+| −3 | 0.527 | 0.552 | 0.483 | 0.381 | 0.308 |
 
-Two coaching strategies fall straight out of the feed without being told to:
+Three coaching strategies fall straight out of the feed without being told to:
 
-- **Foul when trailing.** With the ball and up 1–5 inside 30 seconds, a team is
-  sent to the line on a third of its possessions; up 8 or more, half that.
+- **Foul the leader.** A team *with the ball and ahead* is the one that gets
+  fouled: up 1–5 inside 20 seconds it is sent to the line on 68–85% of its
+  possessions. That is the trailing defence stopping the clock, and it is the
+  single behaviour that makes an endgame an endgame.
+- **Stop fouling when it is over.** Up 8 or more inside 10 seconds, the rate
+  collapses to 5%. Nobody fouls a game that is already decided.
 - **Foul up three.** A team *trailing by three* with the ball inside 10 seconds
-  is fouled 71% of the time — the defence trading a free-throw trip for the
-  chance to deny a tying three.
+  is still fouled 53% of the time — the mirror strategy, a leading defence
+  trading a free-throw trip for the chance to deny a tying three. It shows up as
+  a bump against the −1 row (25%), where there is no three to deny.
 
-Mean possession length collapses from 13.8s (50–59s left) to 1.3s (0–9s left):
+The 0–9s column sits below the 10–19s column throughout, which is not teams
+declining to foul: it is possessions that simply end with the buzzer before
+anyone can.
+
+Mean possession length collapses from 5.6s (50–59s left) to 1.0s (0–9s left):
 the endgame is a rapid foul/inbound cycle, not a sequence of normal possessions.
-Turnovers end 28.5% of late possession-ending events. Mean gap from a made free
+Turnovers end 11.5% of late possession-ending events. Mean gap from a made free
 throw to the next foul is 8.7s, modal 7–9s.
 
 ## 6. Notes for Phase 3

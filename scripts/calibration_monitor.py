@@ -1,4 +1,4 @@
-"""Weekly calibration drift check. Exit code 1 means "look at this".
+r"""Weekly calibration drift check. Exit code 1 means "look at this".
 
 Two sources, same check:
 
@@ -75,7 +75,18 @@ def from_live(args):
                 rows.append(json.loads(line))
     if not rows:
         raise SystemExit("live files are empty")
-    live = pl.DataFrame(rows).select(
+    # Rehearsal rows are tagged at the source (live_poller.decorate). Tagging
+    # them is only worth anything if the consumer that grades the model actually
+    # looks: a replayed archive would otherwise be scored as if it were a night
+    # of real games, and counted twice alongside the backtest.
+    replayed = [r for r in rows if r.get("replay")]
+    if replayed:
+        print(f"note: {len(replayed):,} replay rows skipped (rehearsal, not live)",
+              file=sys.stderr)
+        rows = [r for r in rows if not r.get("replay")]
+    if not rows:
+        raise SystemExit("every live row was tagged as a replay; nothing to check")
+    live = pl.DataFrame(rows, infer_schema_length=None).select(
         "game_id", "home_win_prob", "game_seconds_remaining")
     games = pl.read_parquet(ROOT / "data/proc/games.parquet").select(
         "game_id", "home_win")

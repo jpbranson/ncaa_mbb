@@ -4,15 +4,49 @@
 (`cbbwp-endgame-plan.md`). The test below was run once, on 2025–2026, after the
 blend was tuned on 2024. This document reports what happened.*
 
+> **Rebuilt 2026-09-08 after a measurement bug was found in the fouling
+> parameters** (audit H2, `AUDIT-2026-09-08.md`). Possession runs were segmented
+> on the possession AFTER each event, and a made free throw flips possession —
+> so every made-free-throw trip was attributed to the team that committed the
+> foul instead of the team that shot it. The measured foul rate was therefore
+> the mirror image of reality: a *trailing* offence recorded as reaching the line
+> 71–84% of the time in the last ten seconds, a *leading* offence 10–18%, when in
+> real basketball it is the trailing defence that fouls the leading ball-handler.
+>
+> Everything below is re-measured with that corrected. The table got materially
+> better and **the verdict did not change** — which is the outcome a
+> pre-registered bar is for. Superseded numbers are kept in the tables below so
+> the correction is auditable rather than merely asserted.
+
 ## Verdict: it does not ship
 
 | # | Criterion | Result | |
 |---|---|---|---|
-| 1 | Log loss improves ≥1% relative in the <60s bucket | **0.40%** (0.124624 → 0.124130) | **fail** |
-| 2 | Calibration does not get worse | ECE 0.004855 → **0.003663**; `monitor.check` alerts 0 → 0 | pass |
+| 1 | Log loss improves ≥1% relative in the <60s bucket | **0.63%** (0.124812 → 0.124022) | **fail** |
+| 2 | Calibration does not get worse | ECE 0.005777 → **0.004143**; `monitor.check` alerts 0 → 0 | pass |
 | 3 | Monotonicity holds, checked exhaustively | 0 margin violations, 0 possession violations across 1,660,725 states | pass |
-| 4 | The blend is invisible at the 60s handoff | max \|Δp\| = **0.00069** (bar: 0.02) | pass |
-| 5 | Fast enough to serve | **0.000068 ms**/state (bar: 1 ms) | pass |
+| 4 | The blend is invisible at the 60s handoff | max \|Δp\| = **1.1e-16** (bar: 0.02) | pass |
+| 5 | Fast enough to serve | **0.000038 ms**/state (bar: 1 ms) | pass |
+
+Criterion 1, before and after the fouling fix, on a like-for-like baseline:
+
+| | baseline (model + clamps) | blended | relative |
+|---|---|---|---|
+| As first published | 0.124624 *(unclamped)* | 0.124130 | 0.40% |
+| Same run, clamped baseline | 0.124812 | 0.124130 | 0.55% |
+| **After the fouling fix** | **0.124812** | **0.124022** | **0.63%** |
+
+Two separate corrections are folded into that last row, and they are worth
+keeping apart:
+
+* **The baseline was wrong.** `blend_endgame.py` compared a rules-clamped blend
+  against an *unclamped* model, while the shipped path (`serve.py`) applies the
+  clamps to the model. That flattered the blend by measuring the clamps as part
+  of it. Fixed; both numbers are now reported.
+* **The table was wrong**, per the note above. Fixing it moved the honest
+  comparison from 0.55% to 0.63%.
+
+The bar is 1%. It is still not close.
 
 The plan's rule was explicit: *"If it clears 2–5 but not 1, it does not ship. It
 becomes a documented diagnostic, like `calibration.py`, and EXPLAIN gets a
@@ -86,7 +120,8 @@ genuinely out of sample and is not one of the held-out test seasons.
 
 | Last 60s of 2H/OT, 2024, 103,554 states | log loss | Brier | accuracy | ECE |
 |---|---|---|---|---|
-| **Endgame table alone** | **0.1384** | 0.0387 | 94.71% | 0.0173 |
+| **Endgame table alone** | **0.1338** | 0.0380 | 94.70% | 0.0090 |
+| *(before the fouling fix)* | *0.1384* | *0.0387* | *94.71%* | *0.0173* |
 | ESPN (deployed), same rows | 0.1518 | 0.0429 | 94.40% | 0.0309 |
 
 A table that knows the score, the clock, possession, the foul counts and how
@@ -94,10 +129,19 @@ well the two teams shoot free throws — and **nothing whatever about how good
 either team is** — beats a deployed commercial model in the last minute. Phase 4
 asked only for honesty; it got that and more.
 
-Its one systematic flaw is under-confidence: states it calls 0.75 are won 0.85 of
-the time, states it calls 0.145 are won 0.109 of the time. The table is too
-generous to comebacks, most likely because possession lengths enter as means and
-so allow slightly too many possessions to be squeezed in.
+Correcting the fouling attribution improved every column, and nearly halved the
+calibration error (ECE 0.0173 → 0.0090). It also all but removed the need for
+the isotonic repair the build applies: the raw solve's largest margin violation
+fell from 6.6e-3 to 5.6e-5, and the free-throw-bucket monotonicity violations
+went from 6,543 to zero. A table built on measurements that say leading teams
+are never fouled has to be bent into shape afterwards; one built on the real
+numbers very nearly comes out monotone on its own. That is the strongest
+evidence that the corrected parameters are the right ones.
+
+Its one systematic flaw is still under-confidence: states it calls 0.755 are won
+0.814 of the time. The table remains too generous to comebacks, most likely
+because possession lengths enter as means and so allow slightly too many
+possessions to be squeezed in.
 
 ## Phase 5 — the blend
 
@@ -122,10 +166,11 @@ model's strongest region. The weight schedule was therefore given a free
 ceiling — `w(t) = w_max · (1 − (t/60)^γ)`, which is exactly 0 at the handoff, so
 criterion 4 holds by construction rather than by tuning.
 
-Tuned on 2024: γ = 6, **w_max = 0.20**, table log-odds scaled by α = 0.75,
-β = 0.05. On the tuning season itself that gives 0.12084 against the model's
-0.12199 — a 0.94% improvement **on the data it was tuned on**, already under the
-1% bar.
+Re-tuned on 2024 after the fouling fix: γ = 8, **w_max = 0.30**, table log-odds
+scaled by α = 0.80, β = 0.05. On the tuning season itself that gives 0.12138
+against the model's 0.12229 — a 0.74% improvement **on the data it was tuned
+on**, already under the 1% bar. (The corrected table earns more weight than the
+old one did: w_max went from 0.20 to 0.30.)
 
 ### The single-shot test
 
@@ -134,19 +179,25 @@ written before the test and hashed into the result.
 
 | | log loss |
 |---|---|
-| Model alone | 0.124624 |
-| **Blended** | **0.124130** (+0.40%) |
-| Table alone | 0.140429 |
+| Model alone (with the clamps it ships with) | 0.124812 |
+| **Blended** | **0.124022** (+0.63%) |
+| Table alone | 0.134313 *(was 0.140429)* |
 | ESPN, same rows | 0.154912 |
 
 | bucket | n | model | blended | table alone |
 |---|---|---|---|---|
-| 0–10s | 74,374 | 0.11219 | **0.11126** | 0.14319 |
-| 10–30s | 85,572 | 0.13713 | **0.13624** | 0.14901 |
-| 30–60s | 101,586 | **0.12313** | 0.12328 | 0.13126 |
+| 0–10s | 74,374 | 0.11259 | **0.11121** | 0.14042 |
+| 10–30s | 85,572 | 0.13727 | **0.13610** | 0.13966 |
+| 30–60s | 101,586 | 0.12321 | **0.12316** | 0.12540 |
 
-The gain is real but small, and it is not uniform: 30–60s gets very slightly
-worse. 0.40% against a 1% bar is not close enough to argue about.
+The gain is real but small. It is now at least uniform — with the corrected
+table every bucket improves, where before 30–60s got very slightly worse — but
+0.63% against a 1% bar is still not close enough to argue about.
+
+The table alone improved by 4.4% relative (0.140429 → 0.134313) and the blend by
+only 0.08 percentage points, which is not a contradiction: the weight schedule
+caps the table's influence at `w_max`, so most of a better table is deliberately
+left on the floor inside a window where the model is already strong.
 
 ## Why it failed, and what would change it
 
@@ -155,7 +206,7 @@ bonus, free-throw ability are all features — **and also knows how good the two
 teams are**, which the table does not. So the table's only possible contribution
 is a better functional form for the endgame, and LightGBM with monotone
 constraints, trained on 5.4 million states, has already learned most of that
-shape. The 0.40% is what remains.
+shape. The 0.63% is what remains.
 
 Two things would plausibly change the answer, neither of them a tweak:
 

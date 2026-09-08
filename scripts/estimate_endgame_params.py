@@ -134,9 +134,15 @@ def annotate(df: pl.DataFrame) -> pl.DataFrame:
 
     # A trip is a run of free throws by one team at one dead ball.
     ft = pl.col("isft")
-    prev_i = pl.when(ft).then(pl.col("i")).otherwise(None).forward_fill().over("game_id").shift(1)
-    prev_team = pl.when(ft).then(pl.col("team_id")).otherwise(None).forward_fill().over("game_id").shift(1)
-    prev_sec = pl.when(ft).then(pl.col("sec")).otherwise(None).forward_fill().over("game_id").shift(1)
+    # `.shift(1)` must be INSIDE the per-game window, not after it. Outside, the
+    # first free throw of a game compares itself against the last free throw of
+    # the previous game in the frame -- which happens to be harmless today only
+    # because the `(i - prev_i) > 8` guard catches it (i is a season-global row
+    # index, so the gap across a game boundary is enormous). That is an accident,
+    # not a property, and it would break the moment `i` became per-game.
+    prev_i = pl.when(ft).then(pl.col("i")).otherwise(None).forward_fill().shift(1).over("game_id")
+    prev_team = pl.when(ft).then(pl.col("team_id")).otherwise(None).forward_fill().shift(1).over("game_id")
+    prev_sec = pl.when(ft).then(pl.col("sec")).otherwise(None).forward_fill().shift(1).over("game_id")
     new_trip = ft & (
         prev_i.is_null()
         | (pl.col("team_id") != prev_team)
@@ -174,11 +180,14 @@ def _nk(frame: pl.DataFrame, col: str = "scoring_play") -> dict:
     return {"n": int(len(frame)), "k": int(frame[col].sum()) if len(frame) else 0}
 
 
-def trip_kind() -> pl.Expr:
+def trip_kind(andone: str = "andone", n_shots: str = "n_shots",
+              opp_fouls: str = "opp_fouls") -> pl.Expr:
+    """Classify a free-throw trip. Column names are arguments so the inputs can
+    be resolved PER TRIP rather than per row -- see `count_season`."""
     return (
-        pl.when(pl.col("andone")).then(pl.lit("and_one"))
-        .when(pl.col("n_shots") >= 3).then(pl.lit("shooting_3"))
-        .when((pl.col("opp_fouls") >= BONUS_FOULS) & (pl.col("opp_fouls") < DOUBLE_BONUS_FOULS))
+        pl.when(pl.col(andone)).then(pl.lit("and_one"))
+        .when(pl.col(n_shots) >= 3).then(pl.lit("shooting_3"))
+        .when((pl.col(opp_fouls) >= BONUS_FOULS) & (pl.col(opp_fouls) < DOUBLE_BONUS_FOULS))
         .then(pl.lit("one_and_one"))
         .otherwise(pl.lit("two_shot"))
     )
@@ -191,8 +200,18 @@ def count_season(df: pl.DataFrame) -> dict:
     ft = df.filter(pl.col("isft")).with_columns(
         pl.col("i").rank("ordinal").over(["game_id", "trip"]).alias("shot_no")
     )
-    sizes = ft.group_by(["game_id", "trip"]).agg(pl.len().alias("n_shots"))
-    ft = ft.join(sizes, on=["game_id", "trip"], how="left").with_columns(trip_kind().alias("kind"))
+    # A trip has ONE kind. Classifying per row let a single trip call its first
+    # shot `and_one` and its second `two_shot`, splitting one trip's shots
+    # across two free-throw-rate cells and quietly contaminating both. Both
+    # inputs are therefore resolved per trip: `andone` is a property of the
+    # whole trip, and the bonus state is read at the trip's first shot.
+    sizes = ft.group_by(["game_id", "trip"]).agg([
+        pl.len().alias("n_shots"),
+        pl.col("andone").any().alias("trip_andone"),
+        pl.col("opp_fouls").sort_by("i").first().alias("trip_opp_fouls"),
+    ])
+    ft = ft.join(sizes, on=["game_id", "trip"], how="left").with_columns(
+        trip_kind("trip_andone", "n_shots", "trip_opp_fouls").alias("kind"))
 
     windows = {
         "all_game": pl.lit(True),

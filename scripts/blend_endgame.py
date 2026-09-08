@@ -153,12 +153,19 @@ def main() -> None:
         inside = d["secs"] <= HANDOFF
         y, sec = d["y"][inside], d["secs"][inside]
         pm, pt = d["p_model"][inside], d["p_table"][inside]
+        margin_in = d["margin"][inside]
+        # Tune against the objective --test will measure: the clamped blend
+        # versus the clamped model. Optimising the unclamped blend chose
+        # parameters for a quantity nothing ever reports.
+        clamped = lambda p: apply_rules(p, margin_in, sec)
+        pm_shipped = clamped(pm)
         best = None
         for gamma in (1.0, 1.5, 2.0, 3.0, 4.0, 6.0, 8.0):
             for w_max in np.arange(0.05, 0.85, 0.05):
                 for alpha in np.arange(0.7, 1.35, 0.05):
                     for beta in (-0.05, 0.0, 0.05):
-                        ll = log_loss(y, blend(pm, pt, sec, gamma, alpha, beta, w_max))
+                        ll = log_loss(y, clamped(
+                            blend(pm, pt, sec, gamma, alpha, beta, w_max)))
                         if best is None or ll < best[0]:
                             best = (ll, gamma, float(alpha), beta, float(w_max))
         ll, gamma, alpha, beta, w_max = best
@@ -167,7 +174,8 @@ def main() -> None:
             "w_max": w_max,
             "table": a.table, "model": a.model, "tuned_on_season": TUNE_SEASON,
             "tune_log_loss_inside_60s": ll,
-            "tune_baseline_model_only": log_loss(y, pm),
+            "tune_baseline_model_only": log_loss(y, pm_shipped),
+            "tune_baseline_model_only_unclamped": log_loss(y, pm),
             "tune_table_only": log_loss(y, pt),
             "n_tune_rows": int(inside.sum()),
         }
@@ -192,14 +200,23 @@ def main() -> None:
 
     p_blend_raw = blend(d["p_model"], d["p_table"], d["secs"], cfg["gamma"], cfg["alpha"], cfg["beta"], cfg["w_max"])
     p_blend = apply_rules(p_blend_raw, d["margin"], d["secs"])
-    p_model = d["p_model"]
+    # The baseline has to be what actually SHIPS, and what ships is the model
+    # WITH these clamps -- serve.py applies them on every prediction. Comparing a
+    # clamped blend against an unclamped model measured the clamps and the table
+    # together and credited the whole difference to the table. Corrected
+    # 2026-09-08; both numbers are reported so the older figure stays explicable.
+    p_model_unclamped = d["p_model"]
+    p_model = apply_rules(p_model_unclamped, d["margin"], d["secs"])
 
     inside = d["secs"] <= HANDOFF
     ok = np.isfinite(d["espn"])
     res = {
         "config_sha256_16": cfg_hash, "config": cfg, "seasons": TEST_SEASONS,
         "criterion_1_log_loss_under_60s": {
+            # `model_only` is the shipped path: model + rule clamps.
             "model_only": log_loss(d["y"][inside], p_model[inside]),
+            "model_only_unclamped": log_loss(d["y"][inside],
+                                             p_model_unclamped[inside]),
             "blended": log_loss(d["y"][inside], p_blend[inside]),
             "table_only": log_loss(d["y"][inside], d["p_table"][inside]),
             "espn": log_loss(d["y"][inside & ok], d["espn"][inside & ok]),
@@ -207,6 +224,7 @@ def main() -> None:
         },
         "criterion_2_ece_under_60s": {
             "model_only": ece(d["y"][inside], p_model[inside]),
+            "model_only_unclamped": ece(d["y"][inside], p_model_unclamped[inside]),
             "blended": ece(d["y"][inside], p_blend[inside]),
         },
     }

@@ -103,6 +103,43 @@ def season_pregame_margins(games: pl.DataFrame, prior: Dict[int, float], lam: fl
     return joined, final_ratings, final_hca
 
 
+def season_end_ratings(season_games: pl.DataFrame, prior: Dict[int, float],
+                       lam: float | None = None) -> tuple[Dict[int, float], float]:
+    """End-of-season ratings for one season, given the prior carried into it.
+
+    Exactly the fit `season_pregame_margins` performs for its own return value,
+    lifted out so the live snapshot can reuse it instead of writing a second,
+    subtly different version. The team list is that season's teams, which is
+    what makes a team that stopped playing drop out of the carry.
+    """
+    teams = sorted(set(season_games["home_id"].to_list())
+                   | set(season_games["away_id"].to_list()))
+    return _fit_ridge(season_games, teams, prior, lam)
+
+
+def carried_prior(games: pl.DataFrame, before_season: int,
+                  lam: float | None = None) -> Dict[int, float]:
+    """The prior `build_all_seasons` would carry into `before_season`.
+
+    THE POINT OF THIS FUNCTION is that the live path used to build its prior
+    from a SINGLE previous season fit against an empty prior, while training
+    chains every season from 2016 and applies CARRYOVER at each boundary. Same
+    ridge fit, different prior - so `pregame_exp_margin` served live was not the
+    quantity the model was trained on. Measured on the real data, the two
+    disagreed by 1.3 points sd (max 6.8) over the first fortnight of November,
+    which is exactly when the pregame term carries the most weight.
+
+    `tests/test_ratings_parity.py` holds the two definitions together.
+    """
+    prior: Dict[int, float] = {}
+    for s in sorted(x for x in games["season"].unique().to_list()
+                    if x < before_season):
+        final, _ = season_end_ratings(games.filter(pl.col("season") == s),
+                                      prior, lam)
+        prior = {t: v * CARRYOVER for t, v in final.items()}
+    return prior
+
+
 def build_all_seasons(games: pl.DataFrame, lam: float | None = None) -> pl.DataFrame:
     """Walk seasons in order, carrying each season's ratings into the next."""
     prior: Dict[int, float] = {}

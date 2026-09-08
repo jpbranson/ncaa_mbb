@@ -7,7 +7,12 @@ name = "cbbwp"
 version = "0.2.0"
 description = "College basketball live win probability model"
 requires-python = ">=3.10"
-dependencies = ["numpy", "polars", "scikit-learn", "lightgbm"]
+# pyarrow is not optional in practice: polars needs it to read the hoopR parquet
+# files, which is the first step of every pipeline here.
+dependencies = ["numpy", "polars", "pyarrow", "scikit-learn", "lightgbm"]
+
+[project.optional-dependencies]
+dev = ["pytest"]
 
 [tool.setuptools.packages.find]
 where = ["src"]

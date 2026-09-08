@@ -30,6 +30,7 @@ tell "not validated yet" from "validated and broken".
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import pathlib
 import subprocess
@@ -108,6 +109,13 @@ def main() -> int:
     # 3 --- the offline test suite still passes ----------------------------
     if a.no_tests:
         record("3 offline test suite", SKIP, "--no-tests")
+    elif importlib.util.find_spec("pytest") is None:
+        # The serving image deliberately ships without pytest. "pytest is not
+        # installed here" is not "the test suite fails", and reporting it as a
+        # FAIL sends whoever runs this in a container hunting a broken suite.
+        record("3 offline test suite", SKIP,
+               "pytest is not installed in this interpreter -- run the suite on "
+               "the host, or pip install pytest")
     else:
         try:
             r = subprocess.run([sys.executable, "-m", "pytest", "-q"], cwd=ROOT,

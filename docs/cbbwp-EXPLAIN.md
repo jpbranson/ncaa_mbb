@@ -885,19 +885,25 @@ that with the model. It was built, in full, and it is **not in the serving path*
 The bar was written first, in `cbbwp-endgame-plan.md`, before any code existed, because
 "we built it and did not ship it" is only a credible outcome if the threshold was set in
 advance. Five criteria; the first was a 1% relative log-loss improvement inside 60 seconds.
-Tested once on 2025-2026: **0.40%**. Criteria 2-5 all passed — calibration improved (ECE
-0.00485 to 0.00366, no new monitor alert), monotonicity is exact across all 1,660,725
-states, the 60-second handoff moves probabilities by at most 0.0007, and a lookup costs
-0.000068 ms. The plan's rule was that clearing 2-5 but not 1 means it does not ship, so it
+Tested once on 2025-2026: **0.63%**. Criteria 2-5 all passed — calibration improved (ECE
+0.00578 to 0.00414, no new monitor alert), monotonicity is exact across all 1,660,725
+states, the 60-second handoff moves probabilities by at most 1e-16, and a lookup costs
+0.000038 ms. The plan's rule was that clearing 2-5 but not 1 means it does not ship, so it
 does not ship.
+
+*(Re-measured 2026-09-08. The first published figure was 0.40%, from a run that
+compared a rules-clamped blend against an unclamped model and used fouling
+parameters attributed to the wrong team — see `AUDIT-2026-09-08.md` H2 and
+`cbbwp-endgame-results.md`. Both are fixed; the verdict is unchanged, which is
+what a bar set in advance is for.)*
 
 Three things came out of it that are worth more than the blend would have been.
 
 **The table is a sharp measurement in its own right.** On 2024, out of sample, knowing the
 score, the clock, possession, both foul counts and how well the two teams shoot free
-throws — and *nothing at all* about how good either team is — it scores 0.1384 against
+throws — and *nothing at all* about how good either team is — it scores 0.1338 against
 ESPN's 0.1518 on the same rows. That is a statement about how much of endgame win
-probability is pure structure, and it is worth more as a diagnostic than as a 0.4% blend.
+probability is pure structure, and it is worth more as a diagnostic than as a 0.6% blend.
 
 **A free-throw statistic that looked like a rule change was a censoring artifact.** "1 of 1"
 free throws convert at 0.537, which was flagged as a possible second instance of the

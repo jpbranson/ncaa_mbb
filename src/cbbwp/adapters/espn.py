@@ -32,7 +32,7 @@ from typing import Any, Iterable, List, Optional, Sequence
 
 from ..schemas import Event, PregameContext
 from ..schemas import HALF_SECONDS, OT_SECONDS
-from ..state import clock_to_seconds, game_seconds_remaining
+from ..state import clock_to_seconds, game_seconds_remaining, parse_clock
 
 SITE_API = "https://site.api.espn.com/apis/site/v2/sports/basketball/mens-college-basketball"
 SCOREBOARD_URL = SITE_API + "/scoreboard"
@@ -153,6 +153,26 @@ def chronological_inversions(events: Sequence[Event]) -> int:
                 + (OT_SECONDS - e.clock_seconds))
     t = [elapsed(e) for e in events]
     return sum(1 for i in range(1, len(t)) if t[i] < t[i - 1])
+
+
+def clock_parse_failures(plays: Sequence[dict]) -> int:
+    """Plays carrying a clock string this code cannot read.
+
+    Zero on every real ESPN payload measured so far. A non-zero count is the
+    same class of signal as an unknown play-type id: the feed has changed shape,
+    and states are being built on a clock of 0 that nobody measured. In the
+    second half that fabricated 0 means "the game is over" to `endgame.apply`,
+    which will then clamp the published probability to near-certainty.
+
+    A play with NO clock at all is not counted: ESPN sends administrative rows
+    that way and always has. Only a present-but-unreadable value counts.
+    """
+    n = 0
+    for p in plays:
+        raw = str((p.get("clock") or {}).get("displayValue") or "").strip()
+        if raw and parse_clock(raw) is None:
+            n += 1
+    return n
 
 
 def events_from_plays(plays: Sequence[dict], game_id: int) -> List[Event]:

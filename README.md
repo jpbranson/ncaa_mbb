@@ -178,7 +178,7 @@ scripts/           the pipeline, the poller, the smoke test, the replay
                    server, the viz app, the monitor
 web/               the viz app's single page (no build step, no CDN)
 deploy/            macOS LaunchAgents, Dockerfile, compose
-tests/             110 tests
+tests/             121 tests
 docs/              the project docs, kept alongside the code
 data/, artifacts/, registry/   built locally; not source
 ```

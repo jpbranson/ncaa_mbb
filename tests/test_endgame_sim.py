@@ -56,8 +56,45 @@ def test_time_expired_is_decided_by_the_scoreboard(table):
 
 @needs_table
 def test_a_made_basket_never_lowers_your_win_probability(table):
-    """Criterion 3, exhaustively -- every state, not a sample."""
+    """Criterion 3, exhaustively -- every state, not a sample.
+
+    Note what this can and cannot fail on. `build_endgame_table.py` isotonically
+    projects the solved table along the margin axis before publishing it, so
+    margin-monotonicity of the PUBLISHED array is true by construction. Keeping
+    the check is still worth it -- it catches a projection that did not run, or
+    an axis order that moved -- but the honest signal about the model is the
+    size of the correction that projection had to make, which is asserted in
+    `test_the_isotonic_projection_barely_had_to_do_anything` below.
+    """
     assert np.diff(table, axis=1).min() >= -1e-6
+
+
+@needs_table
+def test_the_isotonic_projection_barely_had_to_do_anything(manifest):
+    """The claim the published table's own monotonicity cannot make.
+
+    Parameters are estimated from finite samples, so a cell can land a fraction
+    below its neighbour and projecting is honest. A LARGE correction would mean
+    something different: that the solver is producing a shape the projection is
+    hiding. The manifest records both numbers, so bound them here rather than
+    trusting a check that cannot fail.
+    """
+    moved = manifest["isotonic_max_correction"]
+    assert moved < 0.02, (
+        f"the projection moved a cell by {moved:.4f}; that is no longer noise "
+        "in the parameter estimates, it is the model disagreeing with itself")
+
+    before = manifest["monotonicity_before"]
+    after = manifest["monotonicity_after"]
+    # The projection must fix margin monotonicity...
+    assert before["margin_violations"] > 0, (
+        "no pre-projection violations recorded -- has the manifest stopped "
+        "reporting the raw solve? Then this bound is measuring nothing.")
+    assert after["margin_violations"] == 0
+    # ...and it must not be papering over a violated possession invariant,
+    # which nothing projects and which would be a real modelling error.
+    assert before["possession_violations"] == 0
+    assert after["possession_violations"] == 0
 
 
 @needs_table

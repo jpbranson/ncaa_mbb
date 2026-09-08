@@ -1,8 +1,8 @@
 {
   "version": "e1_no2024",
   "state_rules_version": 2,
-  "built": "2026-09-02T16:08:40Z",
-  "sha256_16": "6f825e79fa2b54f6",
+  "built": "2026-09-08T16:37:10Z",
+  "sha256_16": "6804b2e63ff8e790",
   "seasons_used": [
     2016,
     2017,
@@ -35,33 +35,33 @@
   "foul_max": 10,
   "ft_bucket_means": [
     0.6676215163559747,
-    0.7093128333392267,
+    0.7093128333392268,
     0.7491113428077254
   ],
   "monotonicity_before": {
-    "margin_min_increment": 0.0,
-    "margin_violations": 0,
-    "own_ft_bucket_min_increment": -7.313153235363745e-06,
-    "own_ft_bucket_violations": 2029,
-    "opp_ft_bucket_max_increment": 2.058440391250471e-06,
-    "opp_ft_bucket_violations": 903,
-    "own_fouls_max_increment": 0.007309329569690964,
-    "opp_fouls_min_increment": -0.02140265283912346,
+    "margin_min_increment": -5.695926059743501e-05,
+    "margin_violations": 4340,
+    "own_ft_bucket_min_increment": 0.0,
+    "own_ft_bucket_violations": 0,
+    "opp_ft_bucket_max_increment": 0.0,
+    "opp_ft_bucket_violations": 0,
+    "own_fouls_max_increment": 0.021387046151474312,
+    "opp_fouls_min_increment": -0.07594546151163717,
     "possession_min_advantage": 0.0,
     "possession_violations": 0
   },
   "monotonicity_after": {
     "margin_min_increment": 0.0,
     "margin_violations": 0,
-    "own_ft_bucket_min_increment": -7.313153235363745e-06,
-    "own_ft_bucket_violations": 2029,
-    "opp_ft_bucket_max_increment": 2.058440391250471e-06,
-    "opp_ft_bucket_violations": 903,
-    "own_fouls_max_increment": 0.007309329569690964,
-    "opp_fouls_min_increment": -0.02140265283912346,
+    "own_ft_bucket_min_increment": 0.0,
+    "own_ft_bucket_violations": 0,
+    "opp_ft_bucket_max_increment": 0.0,
+    "opp_ft_bucket_violations": 0,
+    "own_fouls_max_increment": 0.021387046151474312,
+    "opp_fouls_min_increment": -0.07594546151163717,
     "possession_min_advantage": 0.0,
     "possession_violations": 0
   },
-  "isotonic_max_correction": 0.0,
+  "isotonic_max_correction": 5.695926059743501e-05,
   "note": "V[t, m, fo, fd, bo, bd] = P(the team WITH THE BALL wins)."
 }

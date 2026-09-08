@@ -320,6 +320,19 @@ there is nothing to authenticate: it is a read-only view of public scores.
 
 This is the operational trap worth knowing about.
 
+**The running service picks up a rebuilt snapshot on its own.** It re-reads
+`context_latest.json` whenever the file's modification time changes
+(`cbbwp.live_context.ReloadingContextProvider`), so the `com.cbbwp.ratings`
+agent and the always-on `com.cbbwp.live` agent compose the way the install
+script implies. No restart, no `launchctl kickstart`.
+
+That was not true before 2026-09-08: the snapshot was read once at startup, so
+a process left up for a season served launch-day ratings and `/health` reported
+a permanent 503 — advising a rebuild that cron had already done — after
+`CBBWP_RATINGS_MAX_AGE` days of uptime. `build_live_context.py` now also writes
+the file atomically (write, then rename), so a reload can never see half a JSON
+document.
+
 `build_live_context.py` computes ratings from `data/proc/games.parquet`, which
 only changes when `fetch_data.py` runs. **Rebuilding the snapshot without
 refreshing the data underneath it produces a file with today's timestamp and
@@ -389,8 +402,9 @@ curl -s http://127.0.0.1:8808/health
 The image contains the code and **not** the 527 MB of training data: it scores
 games, it does not fit models. The registry is mounted read-only, because a
 serving process has no business rewriting the model it serves. Rebuild the
-ratings snapshot wherever the training data lives, and restart the container to
-pick it up.
+ratings snapshot wherever the training data lives; the container notices the new
+file by itself, so no restart is needed for ratings (a *model version* change
+still is, since the model is loaded once at startup on purpose).
 
 ## Configuration
 
@@ -426,7 +440,17 @@ is old" from "the data behind the ratings is old" — different fixes.
 
 **Suspect the feed changed.** Record and inspect:
 `python3 scripts/record_espn_fixtures.py --limit 10` then
-`python3 scripts/check_espn_fixtures.py`. Unknown play type ids are the signal.
+`python3 scripts/check_espn_fixtures.py`. Three signals, all reported and none
+silently repaired:
+
+| signal | what it means |
+|---|---|
+| unknown play type ids | ESPN added a type the model never trained on. The honest fix is a refit with the new type present, not a mapping to something plausible |
+| plays out of clock order | the feed arrived disordered. The adapter preserves its order rather than sorting by an unreliable key (EXPLAIN 8.8b); the viz page steps by clock and flags the moment |
+| unparseable clocks | a clock string this build cannot read. Those score as 0:00, and a 0:00 in the second half lets the endgame clamp publish near-certainty — so this one can put an absurd number on screen |
+
+The poller reports the last two per game as they happen, on stderr, and stamps
+`feed_inversions` / `feed_bad_clocks` into the JSONL row when non-zero.
 
 **Reproduce a night offline.** Fixtures replay with no network at all:
 `CBBWP_FIXTURE_DIR=tmp/fixtures python3 scripts/serve_live.py --once`.
@@ -453,5 +477,5 @@ back on its own; the JSONL will show the gap.
 - **Late-game home advantage** is zeroed by the symmetry mirroring rather than
   flipped (EXPLAIN §8.1) — the largest single accuracy gain available.
 - **The endgame table is built, tested and not wired in** (EXPLAIN §7.14). It
-  missed its pre-registered bar at 0.40% against 1%.
+  missed its pre-registered bar at 0.63% against 1%.
 - **No auth on the API**, by design. Do not expose it without a proxy.

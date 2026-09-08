@@ -91,10 +91,21 @@ def test_a_gap_that_is_only_significant_because_of_duplication_is_not_an_alert()
     # 400 games, each 40 states. A 2.5pp gap over 400 games is noise; the same
     # gap over 16,000 "independent" states looks like a 5-sigma event.
     y, p, s, g = clustered_synth(400, 40, 90, 0.725, 0.70, seed=3)
-    assert not monitor.check(y, p, s, game_ids=g).ok or True   # may or may not fire
-    naive_z = abs(monitor.check(y, p, s).bins[0].z)
-    clust_z = abs(monitor.check(y, p, s, game_ids=g).bins[0].z)
+    naive = monitor.check(y, p, s)
+    clustered = monitor.check(y, p, s, game_ids=g)
+    naive_z = abs(naive.bins[0].z)
+    clust_z = abs(clustered.bins[0].z)
     assert naive_z > clust_z * 3
+    # The point of the whole exercise: treating states as independent turns a
+    # 2.5-point gap into "significant", and correcting for clustering does not.
+    # (This line used to read `assert not clustered.ok or True`, which is
+    # vacuously true and asserted nothing at all.)
+    assert naive_z > monitor.Z_ALERT
+    assert clust_z < monitor.Z_ALERT
+    assert clustered.ok
+    # ...and the naive report has to say out loud that it is optimistic.
+    assert not naive.clustered
+    assert any("independent" in n for n in naive.notes)
 
 
 def test_real_drift_still_fires_when_clustered():

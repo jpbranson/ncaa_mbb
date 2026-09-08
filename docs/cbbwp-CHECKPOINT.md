@@ -12,8 +12,8 @@ count as an improvement. If you come back to this in a year, start here.*
 | State rules | **v2** (`STATE_RULES_VERSION = 2` in `schemas.py`) |
 | Features | 11, order is part of the contract |
 | Trained on | 2016–2023 · calibrated 2024 · tested 2025–2026 |
-| Endgame table | `registry/endgame/e1`, sha `5ee6ed660768e3ba` — **built, not served** |
-| Tests | 82 at the tag; 110 now, after session 6 and 7's live-path and viz tests. None skipped, ~6s |
+| Endgame table | `registry/endgame/e1`, sha `ef41c4a74af1be04` — **built, not served** (rebuilt 2026-09-08, see below) |
+| Tests | 82 at the tag; 121 now, after session 6 and 7's live-path and viz tests and session 8's audit fixes. None skipped, ~7s |
 | Python | ≥ 3.10 (checkpoint built on 3.10.12; the suite also passes on 3.14) |
 | Prior model | `registry/v1`, sha `aaddca0d81606bc0`, state rules v1, deliberately refused at load |
 
@@ -106,11 +106,40 @@ each was declined against a bar set **before** the result was known.
 |---|---|
 | Post-hoc calibrator | Cost 0.0008 log loss and raised ECE. Residual bias is smaller than season-to-season noise. Diagnostic kept in `scripts/calibrate_and_eval.py`. |
 | Endgame overrides beyond the rule clamps | ~0.2% of feeds contradict themselves; overrides lose ~0.0002 to it. The mathematical clamps *are* live, at 0.999. |
-| Endgame simulator and lookup table | 0.40% log-loss gain against a pre-registered 1% bar. Passed the other four criteria. `registry/endgame/e1`, EXPLAIN §7.14. |
+| Endgame simulator and lookup table | 0.63% log-loss gain against a pre-registered 1% bar. Passed the other four criteria. `registry/endgame/e1`, EXPLAIN §7.14. |
 
 Do not rebuild any of these expecting a different answer without changing
 something structural first — the reasons are in `cbbwp-endgame-results.md` and
 EXPLAIN §7.7–7.9 and §7.14.
+
+**One of them was rebuilt, on 2026-09-08, because something structural did
+change.** An audit found the endgame table's fouling parameters attributed to
+the wrong team (`AUDIT-2026-09-08.md` H2): possession runs were segmented on the
+possession *after* each event, and a made free throw flips possession, so every
+free-throw trip landed in the fouling team's run instead of the shooting team's.
+The measured foul rate was inverted. Corrected, the table improved substantially
+— Phase 4 log loss 0.1384 → 0.1338, ECE 0.0173 → 0.0090, and the isotonic repair
+the build has to apply fell by a factor of a hundred — and the blend went from
+0.55% to 0.63% against the 1% bar. **The verdict did not change.** That is the
+value of having written the bar down first.
+
+## What changed after the 2026-09-08 audit
+
+`AUDIT-2026-09-08.md` is the audit; every finding it raised has been addressed.
+The three that change behaviour a future reader needs to know about:
+
+- **The ratings snapshot is now reloaded while the process runs**
+  (`cbbwp.live_context.ReloadingContextProvider`). It used to be read once at
+  startup, which made the daily ratings LaunchAgent a job that rewrote a file
+  nobody read, and drove `/health` to a permanent 503 after three days of uptime.
+- **The live pregame term is now on the training scale.**
+  `build_live_context.py` chains its prior across every season with CARRYOVER,
+  as `ratings.build_all_seasons` does; it used to fit the single previous season
+  against an empty prior. `registry/context_latest.json` has been regenerated
+  and its ratings moved by 0.84 sd (max 8.5 points).
+- **`registry/endgame/e1` and `e1_no2024` were rebuilt** (new hashes above).
+  `registry/v2` is untouched: no state rule, feature or model changed, so the
+  shipped model and every number in "What it scores" still stand exactly.
 
 ## The state this leaves the project in
 

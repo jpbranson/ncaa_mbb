@@ -27,8 +27,10 @@ FOUL_TYPES = {"PersonalFoul", "Technical Foul"}
 #   "other"  -> the other team has the ball
 #   "carry"  -> unchanged from the previous state
 #   "unknown"-> 0.5
-# NOTE: this list is NO LONGER used to decide possession - see _possession_after.
-# It is kept only for documentation of what the field-goal types look like.
+# NOTE: `_MADE_SHOT_TYPES` is NO LONGER used to decide possession - see
+# `_possession_after`, which keys made field goals on the feed's scoring and
+# shooting flags. It is kept only to document what the field-goal types look
+# like. `_TURNOVER_MARKER` below IS still load-bearing (see `_possession_after`).
 _MADE_SHOT_TYPES = {"JumpShot", "LayUpShot", "DunkShot", "TipShot"}
 _TURNOVER_MARKER = "Turnover"
 
@@ -36,18 +38,40 @@ TEAM_TIMEOUT_TYPES = {"ShortTimeOut", "RegularTimeOut", "TeamTimeOut", "Timeout"
 OFFICIAL_TIMEOUT_TYPES = {"OfficialTVTimeOut", "MediaTimeOut"}
 
 
-def clock_to_seconds(display: str) -> int:
-    """'19:48' -> 1188.  '0:23.4' -> 23.  Returns 0 on anything unparseable."""
+def parse_clock(display: str) -> Optional[int]:
+    """'19:48' -> 1188.  '0:23.4' -> 23.  None if it does not parse at all.
+
+    `clock_to_seconds` folds two different facts into 0: "this play carries no
+    clock" (normal - ESPN sends administrative rows that way) and "this clock
+    string is a shape this code does not understand" (a feed change). The second
+    is worth knowing about, because a fabricated 0 in the SECOND HALF reads as
+    `game_seconds_remaining == 0`, and the endgame clamp then publishes 0.999
+    with ten minutes left on the real clock.
+
+    Nothing downstream of the adapters changes behaviour on this - see
+    `adapters/espn.clock_parse_failures`, which counts it and reports it the way
+    unknown play types are reported. Carrying the previous clock forward instead
+    would change what a GameState MEANS and so requires a STATE_RULES_VERSION
+    bump and a refit; that is a deliberate decision, not a bug fix.
+    """
     if not display:
-        return 0
+        return None
     s = display.strip()
+    if not s:
+        return None
     try:
         if ":" in s:
             mm, ss = s.split(":", 1)
             return int(mm) * 60 + int(float(ss))
         return int(float(s))
     except (ValueError, TypeError):
-        return 0
+        return None
+
+
+def clock_to_seconds(display: str) -> int:
+    """'19:48' -> 1188.  '0:23.4' -> 23.  Returns 0 on anything unparseable."""
+    v = parse_clock(display)
+    return 0 if v is None else v
 
 
 def period_length(period: int) -> int:

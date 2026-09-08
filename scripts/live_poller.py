@@ -33,9 +33,10 @@ from typing import Dict, Optional
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "src"))
 
-from cbbwp.adapters.espn import (EspnClient, parse_summary, scoreboard_games,
-                                 STATUS_FINAL, STATUS_PRE)
-from cbbwp.live_context import LiveContextProvider
+from cbbwp.adapters.espn import (EspnClient, chronological_inversions,
+                                 clock_parse_failures, parse_summary,
+                                 scoreboard_games, STATUS_FINAL, STATUS_PRE)
+from cbbwp.live_context import ReloadingContextProvider
 from cbbwp.serve import WinProbabilityService
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -59,6 +60,24 @@ MAX_CONCURRENT_FETCHES = 8
 ERROR_BACKOFF = (5.0, 15.0, 45.0, 90.0)   # per consecutive failure
 
 
+def default_out_path(live_dir: pathlib.Path, day: str,
+                     is_replay: bool) -> pathlib.Path:
+    """Where emitted rows go when the caller did not name a file.
+
+    A dry run against scripts/replay_server.py must never write into the live
+    record. The JSONL is appended to and never rewritten, so simulated states
+    put there would sit in the durable record permanently.
+
+    Both entry points (this module and serve_live.py) route through here, so
+    they cannot disagree about it -- the diversion used to live only in
+    serve_live.py, which left `python3 scripts/live_poller.py` under
+    CBBWP_ESPN_BASE writing replay rows straight into data/live/.
+    """
+    if is_replay:
+        return live_dir.parent / "replay" / f"wp_{day}.jsonl"
+    return live_dir / f"wp_{day}.jsonl"
+
+
 class Poller:
     def __init__(self, svc: WinProbabilityService, ctx: LiveContextProvider,
                  client: EspnClient, out_path: pathlib.Path, quiet: bool = False,
@@ -77,6 +96,8 @@ class Poller:
         self.sem = asyncio.Semaphore(MAX_CONCURRENT_FETCHES)
         self.watchers: Dict[int, asyncio.Task] = {}
         self.last_emitted: Dict[int, tuple] = {}
+        self.inversions: Dict[int, int] = {}
+        self.bad_clocks: Dict[int, int] = {}
         self.stopping = asyncio.Event()
         out_path.parent.mkdir(parents=True, exist_ok=True)
         self._fh = out_path.open("a", buffering=1)
@@ -96,7 +117,35 @@ class Poller:
         async with self.sem:
             return await asyncio.to_thread(self.client.scoreboard, date)
 
-    def emit(self, row: dict, header) -> None:
+    def decorate(self, row: dict, header, inversions: int = 0,
+                 bad_clocks: int = 0) -> dict:
+        """Stamp a scored row with the provenance every durable row must carry.
+
+        One place, so a row written by the single-poll path cannot be missing
+        the tags a row written by the watch loop has. The smoke test's step 7
+        used to write rows with no timestamp, no status and -- in replay mode --
+        no `replay` flag, into the same file as the real feed.
+        """
+        out = dict(row)
+        out["ts"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        out["home_team_id"] = header.home_team_id
+        out["away_team_id"] = header.away_team_id
+        out["status"] = header.status
+        # A simulated row must never be mistakable for a real one. The JSONL is
+        # the record of truth, and it is appended to, so an untagged dry run
+        # would leave fake states in the durable record permanently.
+        if self.client.is_replay:
+            out["replay"] = True
+        # Evidence, in the durable record, that the feed arrived out of clock
+        # order. The adapter deliberately does not repair disorder, so the only
+        # honest thing to do with it is carry it forward.
+        if inversions:
+            out["feed_inversions"] = int(inversions)
+        if bad_clocks:
+            out["feed_bad_clocks"] = int(bad_clocks)
+        return out
+
+    def _write(self, row: dict) -> None:
         self._fh.write(json.dumps(row) + "\n")
         if self.sink is not None:
             try:
@@ -105,6 +154,9 @@ class Poller:
                 # A failing view must never take down the feed.
                 print(f"sink failed ({type(e).__name__}: {e})",
                       file=sys.stderr, flush=True)
+
+    def emit(self, row: dict, header) -> None:
+        self._write(row)
         if self.quiet:
             return
         secs = row["game_seconds_remaining"]
@@ -134,6 +186,31 @@ class Poller:
                 await self._sleep(wait)
                 continue
 
+            # The adapter preserves the feed's array order and does NOT repair
+            # disorder, so this is the only place anybody would ever find out
+            # that ESPN sent one. Report it once per game, and again only if it
+            # gets worse.
+            inversions = chronological_inversions(events) if events else 0
+            if inversions and self.inversions.get(game_id, 0) < inversions:
+                print(f"[{game_id}] WARNING: {inversions} play(s) arrived out of "
+                      "clock order; states are built in the feed's own order "
+                      "and are NOT rearranged (see adapters/espn.py)",
+                      file=sys.stderr, flush=True)
+            self.inversions[game_id] = max(self.inversions.get(game_id, 0),
+                                           inversions)
+
+            # A clock the adapter cannot read becomes 0, and a 0 in the second
+            # half means "game over" to the endgame clamp. Say so loudly rather
+            # than publishing a confident number built on a fabricated clock.
+            bad_clocks = clock_parse_failures(summary.get("plays") or [])
+            if bad_clocks and self.bad_clocks.get(game_id, 0) < bad_clocks:
+                print(f"[{game_id}] WARNING: {bad_clocks} play(s) carry a clock "
+                      "this build cannot parse; they are being scored as 0:00 "
+                      "-- the feed format may have changed",
+                      file=sys.stderr, flush=True)
+            self.bad_clocks[game_id] = max(self.bad_clocks.get(game_id, 0),
+                                           bad_clocks)
+
             if events:
                 pctx = self.ctx.context_for(
                     game_id, header.home_team_id, header.away_team_id,
@@ -141,22 +218,12 @@ class Poller:
                 rows = self.svc.score_game(events, pctx)
                 if rows:
                     last = rows[-1]
-                    key = (last["seq"], round(last["home_win_prob"], 6))
+                    key = (last["seq"], round(last["home_win_prob"], 6),
+                           header.status)
                     if self.last_emitted.get(game_id) != key:
                         self.last_emitted[game_id] = key
-                        last = dict(last)
-                        last["ts"] = datetime.datetime.now(
-                            datetime.timezone.utc).isoformat()
-                        last["home_team_id"] = header.home_team_id
-                        last["away_team_id"] = header.away_team_id
-                        last["status"] = header.status
-                        # A simulated row must never be mistakable for a real
-                        # one. The JSONL is the record of truth, and it is
-                        # appended to, so an untagged dry run would leave fake
-                        # states in the durable record permanently.
-                        if self.client.is_replay:
-                            last["replay"] = True
-                        self.emit(last, header)
+                        self.emit(self.decorate(last, header, inversions,
+                                                bad_clocks), header)
                     secs = last["game_seconds_remaining"]
                 else:
                     secs = None
@@ -168,6 +235,8 @@ class Poller:
                     print(f"[{game_id}] final: {header.away_name} "
                           f"{header.away_score} @ {header.home_name} "
                           f"{header.home_score}", flush=True)
+                self.last_emitted.pop(game_id, None)
+                self.inversions.pop(game_id, None)
                 return
             await self._sleep(poll_interval(secs, header.is_live))
 
@@ -230,13 +299,19 @@ class Poller:
         if not self.ctx.known(header.away_team_id):
             print(f"  note: away team id {header.away_team_id} not in the ratings "
                   "snapshot; using league average")
+        inversions = chronological_inversions(events)
+        if inversions:
+            print(f"  WARNING: {inversions} play(s) arrived out of clock order")
+        bad_clocks = clock_parse_failures(summary.get("plays") or [])
+        if bad_clocks:
+            print(f"  WARNING: {bad_clocks} play(s) carry an unparseable clock")
         for r in rows[-10:]:
             mm, ss = divmod(int(r["game_seconds_remaining"]), 60)
             print(f"  P{r['period']} {mm:>2}:{ss:02d}  margin {r['margin']:>+4}  "
                   f"home {r['home_win_prob']:.4f}")
-            self._fh.write(json.dumps(r) + "\n")
-            if self.sink is not None:
-                self.sink(r)
+            # Through decorate/_write, so a single-poll row carries the same
+            # provenance -- timestamp, status, replay tag -- as a watched one.
+            self._write(self.decorate(r, header, inversions, bad_clocks))
 
     def close(self) -> None:
         self._fh.close()
@@ -262,15 +337,23 @@ def main() -> int:
         print(f"no ratings snapshot at {ctx_path}\n"
               "  run: python3 scripts/build_live_context.py", file=sys.stderr)
         return 2
-    ctx = LiveContextProvider.load(ctx_path)
+    ctx = ReloadingContextProvider(ctx_path)
     if ctx.is_stale:
         print(f"warning: ratings snapshot is {ctx.age_days:.1f} days old; "
               "re-run scripts/build_live_context.py", file=sys.stderr)
 
     svc = WinProbabilityService(a.registry, a.version)
     day = a.date or datetime.datetime.now().strftime("%Y%m%d")
-    out = pathlib.Path(a.out) if a.out else ROOT / f"data/live/wp_{day}.jsonl"
-    poller = Poller(svc, ctx, EspnClient(), out, quiet=a.quiet,
+    client = EspnClient()
+    # An explicit --out is honoured as given; otherwise a replay run is diverted
+    # away from the live record. See default_out_path.
+    out = (pathlib.Path(a.out) if a.out
+           else default_out_path(ROOT / "data" / "live", day, client.is_replay))
+    if client.is_replay:
+        print(f"*** REPLAY MODE -- reading {client.base_url}, NOT ESPN.\n"
+              f"*** Rows are tagged \"replay\": true and written to {out}",
+              file=sys.stderr, flush=True)
+    poller = Poller(svc, ctx, client, out, quiet=a.quiet,
                     fixture_dir=pathlib.Path(a.fixture_dir) if a.fixture_dir else None)
 
     loop = asyncio.new_event_loop()

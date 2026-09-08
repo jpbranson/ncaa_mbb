@@ -16,11 +16,32 @@ with open(ROOT / "artifacts/calibrator_v1.pkl", "wb") as f:
 
 raw = te["p_gbm"]
 calibrated = cal.transform(raw, secs)
-# endgame overrides need the margin, recovered from the saved feature column
+# The endgame overrides need the margin, which test_preds.npz does not carry, so
+# it is re-read from the states files. Those rows are matched to the predictions
+# BY GAME AND SEQ, not by position: a length check alone would let any future
+# change in concat or collect ordering line every probability up against the
+# wrong margin, silently, and the clamps would then fire on the wrong rows.
 import polars as pl
-margin = pl.concat([pl.scan_parquet(ROOT / f"data/proc/states/states_{s}.parquet")
-                    .select("margin") for s in (2025, 2026)], how="diagonal").collect()["margin"].to_numpy()
-assert len(margin) == len(y)
+states = pl.concat([pl.scan_parquet(ROOT / f"data/proc/states/states_{s}.parquet")
+                    .select("game_id", "seq", "margin") for s in (2025, 2026)],
+                   how="diagonal").collect()
+assert len(states) == len(y), (
+    f"{len(states):,} state rows for {len(y):,} predictions -- the states files "
+    "and test_preds.npz were not built from the same dataset")
+if "seq" in te.files:
+    order = pl.DataFrame({"game_id": te["game_id"], "seq": te["seq"],
+                          "_i": np.arange(len(y))})
+    joined = order.join(states, on=["game_id", "seq"], how="left").sort("_i")
+    assert joined["margin"].null_count() == 0, "some predictions have no state row"
+    margin = joined["margin"].to_numpy()
+else:
+    # Older test_preds.npz files carry game_id but not seq. Verify what can be
+    # verified -- that the games line up in the same order -- rather than
+    # assuming the row order matches.
+    assert np.array_equal(states["game_id"].to_numpy(), te["game_id"]), (
+        "state rows are not in the same game order as test_preds.npz; rebuild "
+        "with scripts/rebuild_test_preds.py so the margins can be aligned")
+    margin = states["margin"].to_numpy()
 final = endgame.apply(calibrated, margin, secs)
 
 rows = {

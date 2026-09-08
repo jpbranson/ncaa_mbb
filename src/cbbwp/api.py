@@ -33,18 +33,38 @@ from .schemas import STATE_RULES_VERSION
 
 
 class LiveStore:
-    """Latest state per game, plus a bounded tail of history."""
+    """Latest state per game, plus a bounded tail of history.
 
-    def __init__(self, history: int = 240):
+    Bounded in BOTH directions. The history per game was always capped; the
+    number of games was not, so a process left up for a season accumulated every
+    game it had ever seen and `/games` answered with all of them rather than
+    with tonight's slate. A Division I slate peaks around 350 games, so the
+    default here is a slate and change.
+    """
+
+    def __init__(self, history: int = 240, max_games: int = 512):
         self._lock = threading.Lock()
         self._latest: dict[int, dict] = {}
         self._history: dict[int, collections.deque] = {}
+        self._seen: dict[int, float] = {}
         self._history_len = history
+        self._max_games = max_games
         self._updates = 0
+        self._evicted = 0
         self._last_update: Optional[float] = None
+
+    def _evict_locked(self) -> None:
+        """Drop the least recently updated games. Caller holds the lock."""
+        while len(self._latest) > self._max_games:
+            oldest = min(self._seen, key=self._seen.get)
+            self._latest.pop(oldest, None)
+            self._history.pop(oldest, None)
+            self._seen.pop(oldest, None)
+            self._evicted += 1
 
     def update(self, row: dict) -> None:
         gid = int(row["game_id"])
+        now = time.time()
         with self._lock:
             self._latest[gid] = row
             d = self._history.get(gid)
@@ -53,8 +73,10 @@ class LiveStore:
             d.append({k: row[k] for k in
                       ("seq", "period", "game_seconds_remaining", "margin",
                        "home_win_prob") if k in row})
+            self._seen[gid] = now
             self._updates += 1
-            self._last_update = time.time()
+            self._last_update = now
+            self._evict_locked()
 
     def games(self) -> list[dict]:
         with self._lock:
@@ -72,7 +94,7 @@ class LiveStore:
     def stats(self) -> dict:
         with self._lock:
             return {"games_tracked": len(self._latest), "updates": self._updates,
-                    "last_update": self._last_update}
+                    "evicted": self._evicted, "last_update": self._last_update}
 
 
 def _iso(ts: Optional[float]) -> Optional[str]:
@@ -141,6 +163,7 @@ def make_handler(store: LiveStore, meta: dict,
                     "data_age_days": None if dage is None else round(dage, 2),
                     "games_tracked": s["games_tracked"],
                     "updates": s["updates"],
+                    "evicted": s["evicted"],
                     "last_update": _iso(s["last_update"]),
                 }))
 

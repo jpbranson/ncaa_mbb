@@ -3,6 +3,7 @@ feature builders the training pipeline used, then a pinned model artifact.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import pathlib
 import pickle
@@ -43,6 +44,23 @@ class WinProbabilityService:
                 "data. Refit, or pin the code version that matches the artifact."
             )
         kind = self.manifest["kind"]
+        # The manifest has always recorded a hash of the artifact; nothing ever
+        # checked it, so it was a note for humans rather than a guarantee.
+        # Checking it turns a truncated copy, an interrupted rsync or an edited
+        # model file into a startup failure that names its own cause, instead of
+        # a service that silently serves different numbers than the ones this
+        # version was measured at.
+        expected = self.manifest.get("sha256")
+        if expected:
+            artifact = self.dir / ("model.txt" if kind == "lightgbm" else "model.pkl")
+            actual = hashlib.sha256(artifact.read_bytes()).hexdigest()
+            if not actual.startswith(expected):
+                raise RuntimeError(
+                    f"model {version} does not match its manifest: {artifact.name} "
+                    f"hashes to {actual[:len(expected)]}, manifest says {expected}. "
+                    "The artifact has changed since it was published - restore it "
+                    "or republish, but do not serve it."
+                )
         if kind == "lightgbm":
             import lightgbm as lgb
             self.model = lgb.Booster(model_file=str(self.dir / "model.txt"))
